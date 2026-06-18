@@ -1,0 +1,54 @@
+{
+    // 可以在这里控制各种生成字幕的参数, 下面这个链接里的参数都可以控制
+    // You can control various subtitle generation parameters here, all parameters in the link below can be controlled
+    // https://github.com/SYSTRAN/faster-whisper/blob/dea24cbcc6cbef23ff599a63be0bbb647a0b23d6/faster_whisper/transcribe.py#L733
+
+    // Whisper任务：translate = 翻译输出，transcribe = 原文转写
+    // Whisper task: translate = translated output, transcribe = same-language transcript
+    "task": "translate",
+
+    // VAD 参数设置 (使用改进的 whisper_vad 模型)
+    // VAD parameters (using improved whisper_vad model)
+    "vad_parameters": {
+        // VAD检测阈值 (0.3-0.7, 推荐0.5)
+        // 太大会导致漏翻, 太小可能会导致时间轴不准或文本质量下降(幻听)
+        // VAD detection threshold (0.3-0.7, recommended 0.5)
+        // Too high will cause missed translations, too low may cause timeline inaccuracy or text quality degradation (hallucinations)
+        "threshold": 0.5,
+
+        // 最小语音持续时间 (毫秒)
+        // Minimum speech duration (milliseconds)
+        "min_speech_duration_ms": 300,
+
+        // 最小静音持续时间 (毫秒)
+        // Minimum silence duration (milliseconds)
+        "min_silence_duration_ms": 100,
+
+        // 语音前后填充时间 (毫秒)
+        // Speech padding before and after (milliseconds)
+        "speech_pad_ms": 200,
+    },
+
+    // 避免时间轴向前偏移过长的问题
+    // Avoid excessive forward shift of timeline
+    "max_initial_timestamp": 30,
+
+    "repetition_penalty": 1.1,
+
+    // 字幕后处理：合并重复/重叠片段，避免字幕时间轴过长
+    // Subtitle post-processing: merge repeated/overlapping segments and avoid overly long timelines
+    "segment_merge": {
+        // 是否启用合并
+        // Enable merging
+        "enabled": true,
+
+        // 只有当相邻两段之间的间隔 <= max_gap_ms 时才允许合并（避免跨长静音误合并）
+        // Only merge if the gap between adjacent segments is <= max_gap_ms (avoid merging across long silences)
+        "max_gap_ms": 2000,
+
+        // 单条字幕合并后的最大时长（毫秒），超过则停止合并（避免出现几十秒/几分钟的超长字幕）
+        // Maximum duration (ms) of a merged subtitle; stop merging when exceeded
+        "max_duration_ms": 20000,
+    },
+
+}

@@ -1,0 +1,130 @@
+# ==================== 项目文件 ====================
+# 核心脚本（保留）
+# translate.py
+# scriptbook_utils.py
+# record_scriptbooks.py
+# infer.exe
+# modal_infer.exe
+
+# ==================== 排除文件 ====================
+
+# 配置文件（不纳入，用户自行配置）
+config.json
+*.json
+!.terms.json
+!.alias.json
+!.worldview.json
+
+# 临时测试脚本
+test_*.py
+extract_pdf*.py
+debug_*.py
+temp_*.py
+_*.py
+
+# 编译/打包产物
+build/
+dist/
+*.spec
+*.exe
+translate.exe
+infer.exe
+modal_infer.exe
+
+# 内部依赖库
+_internal/
+
+# 日志文件
+*.log
+log.txt
+latest.log
+nul
+
+# 输出文件
+*.txt
+!使用说明.txt
+!台本命名规则.md
+!RELEASE_NOTES_CN.md
+!README.md
+
+# 音频/字幕文件
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.aac
+*.ogg
+*.wma
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.flv
+*.wmv
+*.lrc
+*.srt
+*.vtt
+
+# PDF文件
+*.pdf
+
+# 图片文件
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.ico
+
+# 压缩文件
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# 模型文件
+models/
+
+# 台本目录
+台本/
+
+# 测试目录
+testFile/
+trash/
+voice/
+
+# 发布目录
+Hde_G_release/
+Hde鸡v0.32/
+
+# Bug收集目录
+Hde_G_bug_lrc_collection/
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+
+# IDE配置
+.vscode/
+.idea/
+*.code-workspace
+
+# 其他
+.lrc
+Hde鸡v0.32.zip

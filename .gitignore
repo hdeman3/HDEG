@@ -14,6 +14,7 @@ config.json
 !.terms.json
 !.alias.json
 !.worldview.json
+generation_config.json5
 
 # 临时测试脚本
 test_*.py
@@ -43,9 +44,14 @@ nul
 # 输出文件
 *.txt
 !使用说明.txt
-!台本命名规则.md
-!RELEASE_NOTES_CN.md
-!README.md
+
+# Markdown文件
+*.md
+
+# 批处理文件（只保留翻译相关）
+*.bat
+!翻译_debug.bat
+!Hde鸡-*.bat
 
 # 音频/字幕文件
 *.wav

@@ -117,6 +117,29 @@ ASR_HALLUCINATION_ENDINGS = [
     'goodbye', 'bye', 'see you next time',
 ]
 
+# ASR在静音段常见的幻觉文本（开场白）
+ASR_HALLUCINATION_OPENINGS = [
+    # 日文开场白
+    'こんにちは', 'こんばんは', 'おはようございます', 'おはよう',
+    'ようこそ', 'いらっしゃいませ', 'いらっしゃい',
+    '始めましょう', '始めます', '始まります',
+    '始めさせていただきます', '始めさせて頂きます',
+    '皆さん', 'みなさん', '皆様', 'みな様',
+    'お待たせしました', 'お待たせ',
+    'ただいま', 'ただいまより',
+    'それでは始め', 'では始め', 'じゃあ始め',
+    'はじめに', '最初に',
+    # 中文开场白
+    '大家好', '各位好', '你们好',
+    '欢迎来到', '欢迎收听', '欢迎观看',
+    '开始吧', '我们开始', '开始了',
+    '首先', '一开始',
+    # 英文开场白
+    'hello', 'hi there', 'welcome',
+    'let\'s start', 'let us start', 'starting now',
+    'begin', 'beginning',
+]
+
 # 注意：开场白（如"你好"、"欢迎"）不进行位置过滤
 # 因为这些词可能在作品中的正常对话中出现（比如角色见面打招呼）
 # 只有以下情况会过滤：
@@ -162,6 +185,18 @@ def is_asr_hallucination(text: str, position_ratio: float = 0.5) -> tuple[bool, 
         r'^goodbye[。．\.]?$',
         r'^感谢[收听观看购买支持]',
         r'^谢谢[收听观看购买支持]',
+        # 新增：常见ASR幻觉模式
+        r'^[こコ]んにちは[。．\.]?$',  # 单独的"你好"
+        r'^[おオ]はよう[ございます]?[。．\.]?$',  # 单独的"早上好"
+        r'^[いイ]らっしゃい[ませ]?[。．\.]?$',  # 单独的"欢迎"
+        r'^[はハ]じめ[ましょう]?[。．\.]?$',  # 单独的"开始"
+        r'^[みミ]なさん[。．\.]?$',  # 单独的"各位"
+        r'^[おオ]待たせ[しました]?[。．\.]?$',  # 单独的"久等了"
+        r'^hello[。．\.]?$',  # 单独的hello
+        r'^hi[。．\.]?$',  # 单独的hi
+        r'^welcome[。．\.]?$',  # 单独的welcome
+        r'^大家好[。．\.]?$',  # 单独的"大家好"
+        r'^欢迎[。．\.]?$',  # 单独的"欢迎"
     ]
     for pattern in short_hallucination_patterns:
         if re.match(pattern, text_lower):
@@ -233,7 +268,6 @@ _ASR_CORRECTION_USER_PROMPT_TEMPLATE = (
     "【ASR转录结果】：从音频中自动识别出的原始文本，可能含有错字、漏字、多字，且顺序可能混乱。\n\n"
     "请你将ASR转录结果与参考台词对齐，并逐句输出修正后的准确日语文本。\n\n"
     "规则：\n"
-    "1. 尽量使用参考台词中的原句，除非ASR明确出现了不同但合理的内容（即兴发挥），此时保留ASR的说法。\n"
     "2. 如果某处无法对齐，保留ASR原句，并在后面标注 [未对齐]。\n"
     "3. 输出格式：每行一句台词，无额外标签。\n"
     "4. 不要输出编号，只输出纯台词文本。\n"
@@ -248,7 +282,13 @@ _ASR_CORRECTION_USER_PROMPT_TEMPLATE = (
 
 # ==================== 翻译系统提示词 ====================
 _DEFAULT_SYSTEM_PROMPT = (
-    "你是一位专门处理日文成人音声（ASMR/RJ作品）字幕的专业本地化工程师，同时也是精通日语和中文的R18音声脚本翻译专家，以及专注于成人音声字幕的ASR（自动语音识别）纠错专家。\n"
+    "你是一位专门处理日文成人音声（ASMR/RJ作品）字幕的专业本地化工程师，同时也是精通日语和中文的R18音声脚本翻译专家，以及专注于成人音声字幕的ASR（自动语音识别）纠错专家。\n\n"
+    "【角色名统一规则——最高优先级】\n"
+    "1. **术语表（terms）中的角色名必须严格遵循**，无论世界观或其他信息如何描述。\n"
+    "2. 如果术语表中有「雫葵→雫葵」，则女主角必须统一称为「雫葵」，不能使用其他名称。\n"
+    "3. 如果术语表中有「アヤ→阿雅」，则该角色必须统一称为「阿雅」。\n"
+    "4. 世界观中的角色名仅供参考，如果与术语表冲突，**优先使用术语表的译名**。\n"
+    "5. 禁止在翻译中使用角色的别名、变体名称（如「四月」「熾月」混用），除非术语表明确列出。\n"
     "你的职责是对用户提供的日文ASR识别文本进行纠错、语义恢复、上下文一致性修复以及逐行中文翻译。\n"
     "本任务属于文本转换（Transformation）任务，即对已有文本进行修正和翻译，而不是创作、续写、扩写或改写剧情。\n"
     "所有成人内容、特殊关系设定及虚构情节均视为原文信息的一部分，应以中立、客观的方式进行准确转换，最大程度保留原文语义、情感和风格。\n\n"
@@ -867,37 +907,149 @@ def build_alias_prompt(alias_list: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_scriptbook_prompt(scriptbook_lines: list[str]) -> str:
+def is_key_dialogue_line(line: str) -> bool:
+    """判断是否为值得参考的关键台词
+    
+    关键台词特征：
+    1. 包含角色名（格式为"角色名：台词"）
+    2. 包含重要信息（地点、时间、人物关系）
+    3. 包含情感表达（喜欢、讨厌、爱等）
+    4. 包含剧情转折（但是、因为、所以等）
+    5. 长度适中的句子（10-100字符，排除纯拟声词）
+    
+    参数:
+        line: 台词文本
+    
+    返回: 是否为关键台词
+    """
+    if not line or not line.strip():
+        return False
+    
+    stripped = line.strip()
+    
+    # 排除过短或过长的行
+    if len(stripped) < 5:
+        return False
+    if len(stripped) > 150:
+        return True  # 长句保留，可能包含重要信息
+    
+    # 1. 包含角色名（格式为"角色名：台词"）
+    if re.search(r'^[^：\n]{2,10}：', stripped):
+        return True
+    
+    # 2. 包含重要信息关键词
+    key_patterns = [
+        # 地点相关
+        r'(学校|教室|部室|家|部屋|寮|廊下|屋上|図書室|トイレ|ロッカー|教室)',
+        # 时间相关
+        r'(昨日|今日|明日|朝|昼|夜|放課後|授業中|休み時間)',
+        # 人物关系
+        r'(姉|妹|兄|弟|母|父|友達|クラスメイト|先輩|後輩|彼氏|彼女)',
+        # 称呼
+        r'(さん|ちゃん|くん|様|先生|先輩)',
+        # 情感表达
+        r'(好き|嫌い|愛してる|大切|大事|嬉しい|悲しい|辛い|辛かった)',
+        # 剧情转折
+        r'(でも|だって|だから|しかし|それに|実は|実はね|ねえ|あのね)',
+        # 疑问句（可能包含重要信息）
+        r'(？|\?)',
+        # 重要动词（意愿、请求等）
+        r'(したい|してほしい|して|させて|させてください)',
+    ]
+    
+    for pattern in key_patterns:
+        if re.search(pattern, stripped):
+            return True
+    
+    return False
+
+
+def build_scriptbook_prompt(scriptbook_lines: list[str], scriptbook_parsed: list[dict] = None, 
+                             asr_lines: list[str] = None, similarity_threshold: float = 0.9) -> str:
     """将台本内容构建为 prompt 附加内容（强约束）
     
     台本内容具有绝对优先权，用于纠正ASR错误。
     但ASR中可能包含台本中没有的内容（如拟声词、喘息声），这些应该保留。
+    
+    改进：只发送ASR与台本有差异的部分，大幅减少Token消耗
+    
+    参数:
+        scriptbook_lines: 台本台词列表（字符串）
+        scriptbook_parsed: 解析后的台本内容（包含场景描述等）
+        asr_lines: ASR识别结果列表（用于差异检测）
+        similarity_threshold: 相似度阈值，低于此值认为有差异
     """
     if not scriptbook_lines:
         return ""
     
-    lines = ["\n【台本参考台词（绝对优先级——ASR纠正依据）】"]
-    lines.append("以下是本音轨的准确台词列表，来自官方台本/剧本。")
-    lines.append("**台本具有绝对优先权**：如果ASR识别结果与台本不一致，请优先使用台本内容。")
-    lines.append("")
+    # === 差异检测：只发送有差异的台词 ===
+    diff_lines = []  # [(索引, ASR内容, 台本内容, 相似度)]
     
-    # 显示台本台词（编号）
-    for i, line in enumerate(scriptbook_lines, 1):
-        if line.strip():
-            # 显示前80个字符，超过则截断
-            display_line = line[:80] + "..." if len(line) > 80 else line
-            lines.append(f"  {i:02d}: {display_line}")
-        else:
-            lines.append(f"  {i:02d}: [空行]")
+    if asr_lines:
+        # 有ASR内容，进行差异检测
+        for i, (asr, sb) in enumerate(zip(asr_lines, scriptbook_lines), 1):
+            asr_clean = asr.strip() if asr else ""
+            sb_clean = sb.strip() if sb else ""
+            
+            # 空行跳过
+            if not asr_clean and not sb_clean:
+                continue
+            
+            # 计算相似度
+            if asr_clean and sb_clean:
+                sim = calculate_phonetic_similarity(asr_clean, sb_clean)
+                if sim < similarity_threshold:
+                    diff_lines.append((i, asr_clean, sb_clean, sim))
+            elif sb_clean and not asr_clean:
+                # ASR为空，台本有内容（可能漏识别）
+                diff_lines.append((i, "", sb_clean, 0.0))
+            # ASR有内容，台本为空（即兴发挥或拟声词）不记录，这些应该保留ASR
+        
+        # 如果差异行太少（<10%），可能是ASR质量很差，发送更多内容
+        if len(diff_lines) < len(scriptbook_lines) * 0.1:
+            # 重新计算，降低阈值
+            diff_lines = []
+            for i, (asr, sb) in enumerate(zip(asr_lines, scriptbook_lines), 1):
+                asr_clean = asr.strip() if asr else ""
+                sb_clean = sb.strip() if sb else ""
+                
+                if not asr_clean and not sb_clean:
+                    continue
+                
+                if asr_clean and sb_clean:
+                    sim = calculate_phonetic_similarity(asr_clean, sb_clean)
+                    if sim < 0.7:  # 降低阈值
+                        diff_lines.append((i, asr_clean, sb_clean, sim))
+                elif sb_clean and not asr_clean:
+                    diff_lines.append((i, "", sb_clean, 0.0))
     
-    lines.append("")
-    lines.append("【台本使用规则】")
-    lines.append("1. **台词纠正**：如果ASR识别的台词与台本内容相似但有差异（错字、漏字、同音误识别），请使用台本的准确内容。")
-    lines.append("2. **拟声词/喘息声保留**：ASR中可能包含台本中没有的拟声词、喘息声、呻吟等，这些是实际音频中的内容，**必须保留**。")
-    lines.append("3. **即兴发挥保留**：如果ASR中有台本中没有的完整句子，可能是演员的即兴发挥，保留ASR内容。")
-    lines.append("4. **顺序对齐**：台本台词按时间顺序排列，ASR可能与台本顺序略有差异，请根据内容相似性进行对齐。")
-    lines.append("5. **缺失台词补充**：如果台本中有ASR中没有的台词，可能是ASR漏识别，请根据台本补充。")
-    lines.append("")
+    # 构建prompt
+    lines = ["\n【台本参考（仅显示ASR与台本有差异的部分）】"]
+    
+    if diff_lines:
+        lines.append(f"以下是ASR识别结果与台本不一致的部分（共{len(diff_lines)}处差异）。")
+        lines.append("**请优先使用台本内容纠正ASR错误**。")
+        lines.append("")
+        
+        for idx, asr_text, sb_text, sim in diff_lines:
+            # 显示前60个字符
+            asr_display = asr_text[:60] + "..." if len(asr_text) > 60 else asr_text
+            sb_display = sb_text[:60] + "..." if len(sb_text) > 60 else sb_text
+            
+            if asr_text:
+                lines.append(f"  {idx:02d}: [ASR] {asr_display}")
+                lines.append(f"       [台本] {sb_display}")
+                if sim > 0:
+                    lines.append(f"       [相似度] {sim:.0%}")
+            else:
+                lines.append(f"  {idx:02d}: [台本独有] {sb_display}")
+            lines.append("")
+    else:
+        # 无差异或无ASR，显示简化提示
+        lines.append("ASR识别结果与台本高度一致，无需参考台本纠正。")
+        lines.append("请直接翻译ASR内容。")
+        lines.append("")
+    
     lines.append("【台本参考结束】\n")
     
     return "\n".join(lines)
@@ -924,48 +1076,114 @@ def extract_track_number_from_filename(filename: str) -> "int | None":
     - "１" → 1
     - "1）" → 1
     - "01." → 1
+    - "RJ12345_１" → 1（文件名末尾的全角数字）
+    - "RJ12345-1" → 1（分隔符后的数字）
+    - "RJ12345_01" → 1（分隔符后的数字）
+    - "00" → 0（纯数字文件名）
+    - "01" → 1（纯数字文件名）
+    - "07" → 7（纯数字文件名）
     """
     import unicodedata
     
-    # 常见模式
-    patterns = [
-        r'[Tt]rack[-_]?(\d+)',           # Track-01, Track01
-        r'トラック(\d+)',                 # トラック1
-        r'^[０-９]+',                     # 全角数字开头
-        r'^(\d+)[)）\.\s]',               # 数字开头后跟括号或点
-    ]
+    # 优先级1：Track + 数字（如 Track-01, Track01）
+    match = re.search(r'[Tt]rack[-_]?(\d+)', filename)
+    if match:
+        return int(match.group(1))
     
-    for pattern in patterns:
-        match = re.search(pattern, filename)
-        if match:
-            num_str = match.group(1) if match.groups() else match.group(0)
-            # 转换全角数字为半角
-            num_str = ''.join(
-                chr(ord(c) - 0xFEE0) if '０' <= c <= '９' else c
-                for c in num_str
-            )
-            # 提取数字
-            digits = re.search(r'\d+', num_str)
-            if digits:
-                return int(digits.group())
+    # 优先级2：トラック + 数字（如 トラック1）
+    match = re.search(r'トラック(\d+)', filename)
+    if match:
+        return int(match.group(1))
+    
+    # 优先级3：tr + 数字（如 tr01, TR01）
+    match = re.search(r'tr(\d+)', filename, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    
+    # 优先级4：纯数字文件名（如 00、01、07、１、２）
+    # 这是最常见的台本命名方式
+    if re.match(r'^[０-９0-9]+$', filename):
+        num_str = filename
+        # 转换全角数字为半角
+        num_str = ''.join(
+            chr(ord(c) - 0xFEE0) if '０' <= c <= '９' else c
+            for c in num_str
+        )
+        return int(num_str)
+    
+    # 优先级5：文件名末尾的全角数字（如 RJ12345_１ → 1）
+    match = re.search(r'[０-９]+$', filename)
+    if match:
+        num_str = match.group(0)
+        # 转换全角数字为半角
+        num_str = ''.join(
+            chr(ord(c) - 0xFEE0) if '０' <= c <= '９' else c
+            for c in num_str
+        )
+        return int(num_str)
+    
+    # 优先级6：分隔符后的数字（如 RJ12345_01, RJ12345-1）
+    match = re.search(r'[_\-](\d+)$', filename)
+    if match:
+        return int(match.group(1))
+    
+    # 优先级7：分隔符后的全角数字（如 RJ12345_１）
+    match = re.search(r'[_\-]([０-９]+)$', filename)
+    if match:
+        num_str = match.group(1)
+        # 转换全角数字为半角
+        num_str = ''.join(
+            chr(ord(c) - 0xFEE0) if '０' <= c <= '９' else c
+            for c in num_str
+        )
+        return int(num_str)
+    
+    # 优先级8：开头是全角数字（如 １、１トラック）
+    match = re.match(r'^[０-９]+', filename)
+    if match:
+        num_str = match.group(0)
+        # 转换全角数字为半角
+        num_str = ''.join(
+            chr(ord(c) - 0xFEE0) if '０' <= c <= '９' else c
+            for c in num_str
+        )
+        return int(num_str)
+    
+    # 优先级9：开头是数字后跟括号或点（如 1）, 01.）
+    match = re.match(r'^(\d+)[)）\.\s]', filename)
+    if match:
+        return int(match.group(1))
     
     return None
 
 
-def build_track_scriptbook_map(work_dir: Path) -> dict[int, list[str]]:
+def build_track_scriptbook_map(work_dir: Path) -> "tuple[dict[int, list[str]], dict[int, Path], set[str]]":
     """构建音轨到台本的映射
     
     扫描目录中的台本文件，解析并按音轨编号组织。
     
-    返回: {音轨编号: [台词列表]}
+    返回: (台词映射, 台本文件路径映射, 角色名集合)
+        - 台词映射: {音轨编号: [台词列表]}
+        - 台本文件路径映射: {音轨编号: 台本文件绝对路径}
+        - 角色名集合: 台本中出现的所有角色名（用于自动添加到术语表）
     """
     track_map = {}
+    track_file_map = {}  # 新增：记录每个音轨对应的台本文件路径
+    character_names = set()  # 新增：收集所有角色名
     scriptbook_files = find_scriptbooks_in_dir(work_dir)
     
     if not scriptbook_files:
-        return track_map
+        return track_map, track_file_map, character_names
+    
+    print(f"    [台本扫描] 发现 {len(scriptbook_files)} 个台本文件:")
+    for sb_path in scriptbook_files:
+        print(f"      - {sb_path.absolute()}")
     
     for sb_path in scriptbook_files:
+        # 打印台本绝对路径
+        abs_path = sb_path.resolve()
+        print(f"    [台本读取] 正在读取: {abs_path}")
+        
         # 提取音轨编号
         track_num = extract_track_number_from_filename(sb_path.stem)
         
@@ -983,9 +1201,21 @@ def build_track_scriptbook_map(work_dir: Path) -> dict[int, list[str]]:
         if not content.strip():
             continue
         
-        # 解析台本，提取纯台词
+        # 解析台本，提取纯台词（带角色名）
         parsed = parse_scriptbook_content(content)
-        dialogue_lines = [p["text"] for p in parsed if p["type"] == "dialogue" and p["text"].strip()]
+        # 改进：保留角色名信息，格式为 "角色名：台词" 或 "台词"（无角色名时）
+        dialogue_lines = []
+        for p in parsed:
+            if p["type"] == "dialogue" and p["text"].strip():
+                char = p.get("character", "")
+                if char:
+                    # 有角色名：格式为 "角色名：台词"
+                    dialogue_lines.append(f"{char}：{p['text']}")
+                    # 收集角色名（用于自动添加到术语表）
+                    character_names.add(char)
+                else:
+                    # 无角色名：只有台词
+                    dialogue_lines.append(p["text"])
         
         if not dialogue_lines:
             continue
@@ -993,16 +1223,523 @@ def build_track_scriptbook_map(work_dir: Path) -> dict[int, list[str]]:
         if track_num is not None:
             # 有明确音轨编号
             track_map[track_num] = dialogue_lines
+            track_file_map[track_num] = abs_path  # 记录台本文件路径
             print(f"    [台本映射] 音轨{track_num:02d} ← {sb_path.name} ({len(dialogue_lines)}行台词)")
+            print(f"               台本路径: {abs_path}")
         else:
             # 无音轨编号，尝试匹配所有音轨（通常是PDF完整台本）
             # 暂时存储为 track_num=0（表示"所有音轨"）
             if 0 not in track_map:
                 track_map[0] = []
             track_map[0].extend(dialogue_lines)
+            track_file_map[0] = abs_path  # 记录台本文件路径
             print(f"    [台本映射] 完整台本 ← {sb_path.name} ({len(dialogue_lines)}行台词，未分配到具体音轨)")
+            print(f"               台本路径: {abs_path}")
     
-    return track_map
+    return track_map, track_file_map, character_names
+
+
+
+# ==================== 基于读音的ASR与台本对齐（改进版） ====================
+
+# pyopenjtalk 可用性检查和静默调用
+_PYOPENJTALK_AVAILABLE = False
+_pyopenjtalk_module = None
+
+try:
+    import pyopenjtalk
+    _pyopenjtalk_module = pyopenjtalk
+    _PYOPENJTALK_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def _call_pyopenjtalk_g2p(text: str) -> str:
+    """静默调用 pyopenjtalk.g2p，抑制所有 C 库警告
+    
+    使用上下文管理器临时重定向 stderr
+    """
+    if not _PYOPENJTALK_AVAILABLE or not _pyopenjtalk_module:
+        return ""
+    
+    import os
+    import sys
+    from contextlib import contextmanager
+    
+    @contextmanager
+    def _suppress_stderr():
+        """上下文管理器：临时抑制 stderr（包括 C 库输出）"""
+        # 保存原始 stderr 文件描述符
+        stderr_fd = sys.stderr.fileno() if hasattr(sys.stderr, 'fileno') else None
+        
+        if stderr_fd is not None:
+            # 保存原始 stderr
+            stderr_dup = os.dup(stderr_fd)
+            # 打开 /dev/null
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            # 重定向 stderr 到 /dev/null
+            os.dup2(devnull, stderr_fd)
+            os.close(devnull)
+            
+            try:
+                yield
+            finally:
+                # 恢复 stderr
+                os.dup2(stderr_dup, stderr_fd)
+                os.close(stderr_dup)
+        else:
+            yield
+    
+    with _suppress_stderr():
+        try:
+            return _pyopenjtalk_module.g2p(text)
+        except Exception:
+            return ""
+
+
+def text_to_phonemes(text: str) -> list[str]:
+    """将日文文本转换为音素序列（使用 pyopenjtalk）
+    
+    pyopenjtalk.g2p 返回空格分隔的音素字符串，如：
+    "今日は" -> "ky o o w a"
+    "小春" -> "k o h a r u"
+    
+    返回: 音素列表，如 ['ky', 'o', 'o', 'w', 'a']
+    """
+    if not text or not _PYOPENJTALK_AVAILABLE:
+        return []
+    
+    phoneme_str = _call_pyopenjtalk_g2p(text)
+    if phoneme_str:
+        return phoneme_str.split()
+    return []
+
+
+def text_to_reading(text: str) -> str:
+    """将日文文本转换为读音（片假名）
+    
+    使用 fugashi 分词获取每个词的读音，然后拼接成读音字符串。
+    这样可以处理同音异字、ASR误识别等问题。
+    
+    例：
+    - "今日は" -> "キョウハ"
+    - "小春" -> "コハル"
+    - "こはる" -> "コハル"  (同音)
+    """
+    if not text or not _FUGASHI_AVAILABLE:
+        return text
+    
+    readings = []
+    for word in _TAGGER(text):
+        # 获取读音（kana），如果没有则用 surface
+        reading = word.feature.kana if word.feature.kana else word.surface
+        readings.append(reading)
+    
+    return ''.join(readings)
+
+
+def normalize_reading_for_compare(reading: str) -> str:
+    """规范化读音用于比较
+    
+    1. 统一长音符号（ー）
+    2. 去掉促音（ッ）和拨音（ン）的细微差异
+    3. 浊音/半浊音统一（如 ビュ -> ビュ）
+    """
+    # 长音符号保留（用于区分短音和长音）
+    # 促音和拨音保留（它们是日语发音的重要特征）
+    
+    # 但可以做轻微规范化：
+    # 1. 统一小さい「ッ」和「っ」
+    # 2. 统一小さい「ャ」「ュ」「ョ」
+    
+    return reading
+
+
+def calculate_phoneme_similarity_from_sequences(p1: list[str], p2: list[str]) -> float:
+    """计算两个音素序列的相似度（编辑距离）
+    
+    参数:
+        p1: 音素序列1（如 ['ky', 'o', 'o', 'w', 'a']）
+        p2: 音素序列2
+    
+    返回: 相似度 (0.0-1.0)
+    """
+    if not p1 or not p2:
+        return 0.0
+    
+    # 如果音素序列完全相同，直接返回 1.0
+    if p1 == p2:
+        return 1.0
+    
+    # 计算编辑距离
+    def levenshtein_distance(a: list, b: list) -> int:
+        m, n = len(a), len(b)
+        if m == 0: return n
+        if n == 0: return m
+        
+        prev = list(range(n + 1))
+        curr = [0] * (n + 1)
+        
+        for i in range(1, m + 1):
+            curr[0] = i
+            for j in range(1, n + 1):
+                cost = 0 if a[i-1] == b[j-1] else 1
+                curr[j] = min(
+                    curr[j-1] + 1,
+                    prev[j] + 1,
+                    prev[j-1] + cost
+                )
+            prev, curr = curr, prev
+        
+        return prev[n]
+    
+    dist = levenshtein_distance(p1, p2)
+    max_len = max(len(p1), len(p2))
+    
+    return 1.0 - (dist / max_len)
+
+
+def calculate_phoneme_similarity(s1: str, s2: str) -> float:
+    """计算两个日文文本的音素相似度（使用 pyopenjtalk）
+    
+    这是最高精度的相似度计算，基于音素级别进行比较。
+    可以有效处理：
+    - 同音异字（如「小春」vs「こはる」→ 音素完全相同）
+    - ASR汉字误识别（如「夏生」vs「なつき」→ 音素完全相同）
+    - 浊音/半浊音差异（如「びゅ」vs「ぴゅ」→ by u vs py u）
+    
+    返回: 相似度 (0.0-1.0)
+    """
+    if not s1 or not s2:
+        return 0.0
+    
+    # 如果 pyopenjtalk 不可用，回退到读音相似度
+    if not _PYOPENJTALK_AVAILABLE:
+        return calculate_phonetic_similarity(s1, s2)
+    
+    # 转换为音素序列
+    p1 = text_to_phonemes(s1)
+    p2 = text_to_phonemes(s2)
+    
+    # 如果音素序列完全相同，直接返回 1.0
+    if p1 == p2:
+        return 1.0
+    
+    # 如果任一为空，返回 0
+    if not p1 or not p2:
+        return 0.0
+    
+    # 计算音素序列的编辑距离
+    def levenshtein_distance(a: list, b: list) -> int:
+        m, n = len(a), len(b)
+        if m == 0: return n
+        if n == 0: return m
+        
+        prev = list(range(n + 1))
+        curr = [0] * (n + 1)
+        
+        for i in range(1, m + 1):
+            curr[0] = i
+            for j in range(1, n + 1):
+                cost = 0 if a[i-1] == b[j-1] else 1
+                curr[j] = min(
+                    curr[j-1] + 1,
+                    prev[j] + 1,
+                    prev[j-1] + cost
+                )
+            prev, curr = curr, prev
+        
+        return prev[n]
+    
+    dist = levenshtein_distance(p1, p2)
+    max_len = max(len(p1), len(p2))
+    
+    # 音素相似度
+    phoneme_sim = 1.0 - (dist / max_len)
+    
+    return phoneme_sim
+
+
+def calculate_phonetic_similarity(s1: str, s2: str) -> float:
+    """计算两个日文文本的读音相似度（0.0-1.0）
+    
+    优先使用 pyopenjtalk 的音素级别比较，
+    如果不可用则回退到 fugashi 的片假名比较。
+    
+    算法：
+    1. 使用 pyopenjtalk 转为音素序列（如 k o h a r u）
+    2. 计算音素序列的编辑距离相似度
+    3. 结合字面相似度作为辅助
+    4. **新增：子串匹配检测** - 如果ASR内容是台本内容的子集，给予高分
+    5. **新增：部分重叠检测** - 如果ASR和台本有大量重叠内容，也给予高分
+    """
+    DEBUG_SIM = False  # 调试开关
+    
+    if not s1 or not s2:
+        return 0.0
+    
+    if DEBUG_SIM:
+        print(f"    [相似度计算] ASR: '{s1[:50]}...' vs 台本: '{s2[:50]}...'")
+    
+    # === 新增：子串匹配检测 ===
+    # ASR常会漏识别开头或结尾的部分内容，如果ASR内容是台本内容的子串，应给予高分
+    # 例如：ASR "姫川さんの言うことならなんでも聞きます、って" 
+    #      台本 "こないださ、姫川さんの言うことなら何でも言うこと聞きます～って、"
+    #      ASR是台本的后半部分（去掉开头"こないださ、"）
+    
+    # 去掉标点符号进行比较（标点符号可能不同）
+    # 注意：～ 长音符号在台本中常见，也需要过滤
+    s1_clean = re.sub(r'[、。？！…～♡♪\s・]', '', s1)
+    s2_clean = re.sub(r'[、。？！…～♡♪\s・]', '', s2)
+    
+    # 检查是否存在子串关系
+    if s1_clean and s2_clean:
+        # 情况1：ASR是台本的子串（ASR漏识别了开头或结尾）
+        if s1_clean in s2_clean:
+            # 计算覆盖率（ASR内容占台本的比例）
+            coverage = len(s1_clean) / len(s2_clean)
+            # 如果覆盖率>=50%，认为是有效匹配
+            if coverage >= 0.5:
+                return coverage * 0.95 + 0.05  # 0.5-1.0 覆盖率映射到 0.525-1.0
+        
+        # 情况2：台本是ASR的子串（ASR多识别了内容，较少见）
+        if s2_clean in s1_clean:
+            coverage = len(s2_clean) / len(s1_clean)
+            if coverage >= 0.5:
+                return coverage * 0.9 + 0.05
+    
+    # === 新增：部分重叠检测 ===
+    # 如果ASR和台本不是子串关系，但有大量重叠内容，也给予高分
+    # 使用最长公共子串（LCS）来计算重叠度
+    if s1_clean and s2_clean:
+        # 计算最长公共子串长度
+        def longest_common_substring(a: str, b: str) -> int:
+            """计算最长公共子串长度"""
+            m, n = len(a), len(b)
+            if m == 0 or n == 0:
+                return 0
+            
+            # 使用动态规划
+            dp = [[0] * (n + 1) for _ in range(m + 1)]
+            max_len = 0
+            
+            for i in range(1, m + 1):
+                for j in range(1, n + 1):
+                    if a[i-1] == b[j-1]:
+                        dp[i][j] = dp[i-1][j-1] + 1
+                        max_len = max(max_len, dp[i][j])
+            
+            return max_len
+        
+        lcs_len = longest_common_substring(s1_clean, s2_clean)
+        min_len = min(len(s1_clean), len(s2_clean))
+        
+        if min_len > 0:
+            overlap_ratio = lcs_len / min_len
+            # 如果重叠度>=40%，认为是有效匹配（降低阈值以处理ASR漏识别）
+            if overlap_ratio >= 0.4:
+                # 根据重叠度计算相似度分数
+                # 0.4 -> 0.65, 0.6 -> 0.75, 0.8 -> 0.85, 1.0 -> 0.95
+                score = 0.65 + (overlap_ratio - 0.4) * 0.5
+                return min(score, 0.95)  # 最高0.95（留一点空间给完全匹配)
+    
+    # === 新增：音素序列模糊匹配 ===
+    # 即使ASR和台本在文本层面差异较大，但如果读音相似，也应给予高分
+    # 这可以处理ASR漏识别、同音异字等情况
+    if _PYOPENJTALK_AVAILABLE and s1.strip() and s2.strip():
+        # 获取音素序列
+        p1 = text_to_phonemes(s1)
+        p2 = text_to_phonemes(s2)
+        
+        if p1 and p2:
+            # 计算音素序列的编辑距离相似度
+            phoneme_sim = calculate_phoneme_similarity_from_sequences(p1, p2)
+            
+            # 调试输出（仅当相似度较低但有可能是部分匹配时）
+            # if DEBUG_MODE and phoneme_sim < 0.8:
+            #     print(f"    [音素相似度] {phoneme_sim:.2f}: '{s1[:20]}...' vs '{s2[:20]}...'")
+            
+            # 如果音素相似度>=40%，认为是有效匹配（降低阈值以处理ASR漏识别）
+            if phoneme_sim >= 0.4:
+                # 结合文本相似度
+                text_sim = calculate_text_similarity(s1, s2)
+                # 音素相似度权重更高（70%），文本相似度辅助（30%）
+                combined_sim = phoneme_sim * 0.7 + text_sim * 0.3
+                return combined_sim
+    
+    # === 新增：N-gram部分匹配 ===
+    # 当ASR和台本在文本层面差异较大时，使用N-gram计算部分匹配度
+    # 这可以处理ASR漏识别中间内容的情况
+    if s1_clean and s2_clean:
+        # 计算2-gram和3-gram的匹配度
+        def ngram_similarity(a: str, b: str, n: int = 2) -> float:
+            """计算N-gram相似度"""
+            if len(a) < n or len(b) < n:
+                return 0.0
+            
+            # 生成N-gram集合
+            def get_ngrams(text: str, n: int) -> set:
+                return set(text[i:i+n] for i in range(len(text) - n + 1))
+            
+            ngrams_a = get_ngrams(a, n)
+            ngrams_b = get_ngrams(b, n)
+            
+            if not ngrams_a or not ngrams_b:
+                return 0.0
+            
+            # 计算Jaccard相似度
+            intersection = len(ngrams_a & ngrams_b)
+            union = len(ngrams_a | ngrams_b)
+            
+            return intersection / union if union > 0 else 0.0
+        
+        # 计算2-gram和3-gram相似度
+        sim_2gram = ngram_similarity(s1_clean, s2_clean, 2)
+        sim_3gram = ngram_similarity(s1_clean, s2_clean, 3)
+        
+        # 综合N-gram相似度（3-gram权重更高）
+        combined_ngram_sim = sim_3gram * 0.7 + sim_2gram * 0.3
+        
+        # 如果N-gram相似度>=25%，认为是有效匹配（降低阈值）
+        if combined_ngram_sim >= 0.25:
+            # 根据N-gram相似度计算分数
+            # 0.25 -> 0.55, 0.4 -> 0.7, 0.6 -> 0.85
+            score = 0.55 + (combined_ngram_sim - 0.25) * 1.5
+            return min(score, 0.92)  # 最高0.92（留一点空间给完全匹配）
+        
+        # === 新增：最长公共子序列（LCS）比例匹配 ===
+        # 当N-gram相似度也不够时，使用LCS比例
+        # LCS允许跳过字符，可以处理ASR漏识别中间内容的情况
+        def lcs_ratio(a: str, b: str) -> float:
+            """计算最长公共子序列比例
+            
+            返回: LCS长度 / min(len(a), len(b))
+            """
+            m, n = len(a), len(b)
+            if m == 0 or n == 0:
+                return 0.0
+            
+            # 使用滚动数组优化空间
+            prev = [0] * (n + 1)
+            curr = [0] * (n + 1)
+            
+            for i in range(1, m + 1):
+                for j in range(1, n + 1):
+                    if a[i-1] == b[j-1]:
+                        curr[j] = prev[j-1] + 1
+                    else:
+                        curr[j] = max(prev[j], curr[j-1])
+                prev, curr = curr, prev
+            
+            lcs_len = prev[n]
+            min_len = min(m, n)
+            
+            return lcs_len / min_len if min_len > 0 else 0.0
+        
+        lcs_sim = lcs_ratio(s1_clean, s2_clean)
+        
+        # 如果LCS比例>=50%，认为是有效匹配
+        if lcs_sim >= 0.5:
+            # 根据LCS比例计算分数
+            # 0.5 -> 0.6, 0.7 -> 0.75, 0.9 -> 0.9
+            score = 0.6 + (lcs_sim - 0.5) * 0.75
+            return min(score, 0.90)
+    
+    # === 原有算法 ===
+    # 优先使用音素相似度（pyopenjtalk）
+    if _PYOPENJTALK_AVAILABLE:
+        phoneme_sim = calculate_phoneme_similarity(s1, s2)
+        
+        # 如果音素完全相同，直接返回 1.0
+        if phoneme_sim >= 0.99:
+            return 1.0
+        
+        # 结合字面相似度
+        text_sim = calculate_text_similarity(s1, s2)
+        
+        # 音素相似度权重更高（80%），字面相似度辅助（20%）
+        return phoneme_sim * 0.8 + text_sim * 0.2
+    
+    # 回退到 fugashi 片假名比较
+    if not _FUGASHI_AVAILABLE:
+        return calculate_text_similarity(s1, s2)
+    
+    # 转换为读音（片假名）
+    r1 = text_to_reading(s1)
+    r2 = text_to_reading(s2)
+    
+    # 如果读音完全相同，直接返回 1.0
+    if r1 == r2:
+        return 1.0
+    
+    # 计算读音的编辑距离
+    def levenshtein_distance(a: str, b: str) -> int:
+        m, n = len(a), len(b)
+        if m == 0: return n
+        if n == 0: return m
+        
+        prev = list(range(n + 1))
+        curr = [0] * (n + 1)
+        
+        for i in range(1, m + 1):
+            curr[0] = i
+            for j in range(1, n + 1):
+                cost = 0 if a[i-1] == b[j-1] else 1
+                curr[j] = min(
+                    curr[j-1] + 1,
+                    prev[j] + 1,
+                    prev[j-1] + cost
+                )
+            prev, curr = curr, prev
+        
+        return prev[n]
+    
+    dist = levenshtein_distance(r1, r2)
+    max_len = max(len(r1), len(r2))
+    
+    if max_len == 0:
+        return 1.0 if r1 == r2 else 0.0
+    
+    phonetic_sim = 1.0 - (dist / max_len)
+    text_sim = calculate_text_similarity(s1, s2)
+    
+    return phonetic_sim * 0.7 + text_sim * 0.3
+
+
+def calculate_text_similarity(s1: str, s2: str) -> float:
+    """计算纯文本相似度（原 calculate_similarity 的逻辑）"""
+    if not s1 or not s2:
+        return 0.0
+    
+    # 方法1：最长公共子序列（LCS）
+    def lcs_length(a: str, b: str) -> int:
+        m, n = len(a), len(b)
+        prev = [0] * (n + 1)
+        curr = [0] * (n + 1)
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if a[i-1] == b[j-1]:
+                    curr[j] = prev[j-1] + 1
+                else:
+                    curr[j] = max(prev[j], curr[j-1])
+            prev, curr = curr, prev
+        return prev[n]
+    
+    lcs = lcs_length(s1, s2)
+    lcs_score = lcs / max(len(s1), len(s2))
+    
+    # 方法2：共同字符比例
+    common_chars = sum(1 for c in s1 if c in s2)
+    common_score = common_chars / max(len(s1), len(s2))
+    
+    # 方法3：编辑距离惩罚
+    len_diff = abs(len(s1) - len(s2))
+    len_penalty = 1.0 - (len_diff / max(len(s1), len(s2)))
+    
+    # 综合分数
+    final_score = (lcs_score * 0.5 + common_score * 0.3 + len_penalty * 0.2)
+    
+    return final_score
 
 
 def calculate_similarity(s1: str, s2: str) -> float:
@@ -1049,23 +1786,302 @@ def calculate_similarity(s1: str, s2: str) -> float:
     return final_score
 
 
+# ==================== 句子级别对齐（改进版） ====================
+
+# 日文句子切分标记
+_SENTENCE_SPLITTERS = ('。', '？', '?', '！', '!', '…', '・・・', '　')
+
+
+def split_to_sentences(text: str) -> list[str]:
+    """将文本切分成句子
+    
+    按日文句号、问号、感叹号等切分。
+    保留标点符号在句末。
+    
+    改进：
+    1. 支持多种句末标点组合
+    2. 正确处理逗号分隔的长句（逗号不是句末，不切分）
+    3. **「～」长音符号不作为句末标点**（它通常是语气延续，不是句子结束）
+    4. **「って」口语引用结束词作为软切分点**（ASR常见切分点）
+    5. **长句智能切分**：如果句子过长（>80字符），尝试在逗号后切分
+    6. **「～って」组合切分**：当长音符号+引用结束词出现时，切分
+    
+    参数:
+        text: 输入文本
+    
+    返回: 句子列表（已去除空白句子）
+    """
+    if not text:
+        return []
+    
+    import re
+    
+    # 先将多个省略号统一为 …
+    text = text.replace('・・・', '…').replace('。。', '。')
+    
+    # === 切分策略 ===
+    # 1. 首先按硬切分点（。？！）切分
+    # 2. 如果整句没有硬切分点，检查软切分点（って、等）
+    # 3. 如果句子过长（>80字符），尝试在逗号后切分
+    
+    # 硬切分标点：句末标点（。？！…）
+    hard_pattern = r'([^。？！…\n]+[。？！…]+)'
+    hard_matches = re.findall(hard_pattern, text)
+    
+    # 检查硬切分后的剩余文本
+    matched_text = ''.join(hard_matches)
+    remaining_text = text[len(matched_text):].strip()
+    
+    sentences = [s.strip() for s in hard_matches if s.strip()]
+    
+    if remaining_text:
+        # 有剩余文本，添加为新句子
+        sentences.append(remaining_text)
+    
+    # 如果没有硬切分，尝试软切分
+    if not sentences:
+        # 检查「って」作为引用结束词
+        tte_positions = []
+        for match in re.finditer(r'って[,、\s]', text):
+            tte_positions.append(match.end())
+        
+        if tte_positions:
+            # 在「って」后面切分
+            new_sentences = []
+            prev_pos = 0
+            for pos in tte_positions:
+                if pos < len(text):
+                    sent = text[prev_pos:pos].strip()
+                    if sent:
+                        new_sentences.append(sent)
+                    prev_pos = pos
+            
+            # 添加剩余部分
+            remaining = text[prev_pos:].strip()
+            if remaining:
+                new_sentences.append(remaining)
+            
+            if new_sentences:
+                sentences = new_sentences
+        
+        # 如果也没有软切分点，返回整句
+        if not sentences and text.strip():
+            sentences = [text.strip()]
+    
+    # 智能切分：如果句子过长（>80字符），尝试在逗号后切分
+    # 这有助于处理ASR将长句切分成多行的情况
+    final_sentences = []
+    for sent in sentences:
+        if len(sent) > 80:
+            # 尝试在逗号后切分
+            # 查找句子中间的逗号位置（避开开头和结尾）
+            comma_positions = []
+            for i, char in enumerate(sent):
+                if char in '、，' and 10 < i < len(sent) - 10:
+                    comma_positions.append(i)
+            
+            if comma_positions:
+                # 在中间的逗号处切分
+                # 选择最接近句子中间位置的逗号
+                mid_pos = len(sent) // 2
+                best_comma = min(comma_positions, key=lambda x: abs(x - mid_pos))
+                
+                first_part = sent[:best_comma + 1].strip()
+                second_part = sent[best_comma + 1:].strip()
+                
+                if first_part and second_part:
+                    final_sentences.append(first_part)
+                    final_sentences.append(second_part)
+                else:
+                    final_sentences.append(sent)
+            else:
+                final_sentences.append(sent)
+        else:
+            final_sentences.append(sent)
+    
+    # === 新增：处理「～って」组合切分 ===
+    # 如果整句只有一个问号或感叹号，检查是否有「～って」切分点
+    # 例如：「こないださ、姫川さんの言うことなら何でも言うこと聞きます～って、お前、言ってたっしょ？」
+    # 应该切分为：「こないださ、姫川さんの言うことなら何でも言うこと聞きます～って」和「お前、言ってたっしょ？」
+    if len(final_sentences) == 1 and len(final_sentences[0]) > 30:
+        sent = final_sentences[0]
+        # 查找「～って」模式（长音符号+引用结束词）
+        tte_match = re.search(r'～って[,、\s]', sent)
+        if tte_match:
+            # 在「って」后面切分
+            split_pos = tte_match.end()
+            first_part = sent[:split_pos].strip()
+            second_part = sent[split_pos:].strip()
+            if first_part and second_part:
+                final_sentences = [first_part, second_part]
+    
+    return final_sentences
+
+
+def split_lines_to_sentences(lines: list[str]) -> tuple[list[str], list[tuple[int, int]]]:
+    """将行列表切分成句子列表，并保留映射关系
+    
+    参数:
+        lines: 行列表
+    
+    返回: (句子列表, 映射列表)
+        - 句子列表: [sentence1, sentence2, ...]
+        - 映射列表: [(原行索引, 句子在原行中的起始位置), ...]
+    
+    例如：
+        输入: ["今日は。明日も。", "いい天気だ。"]
+        输出: 
+            sentences = ["今日は。", "明日も。", "いい天気だ。"]
+            mapping = [(0, 0), (0, 1), (1, 0)]  # (行索引, 句子索引)
+    """
+    all_sentences = []
+    mapping = []  # (line_idx, sentence_idx_in_line)
+    
+    for line_idx, line in enumerate(lines):
+        sentences = split_to_sentences(line)
+        for sent_idx, sent in enumerate(sentences):
+            all_sentences.append(sent)
+            mapping.append((line_idx, sent_idx))
+    
+    return all_sentences, mapping
+
+
+def match_sentences(asr_sentences: list[str], sb_sentences: list[str],
+                   similarity_threshold: float = 0.70) -> tuple[list[tuple[int, int, float]], list[int], list[int]]:
+    """句子级别的动态规划对齐
+    
+    参数:
+        asr_sentences: ASR句子列表
+        sb_sentences: 台本句子列表
+        similarity_threshold: 相似度阈值
+    
+    返回: (匹配对列表, ASR未匹配索引列表, 台本未匹配索引列表)
+        - 匹配对列表: [(asr_idx, sb_idx, similarity), ...]
+        - ASR未匹配索引列表: [idx, ...]
+        - 台本未匹配索引列表: [idx, ...]
+    """
+    if not asr_sentences or not sb_sentences:
+        return [], list(range(len(asr_sentences))), list(range(len(sb_sentences)))
+    
+    n_asr = len(asr_sentences)
+    n_sb = len(sb_sentences)
+    
+    # 计算相似度矩阵（使用音素相似度）
+    sim_matrix = [[0.0] * n_sb for _ in range(n_asr)]
+    
+    for i in range(n_asr):
+        if not asr_sentences[i].strip():
+            continue
+        for j in range(n_sb):
+            if not sb_sentences[j].strip():
+                continue
+            # 使用音素相似度（优先）或文本相似度
+            sim_matrix[i][j] = calculate_phonetic_similarity(
+                asr_sentences[i].strip(), 
+                sb_sentences[j].strip()
+            )
+    
+    # 动态规划对齐
+    # dp[i][j] = 前i个ASR句子和前j个台本句子的最大对齐分数
+    dp = [[0.0] * (n_sb + 1) for _ in range(n_asr + 1)]
+    path = [[None] * (n_sb + 1) for _ in range(n_asr + 1)]
+    
+    for i in range(1, n_asr + 1):
+        for j in range(1, n_sb + 1):
+            # 选项1：对齐
+            sim = sim_matrix[i-1][j-1]
+            align_score = dp[i-1][j-1] + (sim if sim >= similarity_threshold else -1)
+            
+            # 选项2：ASR跳过（ASR有额外内容）
+            skip_asr_score = dp[i-1][j] - 0.3
+            
+            # 选项3：台本跳过（台本有ASR没有的内容）
+            skip_sb_score = dp[i][j-1] - 0.3
+            
+            best_score = align_score
+            best_op = 'align'
+            
+            if skip_asr_score > best_score:
+                best_score = skip_asr_score
+                best_op = 'skip_asr'
+            
+            if skip_sb_score > best_score:
+                best_score = skip_sb_score
+                best_op = 'skip_sb'
+            
+            dp[i][j] = best_score
+            path[i][j] = best_op
+    
+    # 回溯
+    matches = []
+    asr_unmatched = []
+    sb_unmatched = []
+    
+    i, j = n_asr, n_sb
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            op = path[i][j]
+            if op == 'align':
+                sim = sim_matrix[i-1][j-1]
+                if sim >= similarity_threshold:
+                    matches.append((i-1, j-1, sim))
+                else:
+                    asr_unmatched.append(i-1)
+                i -= 1
+                j -= 1
+            elif op == 'skip_asr':
+                asr_unmatched.append(i-1)
+                i -= 1
+            elif op == 'skip_sb':
+                sb_unmatched.append(j-1)
+                j -= 1
+            else:
+                i -= 1
+                j -= 1
+        elif i > 0:
+            asr_unmatched.append(i-1)
+            i -= 1
+        elif j > 0:
+            sb_unmatched.append(j-1)
+            j -= 1
+    
+    # 反转（因为我们是从后往前回溯的）
+    matches.reverse()
+    asr_unmatched.reverse()
+    sb_unmatched.reverse()
+    
+    return matches, asr_unmatched, sb_unmatched
+
+
 def match_scriptbook_to_asr(asr_lines: list[str], scriptbook_lines: list[str], 
-                            similarity_threshold: float = 0.8) -> tuple[list[str], list[float]]:
+                            similarity_threshold: float = 0.75,
+                            asr_timestamps: list[str] = None) -> tuple[list[str], list[float], list[dict]]:
     """将台本台词与ASR结果对齐，返回对齐结果和相似度分数
     
-    使用动态规划算法，找到ASR和台本之间的最优对齐。
+    【改进版】使用句子级别对齐，支持：
+    - 一行多句的ASR与台本对齐（会拆分成多行）
+    - 多行ASR对应一行台本的情况
+    - 基于音素的相似度计算
+    
+    算法流程：
+    1. 将ASR行和台本行都切分成句子
+    2. 在句子级别进行动态规划对齐
+    3. 根据句子对齐结果，重建行级别的映射
+    4. 【关键改进】如果一个ASR行匹配多个台本句子，拆分成多行输出
     
     参数:
         asr_lines: ASR识别结果列表
         scriptbook_lines: 台本台词列表
         similarity_threshold: 相似度阈值，超过此值认为是对齐的
+        asr_timestamps: ASR时间戳列表（如 ["00:01:23", "00:02:45"]）
     
-    返回: (对齐后的台本台词列表, 相似度分数列表)
+    返回: (对齐后的台本台词列表, 相似度分数列表, 对齐详情列表)
         - 对齐的台词：返回台本内容
         - 未对齐的台词：返回空字符串（保留ASR）
+        - 对齐详情列表：包含每一行的对齐信息，用于导出
     """
     if not scriptbook_lines or not asr_lines:
-        return [], []
+        return [], [], []
     
     n_asr = len(asr_lines)
     n_sb = len(scriptbook_lines)
@@ -1074,8 +2090,144 @@ def match_scriptbook_to_asr(asr_lines: list[str], scriptbook_lines: list[str],
     asr_texts = [line.strip() for line in asr_lines]
     sb_texts = [line.strip() for line in scriptbook_lines]
     
-    # 计算相似度矩阵
-    # sim_matrix[i][j] = asr_lines[i] 与 scriptbook_lines[j] 的相似度
+    # === 步骤1：句子级别切分 ===
+    asr_sentences, asr_mapping = split_lines_to_sentences(asr_texts)
+    sb_sentences, sb_mapping = split_lines_to_sentences(sb_texts)
+    
+    # 如果切分后句子数量和原行数相同，直接使用行级对齐（更快）
+    if len(asr_sentences) == n_asr and len(sb_sentences) == n_sb:
+        # 使用简单的行级对齐
+        return _match_lines_directly(asr_texts, sb_texts, similarity_threshold, asr_timestamps)
+    
+    # === 步骤2：句子级别对齐 ===
+    print(f"    [句子对齐] ASR: {n_asr}行 → {len(asr_sentences)}句, 台本: {n_sb}行 → {len(sb_sentences)}句")
+    matches, asr_unmatched, sb_unmatched = match_sentences(asr_sentences, sb_sentences, similarity_threshold)
+    print(f"    [句子对齐] 匹配: {len(matches)}对, ASR未匹配: {len(asr_unmatched)}句, 台本未匹配: {len(sb_unmatched)}句")
+    
+    # === 步骤3：重建行级映射 ===
+    # 构建句子索引到行的映射
+    asr_sent_to_line = {}  # asr_sent_idx -> asr_line_idx
+    for sent_idx, (line_idx, _) in enumerate(asr_mapping):
+        asr_sent_to_line[sent_idx] = line_idx
+    
+    sb_sent_to_line = {}  # sb_sent_idx -> sb_line_idx
+    for sent_idx, (line_idx, _) in enumerate(sb_mapping):
+        sb_sent_to_line[sent_idx] = line_idx
+    
+    # 构建每个ASR行对应的台本句子列表
+    # asr_line_sb_sentences[asr_line_idx] = [(sb_sentence_idx, similarity), ...]
+    asr_line_sb_sentences = defaultdict(list)
+    for asr_sent_idx, sb_sent_idx, sim in matches:
+        asr_line_idx = asr_sent_to_line[asr_sent_idx]
+        asr_line_sb_sentences[asr_line_idx].append((sb_sent_idx, sim))
+    
+    # === 步骤4：生成结果 ===
+    result = [""] * n_asr  # 默认空字符串（保留ASR）
+    scores = [0.0] * n_asr
+    alignment_details = []
+    expanded_result = []  # 新增：支持拆分后的结果列表
+    expanded_scores = []  # 新增：支持拆分后的分数列表
+    expanded_timestamps = []  # 新增：支持拆分后的时间戳列表
+    
+    for asr_line_idx in range(n_asr):
+        asr_text = asr_texts[asr_line_idx]
+        timestamp = asr_timestamps[asr_line_idx] if asr_timestamps and asr_line_idx < len(asr_timestamps) else ""
+        
+        if asr_line_idx in asr_line_sb_sentences:
+            # 有匹配的台本句子
+            sb_sents = asr_line_sb_sentences[asr_line_idx]
+            
+            # 【关键改进】如果一个ASR行匹配了多个台本句子，合并为一行输出
+            # 这样可以保持时间戳映射正确，避免空行时间戳问题
+            if len(sb_sents) > 1:
+                # 按台本句子顺序排序（保持对话顺序）
+                sb_sents_sorted = sorted(sb_sents, key=lambda x: x[0])
+                
+                # 合并所有匹配的台本句子为一行
+                merged_texts = []
+                total_chars = 0
+                best_sim = 0.0
+                
+                for sb_sent_idx, sim in sb_sents_sorted:
+                    sb_text = sb_sentences[sb_sent_idx]
+                    merged_texts.append(sb_text)
+                    total_chars += len(sb_text)
+                    best_sim = max(best_sim, sim)  # 取最高相似度
+                
+                # 合并为一行（用空格分隔）
+                merged_text = " ".join(merged_texts)
+                
+                # 添加合并后的结果
+                expanded_result.append(merged_text)
+                expanded_scores.append(best_sim)
+                expanded_timestamps.append(timestamp)
+                
+                # 记录详情（标记为合并匹配）
+                alignment_details.append({
+                    "asr_index": asr_line_idx,
+                    "sb_index": -1,  # 多个台本句子
+                    "asr_text": asr_text,
+                    "sb_text": merged_text,
+                    "similarity": best_sim,
+                    "timestamp": timestamp,
+                    "status": "matched_merged",  # 标记为合并匹配
+                    "merged_count": len(sb_sents),
+                    "merged_from": [sb_sent_idx for sb_sent_idx, _ in sb_sents_sorted]
+                })
+            else:
+                # 单个匹配，保持原逻辑
+                best_sb_sent_idx, best_sim = sb_sents[0]
+                sb_line_idx = sb_sent_to_line[best_sb_sent_idx]
+                sb_text = sb_sentences[best_sb_sent_idx]
+                
+                expanded_result.append(sb_text)
+                expanded_scores.append(best_sim)
+                expanded_timestamps.append(timestamp)
+                
+                alignment_details.append({
+                    "asr_index": asr_line_idx,
+                    "sb_index": sb_line_idx,
+                    "asr_text": asr_text,
+                    "sb_text": sb_text,
+                    "similarity": best_sim,
+                    "timestamp": timestamp,
+                    "status": "matched"
+                })
+        else:
+            # 无匹配，保留ASR
+            expanded_result.append("")
+            expanded_scores.append(0.0)
+            expanded_timestamps.append(timestamp)
+            
+            if asr_text:
+                alignment_details.append({
+                    "asr_index": asr_line_idx,
+                    "sb_index": -1,
+                    "asr_text": asr_text,
+                    "sb_text": "",
+                    "similarity": 0.0,
+                    "timestamp": timestamp,
+                    "status": "asr_only"
+                })
+    
+    # 反转对齐详情（按ASR顺序排列）
+    alignment_details.reverse()
+    
+    # 【重要】返回拆分后的结果（行数可能增加）
+    return expanded_result, expanded_scores, alignment_details
+
+
+def _match_lines_directly(asr_texts: list[str], sb_texts: list[str],
+                          similarity_threshold: float,
+                          asr_timestamps: list[str] = None) -> tuple[list[str], list[float], list[dict]]:
+    """直接行级对齐（当行数和句子数相同时使用）
+    
+    这是一个优化的快速路径，避免不必要的句子切分。
+    """
+    n_asr = len(asr_texts)
+    n_sb = len(sb_texts)
+    
+    # 计算相似度矩阵（使用音素相似度）
     sim_matrix = [[0.0] * n_sb for _ in range(n_asr)]
     
     for i in range(n_asr):
@@ -1084,7 +2236,7 @@ def match_scriptbook_to_asr(asr_lines: list[str], scriptbook_lines: list[str],
         for j in range(n_sb):
             if not sb_texts[j]:
                 continue
-            sim_matrix[i][j] = calculate_similarity(asr_texts[i], sb_texts[j])
+            sim_matrix[i][j] = calculate_phonetic_similarity(asr_texts[i], sb_texts[j])
     
     # 使用动态规划找到最优对齐
     # dp[i][j] = 前i个ASR和前j个台本的最大对齐分数
@@ -1122,31 +2274,176 @@ def match_scriptbook_to_asr(asr_lines: list[str], scriptbook_lines: list[str],
     # 回溯找到对齐结果
     result = [""] * n_asr  # 默认空字符串（保留ASR）
     scores = [0.0] * n_asr
+    alignment_details = []  # 新增：对齐详情列表
     
     i, j = n_asr, n_sb
     while i > 0 and j > 0:
         op = path[i][j]
         if op == 'align':
             sim = sim_matrix[i-1][j-1]
+            asr_text = asr_texts[i-1]
+            sb_text = sb_texts[j-1]
+            timestamp = asr_timestamps[i-1] if asr_timestamps and i-1 < len(asr_timestamps) else ""
+            
             if sim >= similarity_threshold:
-                result[i-1] = sb_texts[j-1]  # 使用台本内容
+                result[i-1] = sb_text  # 使用台本内容
                 scores[i-1] = sim
+                # 记录对齐详情
+                alignment_details.append({
+                    "asr_index": i-1,
+                    "sb_index": j-1,
+                    "asr_text": asr_text,
+                    "sb_text": sb_text,
+                    "similarity": sim,
+                    "timestamp": timestamp,
+                    "status": "matched"  # 匹配成功
+                })
+            else:
+                # 相似度不够，保留ASR
+                alignment_details.append({
+                    "asr_index": i-1,
+                    "sb_index": j-1,
+                    "asr_text": asr_text,
+                    "sb_text": sb_text,
+                    "similarity": sim,
+                    "timestamp": timestamp,
+                    "status": "low_similarity"  # 相似度过低
+                })
             i -= 1
             j -= 1
         elif op == 'skip_asr':
             # ASR中有额外内容（拟声词等），保留ASR
             result[i-1] = ""  # 空字符串表示保留ASR
             scores[i-1] = 0.0
+            asr_text = asr_texts[i-1]
+            timestamp = asr_timestamps[i-1] if asr_timestamps and i-1 < len(asr_timestamps) else ""
+            alignment_details.append({
+                "asr_index": i-1,
+                "sb_index": -1,
+                "asr_text": asr_text,
+                "sb_text": "",
+                "similarity": 0.0,
+                "timestamp": timestamp,
+                "status": "asr_only"  # ASR独有内容
+            })
             i -= 1
         elif op == 'skip_sb':
             # 台本中有ASR没有的内容（可能是ASR漏识别）
+            alignment_details.append({
+                "asr_index": -1,
+                "sb_index": j-1,
+                "asr_text": "",
+                "sb_text": sb_texts[j-1],
+                "similarity": 0.0,
+                "timestamp": "",
+                "status": "sb_only"  # 台本独有内容
+            })
             j -= 1
         else:
             # 默认情况
             i -= 1
             j -= 1
     
-    return result, scores
+    # 反转对齐详情（按ASR顺序排列）
+    alignment_details.reverse()
+    
+    return result, scores, alignment_details
+
+
+def export_alignment_result(alignment_details: list[dict], 
+                            scriptbook_path: Path,
+                            output_dir: Path,
+                            track_num: int = None,
+                            asr_file: str = None) -> Path:
+    """导出ASR与台本的对齐结果到txt文件
+    
+    参数:
+        alignment_details: 对齐详情列表
+        scriptbook_path: 台本文件路径
+        output_dir: 输出目录
+        track_num: 音轨编号（可选）
+        asr_file: ASR文件名（可选）
+    
+    返回: 输出文件路径
+    """
+    import datetime
+    
+    # 确保输出目录存在
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 构造输出文件名
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if track_num is not None:
+        output_name = f"alignment_track{track_num:02d}_{timestamp}.txt"
+    else:
+        output_name = f"alignment_{timestamp}.txt"
+    
+    output_path = output_dir / output_name
+    
+    # 统计对齐情况
+    matched_count = sum(1 for d in alignment_details if d["status"] == "matched")
+    asr_only_count = sum(1 for d in alignment_details if d["status"] == "asr_only")
+    sb_only_count = sum(1 for d in alignment_details if d["status"] == "sb_only")
+    low_sim_count = sum(1 for d in alignment_details if d["status"] == "low_similarity")
+    
+    # 构建输出内容
+    lines = []
+    lines.append("=" * 60)
+    lines.append("ASR与台本对齐结果")
+    lines.append("=" * 60)
+    lines.append(f"台本文件: {scriptbook_path}")
+    lines.append(f"音轨编号: {track_num if track_num is not None else '未指定'}")
+    lines.append(f"ASR文件: {asr_file if asr_file else '未指定'}")
+    lines.append(f"导出时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append(f"统计信息:")
+    lines.append(f"  匹配成功: {matched_count} 行")
+    lines.append(f"  ASR独有: {asr_only_count} 行（拟声词/喘息声等）")
+    lines.append(f"  台本独有: {sb_only_count} 行（可能漏识别）")
+    lines.append(f"  相似度过低: {low_sim_count} 行")
+    lines.append("")
+    lines.append("=" * 60)
+    lines.append("详细对齐结果")
+    lines.append("=" * 60)
+    lines.append("")
+    
+    for detail in alignment_details:
+        status = detail["status"]
+        timestamp_str = detail.get("timestamp", "")
+        asr_text = detail.get("asr_text", "")
+        sb_text = detail.get("sb_text", "")
+        similarity = detail.get("similarity", 0.0)
+        
+        if status == "matched":
+            lines.append(f"[匹配] 时间: {timestamp_str}")
+            lines.append(f"  ASR : {asr_text}")
+            lines.append(f"  台本: {sb_text}")
+            lines.append(f"  相似度: {similarity:.1%}")
+            lines.append("")
+        elif status == "asr_only":
+            lines.append(f"[ASR独有] 时间: {timestamp_str}")
+            lines.append(f"  ASR : {asr_text}")
+            lines.append(f"  说明: 台本中无此内容，可能是拟声词/喘息声/即兴发挥")
+            lines.append("")
+        elif status == "sb_only":
+            lines.append(f"[台本独有]")
+            lines.append(f"  台本: {sb_text}")
+            lines.append(f"  说明: ASR中无此内容，可能是漏识别")
+            lines.append("")
+        elif status == "low_similarity":
+            lines.append(f"[相似度过低] 时间: {timestamp_str}")
+            lines.append(f"  ASR : {asr_text}")
+            lines.append(f"  台本: {sb_text}")
+            lines.append(f"  相似度: {similarity:.1%}")
+            lines.append(f"  说明: 相似度低于阈值，保留ASR原文")
+            lines.append("")
+    
+    # 写入文件
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    
+    print(f"    [对齐导出] 已保存对齐结果: {output_path}")
+    return output_path
 
 
 def build_aligned_scriptbook_prompt(asr_lines: list[str], aligned_lines: list[str], 
@@ -2087,6 +3384,86 @@ def validate_terms(terms: dict[str, str]) -> dict[str, str]:
     return validated
 
 
+# 台本角色名分析提示词（简短版，消耗很小）
+# ==================== 身份称呼统一译名映射表 ====================
+# 常见身份称呼的固定译名（不需要LLM分析）
+ROLE_TRANSLATIONS = {
+    # 家庭关系
+    '母': '妈妈',
+    '母さん': '妈妈',
+    'お母さん': '妈妈',
+    'ママ': '妈妈',
+    'かあさん': '妈妈',
+    '姉': '姐姐',
+    '姉さん': '姐姐',
+    'お姉さん': '姐姐',
+    '姉ちゃん': '姐姐',
+    'お姉ちゃん': '姐姐',
+    '妹': '妹妹',
+    '妹さん': '妹妹',
+    'いもうと': '妹妹',
+    '父': '爸爸',
+    '父さん': '爸爸',
+    'お父さん': '爸爸',
+    'パパ': '爸爸',
+    'とうさん': '爸爸',
+    '兄': '哥哥',
+    '兄さん': '哥哥',
+    'お兄さん': '哥哥',
+    '兄ちゃん': '哥哥',
+    'お兄ちゃん': '哥哥',
+    '弟': '弟弟',
+    '弟さん': '弟弟',
+    'おじ': '叔叔',
+    '叔父': '叔叔',
+    '叔父さん': '叔叔',
+    'おば': '阿姨',
+    '叔母': '阿姨',
+    '叔母さん': '阿姨',
+    '祖父': '爷爷',
+    'おじいさん': '爷爷',
+    '祖母': '奶奶',
+    'おばあさん': '奶奶',
+    # 其他关系
+    '娘': '女儿',
+    '息子': '儿子',
+    '孫': '孙子',
+    # 师生关系
+    '先生': '老师',
+    '教師': '老师',
+    '生徒': '学生',
+    '先輩': '前辈',
+    '後輩': '后辈',
+    # 职业称呼
+    '看護師': '护士',
+    '医者': '医生',
+    '店員': '店员',
+    '受付': '前台',
+    # 特殊关系
+    '主': '主人',
+    'ご主人': '主人',
+    '坊ちゃん': '少爷',
+    'お嬢様': '大小姐',
+    '令嬢': '大小姐',
+}
+
+SCRIPTBOOK_CHARACTER_PROMPT = (
+    "以下是从台本文件中提取的角色名列表。\n"
+    "请为每个角色名给出：1) 正确的日文读音（片假名），2) 统一的中文译名。\n\n"
+    "输出要求：\n"
+    "1. 对于有明确汉字写法的角色名（如「雫葵」），需要给出其正确的日文读音（如 シズキ）\n"
+    "2. 对于片假名角色名（如「アヤ」），读音就是其本身\n"
+    "3. 对于特殊称呼（如「日直」），可以保留原意或音译\n\n"
+    "请严格按以下紧凑 JSON 格式输出，不要添加任何其他内容：\n"
+    '{"characters":[{"name":"角色名1","reading":"片假名读音","translation":"中文译名"},...]}\n\n'
+    "注意：\n"
+    "- reading 必须是片假名，表示该角色名的正确发音\n"
+    "- 译名应简洁自然，适合在对话中使用\n"
+    "- 同一角色在不同场景可能有不同称呼，但译名应统一\n"
+    "- **重要**：汉字角色名可能有特殊读音，请根据常见的日本人名读音规则判断\n"
+    "  例如：雫葵→シズキ、熾月→シズキ、四月→シガツ\n"
+)
+
 CHARACTER_ANALYSIS_PROMPT = (
     "以下是从日文ASR转录文本中提取的词汇信息，以及从文件名中识别出的角色名候选。\n"
     "请分析这些词汇，识别作品中的角色名、称呼、重要物品和设定用语，并给出统一的中文译名。\n\n"
@@ -2261,6 +3638,151 @@ def analyze_characters_with_llm(cores: dict[str, dict], clusters: list[list[str]
     except Exception as e:
         print(f"  ⚠ LLM 分析失败: {e}")
         return {}, []
+
+
+def analyze_scriptbook_characters(character_names: set[str], work_dir: Path) -> dict[str, str]:
+    """
+    分析台本中提取的角色名，调用 LLM 给出统一译名和读音。
+    
+    Args:
+        character_names: 台本中提取的角色名集合
+        work_dir:作品展目录
+        
+    Returns:
+        角色名译名字典 {日文名: 中文译名}
+        
+    副作用：
+        - 更新 .terms.json（术语表）
+        - 更新 .alias.json（ASR误识别映射）
+    """
+    if not character_names:
+        return {}
+    
+    print(f"\n[台本角色分析] 发现 {len(character_names)} 个角色名: {', '.join(sorted(character_names))}")
+    
+    # === 先检查身份称呼映射表 ===
+    terms = {}
+    remaining_names = set()
+    
+    for name in character_names:
+        if name in ROLE_TRANSLATIONS:
+            terms[name] = ROLE_TRANSLATIONS[name]
+            print(f"  [身份称呼] {name} → {ROLE_TRANSLATIONS[name]} (预设译名)")
+        else:
+            remaining_names.add(name)
+    
+    # 如果所有角色名都是身份称呼，直接返回
+    if not remaining_names:
+        print(f"  [台本角色分析] 全部为身份称呼，使用预设译名")
+        return terms
+    
+    # === 对剩余的非身份称呼角色名调用 LLM ===
+    print(f"  [台本角色分析] 剩余 {len(remaining_names)} 个角色名需 LLM 分析: {', '.join(sorted(remaining_names))}")
+    
+    # 构建简短 prompt
+    content = SCRIPTBOOK_CHARACTER_PROMPT + "\n\n角色名列表：\n"
+    for name in sorted(remaining_names):
+        content += f"- {name}\n"
+    
+    try:
+        # 调用 LLM API
+        _raw_params = _api_cfg.get("generation_params", {})
+        gen_params = {k: v for k, v in _raw_params.items()
+                      if k in ('temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty',
+                               'stop', 'logit_bias', 'user', 'reasoning_effort')}
+        gen_params['max_tokens'] = 4096
+        
+        api_response = client.chat.completions.create(
+            model=_api_cfg["model"],
+            messages=[{"role": "user", "content": content}],
+            timeout=_api_cfg.get("timeout", 2000),
+            **gen_params
+        )
+        
+        response = api_response.choices[0].message.content.strip()
+        
+        # 打印 LLM 原始返回内容（便于调试）
+        print(f"  [台本角色分析] LLM 原始返回:")
+        print(f"    {response[:500]}{'...' if len(response) > 500 else ''}")
+        
+        # 解析 JSON（新格式：{"characters":[{"name":"角色名1","reading":"片假名读音","translation":"中文译名"},...]}）
+        json_match = re.search(r'\{[\s\S]*\}', response)
+        if json_match:
+            result = json.loads(json_match.group())
+            characters = result.get('characters', [])
+            
+            if characters:
+                print(f"  [台本角色分析] LLM 返回 {len(characters)} 个角色信息")
+                
+                # 构建角色读音映射（用于检测ASR变体）
+                character_readings = {}  # {name: reading}
+                for char_info in characters:
+                    name = char_info.get('name', '')
+                    reading = char_info.get('reading', '')
+                    translation = char_info.get('translation', '')
+                    
+                    if name and translation:
+                        terms[name] = translation
+                        print(f"    {name} → {translation} (读音: {reading})")
+                        if reading:
+                            character_readings[name] = reading
+                
+                # === 新增：检测可能的ASR变体 ===
+                # 如果有多个角色名读音相似，可能是同一角色的不同写法
+                # 例如：「雫葵」和「熾月」读音都是「シズキ」
+                if len(character_readings) >= 2 and _PYOPENJTALK_AVAILABLE:
+                    alias_list = load_alias(work_dir)
+                    existing_alias_pairs = {(a.get('alias'), a.get('target')) for a in alias_list}
+                    
+                    names = list(character_readings.keys())
+                    for i in range(len(names)):
+                        for j in range(i + 1, len(names)):
+                            name1, name2 = names[i], names[j]
+                            reading1, reading2 = character_readings[name1], character_readings[name2]
+                            
+                            # 如果读音相同，可能是同一角色的不同写法
+                            if reading1 and reading2:
+                                # 计算读音相似度
+                                sim = calculate_phoneme_similarity(reading1, reading2)
+                                
+                                if sim >= 0.8:  # 读音高度相似
+                                    # 选择译名更常用的作为target
+                                    # 优先选择有汉字写法的
+                                    if re.search(r'[\u4e00-\u9fff]', name1) and not re.search(r'[\u4e00-\u9fff]', name2):
+                                        target, alias = name1, name2
+                                    elif re.search(r'[\u4e00-\u9fff]', name2) and not re.search(r'[\u4e00-\u9fff]', name1):
+                                        target, alias = name2, name1
+                                    else:
+                                        # 都有汉字或都没有，选择terms中已有的
+                                        target, alias = name1, name2
+                                    
+                                    # 检查是否已存在
+                                    if (alias, target) not in existing_alias_pairs:
+                                        alias_item = {
+                                            "alias": alias,
+                                            "target": target,
+                                            "confidence": sim,
+                                            "source": "scriptbook_character_analysis"
+                                        }
+                                        alias_list.append(alias_item)
+                                        print(f"    [检测到变体] {alias} → {target} (读音相似度: {sim:.1%})")
+                    
+                    # 保存alias表
+                    if alias_list:
+                        save_alias(work_dir, alias_list)
+                        print(f"  [台本角色分析] 已更新 alias 表")
+                
+                return terms
+            else:
+                print(f"  ⚠ LLM 返回格式错误，characters 为空")
+                return terms
+        else:
+            print(f"  ⚠ LLM 返回格式错误，未找到 JSON")
+            return terms  # 返回预设译名
+            
+    except Exception as e:
+        print(f"  ⚠ LLM 分析失败: {e}")
+        return terms  # 返回预设译名
 
 
 # ==================== 工具函数 ====================
@@ -2624,7 +4146,8 @@ def translate_lyrics_batch(lyrics: list[str], terms: dict[str, str] = None, alia
 
     # 添加台本参考内容（如果启用且存在）
     if USE_SCRIPTBOOK_FOR_TRANSLATION and scriptbook_lines:
-        scriptbook_prompt = build_scriptbook_prompt(scriptbook_lines)
+        # 使用差异检测版本，只发送ASR与台本有差异的部分
+        scriptbook_prompt = build_scriptbook_prompt(scriptbook_lines, None, lyrics)
         if scriptbook_prompt:
             prompt_parts.append(scriptbook_prompt)
 
@@ -3001,7 +4524,17 @@ def translate_lrc_file(source_path: Path, target_path: Path, terms: dict[str, st
 
     # 整文件翻译（不再分批）
     print(f"  翻译整文件 (行数: {len(split_lyrics)}, 字符: {sum(len(l) for l in split_lyrics)})")
-    translated_split = translate_lyrics_batch(split_lyrics, terms, alias_list, worldview, retry_tracker)
+    
+    # === 台本对齐功能已禁用 ===
+    # 原因：台本和ASR的顺序可能不完全一致，强行对齐会导致时间轴错位
+    # 例如：ASR中的"はい"可能被匹配到台本中不同位置的"はい"，导致翻译内容错位
+    # 现在：台本仅作为翻译参考，不进行对齐替换
+    corrected_lyrics = split_lyrics
+    if scriptbook_lines:
+        print(f"  [台本参考] 提供台本作为翻译参考（不进行对齐替换）")
+        # 台本内容已通过 scriptbook_lines 参数传递给翻译函数，作为参考
+    
+    translated_split = translate_lyrics_batch(corrected_lyrics, terms, alias_list, worldview, retry_tracker, scriptbook_lines)
     
     # 收集出错的文件（如果重试次数 >= 3）
     if retry_tracker['count'] >= 3:
@@ -3471,40 +5004,182 @@ ACTING_HINT_PATTERN = r'^（[^）]+）\s*$'
 # 台词缩进标记（行首有空格的台词）
 DIALOGUE_INDENT_PATTERN = r'^\s+[^【《\(（#SE]'
 
+# ==================== 台本文件识别 ====================
+
+# 台本文件关键词（用于识别台本文件）
+SCRIPTBOOK_KEYWORDS = [
+    '台本', 'だいほん', 'だい本', 'ダイホン', 'script', '台本付き',
+    '仮台本', 'かり台本', '本編', 'ほんぺん',
+    'セリフ初稿', 'せりふしょこう', 'シナリオ', 'しなりお',
+    '演技指定', 'えんぎしてい', '射精タイミング', '全章'
+]
+
+# 台本文件扩展名
+SCRIPTBOOK_EXTS = {'.txt', '.pdf'}
+
+# 非台本文件关键词（用于排除特殊用途文件）
+NON_SCRIPTBOOK_KEYWORDS = [
+    'Finishtime', 'クレジット', 'credit', 'readme', 'Readme',
+    '使い方', 'つかいかた', '説明', 'せつめい', '注意', 'ちゅうい',
+    'あとがき', 'アトガキ', '感想', 'かんそう', '紹介', 'しょうかい'
+]
+
 
 def is_scriptbook_file(file_path: Path) -> bool:
     """检测文件是否为台本文件
     
-    判断依据：
-    1. 文件扩展名为 .txt
-    2. 文件名包含台本关键词
-    3. 文件内容包含典型的台本标记（角色名【】、SE、方向指示#等）
+    判断依据（按优先级）：
+    1. 文件扩展名为 .txt 或 .pdf
+    2. 排除特殊用途文件（Finishtime.txt、クレジット.txt等）
+    3. 文件名包含台本关键词
+    4. 文件名符合台本命名模式（トラック1、track1、纯数字编号等）
+    5. 文件内容包含典型的台本标记
+    
+    改进：对于纯数字编号文件，主动检查内容是否为台本格式
     """
     if file_path.suffix.lower() not in SCRIPTBOOK_EXTS:
         return False
     
+    filename = file_path.name  # 原始文件名（保留大小写）
+    filename_lower = filename.lower()
+    stem = file_path.stem  # 不含扩展名的文件名
+    
+    # 排除特殊用途文件（优先级最高）
+    for keyword in NON_SCRIPTBOOK_KEYWORDS:
+        if keyword.lower() in filename_lower:
+            return False
+    
     # 检查文件名是否包含台本关键词
-    filename = file_path.name.lower()
     for keyword in SCRIPTBOOK_KEYWORDS:
-        if keyword.lower() in filename:
+        if keyword.lower() in filename_lower:
             return True
     
-    # 检查文件内容是否包含台本特征
+    # 检查文件名是否符合台本命名模式
+    # 1. トラック + 数字（如 トラック1、トラック２）
+    if re.match(r'^トラック[０-９0-9]+', stem, re.IGNORECASE):
+        return True
+    
+    # 2. track + 数字（如 track1、Track01、TRACK1）
+    if re.match(r'^track[０-９0-9]+', stem, re.IGNORECASE):
+        return True
+    
+    # 3. tr + 数字（如 tr01、TR01）
+    if re.match(r'^tr[０-９0-9]+', stem, re.IGNORECASE):
+        return True
+    
+    # 4. 纯数字编号（如 01、02、1、2、１、２）
+    # 改进：不要求父文件夹名称，而是检查文件内容
+    if re.match(r'^[０-９0-9]+$', stem):
+        # 纯数字文件名，检查内容是否为台本格式
+        if _check_scriptbook_content(file_path):
+            return True
+    
+    # 5. 数字-数字格式（如 01-1、1-2）
+    if re.match(r'^[０-９0-9]+[-_][０-９0-9]+', stem):
+        # 数字编号格式，检查内容是否为台本格式
+        if _check_scriptbook_content(file_path):
+            return True
+    
+    # 6. 父文件夹名包含台本关键词
+    parent_name = file_path.parent.name.lower()
+    if parent_name in ('台本', 'だいほん', 'script', 'scripts', 'scenario', 'scenarios'):
+        return True
+    
+    # 7. 其他情况：检查文件内容
+    return _check_scriptbook_content(file_path)
+
+
+def _check_scriptbook_content(file_path: Path) -> bool:
+    """检查文件内容是否为台本格式
+    
+    台本特征：
+    1. 角色名标记【】（如 【まどか】）
+    2. 角色名：台词格式（如 雫葵：はふー。）
+    3. SE标记（如 SE:潮吹）
+    4. 方向指示#（如 #正面　距離近く）
+    5. 音轨标记（如 トラック1）
+    6. 纯台词型（无角色名，但有大量日文对话行）
+    
+    返回：是否为台本格式
+    """
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
     except Exception:
         return False
     
-    # 检测台本特征标记
-    has_character_marks = bool(re.search(r'^【[^】]+】', content, re.MULTILINE))
+    if not content.strip():
+        return False
+    
+    lines = content.split('\n')
+    non_empty_lines = [l.strip() for l in lines if l.strip()]
+    
+    if len(non_empty_lines) < 5:
+        return False
+    
+    # 台本特征检测
+    # 1. 角色名标记【】（如 【まどか】）
+    has_character_brackets = bool(re.search(r'^【[^】]+】', content, re.MULTILINE))
+    
+    # 2. 角色名：台词格式（如 雫葵：はふー。）
+    # 格式：角色名（2-10字符）+ 全角冒号 + 台词
+    has_character_dialogue = bool(re.search(r'^[^:\n]{2,10}：[^\n]+', content, re.MULTILINE))
+    
+    # 3. SE标记
     has_se_marks = bool(re.search(r'^SE[:：\s]', content, re.MULTILINE))
+    
+    # 4. 方向指示#
     has_direction = bool(re.search(r'^#[^\n]+$', content, re.MULTILINE))
+    
+    # 5. 音轨标记
     has_track = bool(re.search(r'トラック\d+', content))
     
-    # 至少包含两种特征才认为是台本
-    features = sum([has_character_marks, has_se_marks, has_direction, has_track])
-    return features >= 2
+    # 6. 检测大量对话行（角色名：台词 格式的行数）
+    dialogue_lines = re.findall(r'^[^:\n]{2,10}：[^\n]+', content, re.MULTILINE)
+    has_many_dialogues = len(dialogue_lines) >= 5  # 至少5行对话
+    
+    # 7. 纯台词型台本检测（无角色名，但有大量日文对话）
+    # 特征：
+    # - 大量日文字符（平假名/片假名/汉字）
+    # - 行长度适中（10-100字符，排除标题和注释）
+    # - 包含常见台本标点（。、？、！等）
+    japanese_char_count = len(re.findall(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', content))
+    total_char_count = len(content.replace('\n', '').replace(' ', ''))
+    ja_ratio = japanese_char_count / total_char_count if total_char_count > 0 else 0
+    
+    # 统计有效对话行（日文内容，长度适中）
+    valid_dialogue_lines = 0
+    for line in non_empty_lines:
+        # 排除注释行（如 //01 音楽準備室で）
+        if line.startswith('//') or line.startswith('#'):
+            continue
+        # 排除过短或过长的行
+        if len(line) < 5 or len(line) > 150:
+            continue
+        # 检查是否包含日文字符
+        if re.search(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', line):
+            valid_dialogue_lines += 1
+    
+    # 纯台词型判断：日文比例高，且有大量有效对话行
+    is_pure_dialogue = ja_ratio >= 0.5 and valid_dialogue_lines >= 10
+    
+    # 综合判断：
+    # - 有【角色名】标记
+    # - 或有角色名：台词格式且对话行数>=5
+    # - 或是纯台词型台本
+    # - 或至少两种台本特征
+    features = sum([has_character_brackets, has_se_marks, has_direction, has_track])
+    
+    if has_character_brackets:
+        return True
+    if has_character_dialogue and has_many_dialogues:
+        return True
+    if is_pure_dialogue:
+        return True
+    if features >= 2:
+        return True
+    
+    return False
 
 
 def parse_scriptbook_content(content: str) -> list[dict]:
@@ -3748,7 +5423,24 @@ def parse_scriptbook_content(content: str) -> list[dict]:
             })
             continue
         
-        # 普通对话
+        # 角色名：台词 格式（如 雫葵：はふー。今日もやっと学校終わった。）
+        # 格式：角色名（2-10字符）+ 全角冒号 + 台词
+        dialogue_match = re.match(r'^([^：\n]{2,10})：([^\n]+)$', stripped)
+        if dialogue_match:
+            char_name = dialogue_match.group(1).strip()
+            dialogue_text = dialogue_match.group(2).strip()
+            # 更新当前角色名
+            current_character = char_name
+            parsed.append({
+                "line_num": i,
+                "character": char_name,
+                "text": dialogue_text,  # 只存储台词，不含角色名
+                "raw_line": raw_line,
+                "type": "dialogue"
+            })
+            continue
+        
+        # 普通对话（无角色名标记）
         parsed.append({
             "line_num": i,
             "character": current_character,
@@ -4048,9 +5740,35 @@ def process_all_lrc(work_dir: Path) -> tuple[int, int, int, int]:
             
             # 加载台本映射（如果启用）
             scriptbook_map = {}
+            scriptbook_file_map = {}
             if USE_SCRIPTBOOK_FOR_TRANSLATION:
                 print(f"\n  [台本分析] 正在扫描台本文件...")
-                scriptbook_map = build_track_scriptbook_map(parent_dir)
+                scriptbook_map, scriptbook_file_map, scriptbook_characters = build_track_scriptbook_map(parent_dir)
+                
+                # 自动将台本中的角色名添加到术语表
+                if scriptbook_characters:
+                    print(f"  [角色名] 台本中发现 {len(scriptbook_characters)} 个角色名: {', '.join(list(scriptbook_characters)[:5])}")
+                    
+                    # 调用 LLM 分析角色名，给出统一译名
+                    character_terms = analyze_scriptbook_characters(scriptbook_characters, parent_dir)
+                    
+                    # 加载现有术语表
+                    existing_terms = load_terms(parent_dir)
+                    
+                    # 合并新角色名译名（如果尚未存在或现有译名为空）
+                    updated_count = 0
+                    for char_name, char_translation in character_terms.items():
+                        if char_name not in existing_terms or not existing_terms.get(char_name):
+                            existing_terms[char_name] = char_translation
+                            updated_count += 1
+                            print(f"    {char_name} → {char_translation}")
+                    
+                    if updated_count > 0:
+                        save_terms(parent_dir, existing_terms)
+                        print(f"  [角色名] 已更新 {updated_count} 个角色名译名到术语表")
+                        
+                        # 更新当前使用的术语表
+                        terms = existing_terms
                 if scriptbook_map:
                     # 打印台本映射摘要
                     total_tracks = len([k for k in scriptbook_map.keys() if k > 0])
@@ -4061,29 +5779,41 @@ def process_all_lrc(work_dir: Path) -> tuple[int, int, int, int]:
                         print(f"  (其中 {unassigned_lines} 行未分配到具体音轨)")
                 else:
                     print(f"  未发现台本文件")
-            dir_scriptbook_maps[parent_dir] = scriptbook_map
+            dir_scriptbook_maps[parent_dir] = (scriptbook_map, scriptbook_file_map)
             print(f"  {'=' * 50}\n")
         else:
             print(f"  [复用术语] 目录: {parent_dir.name}")
             terms = load_terms(parent_dir)
             alias_list = load_alias(parent_dir)
             worldview = dir_worldviews.get(parent_dir, {})
-            scriptbook_map = dir_scriptbook_maps.get(parent_dir, {})
+            # 从缓存中获取台本映射（tuple格式）
+            scriptbook_cached = dir_scriptbook_maps.get(parent_dir, ({}, {}))
+            scriptbook_map = scriptbook_cached[0] if isinstance(scriptbook_cached, tuple) else scriptbook_cached
+            scriptbook_file_map = scriptbook_cached[1] if isinstance(scriptbook_cached, tuple) else {}
             print(f"  加载术语表: {len(terms)} 个 | alias: {len(alias_list)} 个")
             if scriptbook_map:
                 print(f"  加载台本映射: {len([k for k in scriptbook_map.keys() if k > 0])} 个音轨")
 
         # 根据文件名提取音轨编号，查找对应的台本内容
         track_scriptbook_lines = None
+        track_scriptbook_file = None
+        current_track_num = None
         if scriptbook_map:
             track_num = extract_track_number_from_filename(base_name)
+            current_track_num = track_num
             if track_num is not None and track_num in scriptbook_map:
                 track_scriptbook_lines = scriptbook_map[track_num]
+                track_scriptbook_file = scriptbook_file_map.get(track_num)
                 print(f"  [台本匹配] 音轨{track_num:02d} → {len(track_scriptbook_lines)}行台词")
+                if track_scriptbook_file:
+                    print(f"               台本路径: {track_scriptbook_file}")
             elif 0 in scriptbook_map:
                 # 使用完整台本（未分配到具体音轨）
                 track_scriptbook_lines = scriptbook_map[0]
+                track_scriptbook_file = scriptbook_file_map.get(0)
                 print(f"  [台本匹配] 使用完整台本 → {len(track_scriptbook_lines)}行台词")
+                if track_scriptbook_file:
+                    print(f"               台本路径: {track_scriptbook_file}")
 
         if status['has_src'] and status['has_ja']:
             lang = detect_lrc_language(src_path)
@@ -4200,17 +5930,6 @@ def main():
     print(f"    reasoning_effort: {_gen_params.get('reasoning_effort', 'N/A')}")
     print()
 
-    # 先处理台本文件（如果启用台本指导翻译）
-    script_translated, script_skipped, script_kept = 0, 0, 0
-    if USE_SCRIPTBOOK_FOR_TRANSLATION:
-        print("=" * 50)
-        print("预处理台本文件...")
-        print("=" * 50)
-        print("台本文件将在LRC翻译时作为参考，提高翻译准确性。")
-        print()
-        script_translated, script_skipped, script_kept = process_all_scriptbooks(WORK_DIR)
-        print()
-    
     print("=" * 50)
     print("处理字幕文件...")
     print("=" * 50)
@@ -4228,11 +5947,6 @@ def main():
     print(f"  翻译中文: {translated} 个")
     print(f"  跳过: {skipped} 个")
     print(f"  保留: {kept} 个")
-    if script_translated > 0 or script_skipped > 0 or script_kept > 0:
-        print()
-        print(f"  台本翻译: {script_translated} 个")
-        print(f"  台本跳过: {script_skipped} 个")
-        print(f"  台本保留: {script_kept} 个")
     print()
     print(f"  总用时: {total_time:.1f} 秒 ({total_time/60:.1f} 分钟)")
     print()

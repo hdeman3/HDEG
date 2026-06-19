@@ -24,6 +24,20 @@ SCRIPTBOOK_KEYWORDS = [
 # 台本文件扩展名
 SCRIPTBOOK_EXTS = {'.txt', '.pdf'}
 
+# 非台本文件关键词（需要排除的特殊用途文件）
+NON_SCRIPTBOOK_KEYWORDS = [
+    'finishtime', 'finish_time', 'フィニッシュタイム',  # 高潮时间点
+    'クレジット', 'credit',  # 演职员表
+    'お射精メモ', '射精メモ',  # 射精备忘录
+    'readme', 'read me', 'read_me',  # 说明文件
+    '説明', '説明書',  # 说明书
+    '特典', 'bonus',  # 特典内容
+    'おまけ', 'omake',  # 特典/附赠
+    'キャスト', 'cast',  # 演员表
+    '声優',  # 声优信息
+    '購入特典', '購入特典',  # 购买特典
+]
+
 
 # ==================== PDF文本提取 ====================
 
@@ -262,23 +276,96 @@ def _normalize_text(text: str) -> str:
     return result
 
 
+def _is_moan_only(text: str) -> bool:
+    """判断文本是否为纯娇喘（不承载台词）
+    
+    纯娇喘特征：
+    1. 只包含假名、标点、♡等符号
+    2. 不包含有意义的词汇（动词、名词等）
+    3. 主要是拟声词（ん、あ、は、ひ等）
+    
+    注意：此函数用于判断是否为纯娇喘，以便在清洗时保留娇喘内容。
+    娇喘+断句台词的情况也应该被保留。
+    """
+    text = text.strip()
+    if not text:
+        return False
+    
+    # 移除所有空白和♡符号后检查
+    cleaned = re.sub(r'[\s♡♥❤♦️]', '', text)
+    
+    # 如果只剩下标点，不算娇喘
+    if not cleaned or re.match(r'^[…！？。、・〜～\.\?!\-]+$', cleaned):
+        return False
+    
+    # 检查是否只包含假名和标点（没有汉字）
+    if re.search(r'[\u4e00-\u9fff]', cleaned):
+        return False
+    
+    # 检查是否主要是拟声假名（ん、あ、は、ひ、ふ、へ、ほ等）
+    # 允许的娇喘假名 - 扩展列表，包含更多娇喘相关的假名
+    # 包含小写假名（ぁぃぅぇぉ）用于处理拉长音如 はぁ
+    moan_kana = set('んあいうえおはひふへほまみむめもやゆよらりるれろわをっゃゅょゎヮぁぃぅぇぉ')
+    kana_chars = re.findall(r'[\u3040-\u309f\u30a0-\u30fa]', cleaned.lower())
+    
+    if not kana_chars:
+        return False
+    
+    # 如果超过70%是拟声假名，认为是纯娇喘（降低阈值以识别更多娇喘）
+    moan_count = sum(1 for c in kana_chars if c in moan_kana)
+    return moan_count / len(kana_chars) > 0.7
+
+
+def _simplify_repeated_moans(text: str) -> str:
+    """简化重复的无意义喘息
+    
+    如: ん、ん、ん、ん → ん、ん…♡
+    保留1-2个，不全删
+    
+    规则：
+    1. 匹配重复的单个假名（如 ん、ん、ん、ん）
+    2. 匹配重复的假名+っ组合（如 あっ、あっ、あっ、あっ）
+    3. 精简为2个，加上省略号和♡（如果原文本已有♡则不重复添加）
+    """
+    # 匹配重复的假名+っ组合（如 あっ、あっ、あっ、あっ）
+    # 后面可能有…♡或其他结尾
+    pattern1 = r'([\u3040-\u309f\u30a0-\u30fa]っ)[、，]\1(?:[、，]\1)+(?:…♡|…|♡)?'
+    
+    def simplify1(match):
+        chars = match.group(1)
+        return f'{chars}、{chars}…♡'
+    
+    result = re.sub(pattern1, simplify1, text)
+    
+    # 匹配重复的单个假名（如 ん、ん、ん、ん）
+    # 后面可能有…♡或其他结尾
+    pattern2 = r'([\u3040-\u309f\u30a0-\u30fa])[、，]\1(?:[、，]\1)+(?:…♡|…|♡)?'
+    
+    def simplify2(match):
+        char = match.group(1)
+        return f'{char}、{char}…♡'
+    
+    result = re.sub(pattern2, simplify2, result)
+    
+    return result
+
+
 def clean_script_for_translation(text: str) -> str:
     """清洗台本内容，只保留角色对话
     
+    改进的清洗规则：
+    
     去除内容：
-    1. 页码行
-    2. 纯数字行
-    3. SE标记行
-    4. 位置标记行
-    5. 演技指示行（括号内容）
-    6. 音效/指示标记（｟...｠）
-    7. 书名号标记（《...》）
-    8. 特殊标记（<...>、{...}）
-    9. 内联括号内容（行内任何位置的括号指示）
+    1. 页码行、纯数字行
+    2. SE标记行、纯位置标记行
+    3. 纯演技指示行（整行都是括号内容）
+    4. 音效标记（｟...｠）、书名号（不含台词时）
     
     保留内容：
     1. 角色对话（台词）
-    2. 角色名标记（【角色名】）
+    2. 娇喘（保留原样，不过度清洗）
+    3. 娇喘 + 断句台词（原样保留，不合并）
+    4. 重复的无意义喘息（精简为1-2个，不全删）
     
     返回清洗后的文本
     """
@@ -307,8 +394,9 @@ def clean_script_for_translation(text: str) -> str:
         if re.match(r'^SE[:：]', normalized, re.IGNORECASE):
             continue
         
-        # 跳过纯位置标记行（如 "【正面・中】"）
-        if re.match(r'^【[左右中正远近密着耳・→]+】$', normalized):
+        # 跳过纯位置标记行（如 "【正面・中】"、"【右耳・近距離】"）
+        # 包含：左右中正上下远近密着耳面距離等位置关键词
+        if re.match(r'^【[左右中正上下遠近密着耳面距離・→]+】$', normalized):
             continue
         
         # 跳过纯演技指示行（括号内容）
@@ -386,20 +474,91 @@ def clean_script_for_translation(text: str) -> str:
         if match:
             normalized = match.group(2)
         
-        # 去除内联的｟...｠标记（音效/指示）
-        normalized = re.sub(r'｟[^｠]*｠', '', normalized)
+        # 去除内联的｟...｠标记（音效/指示）- 但保留含台词的内容
+        # 只有当｟...｠内容不含日文台词时才删除
+        def remove_se_marker(text):
+            """移除音效标记，但保留含台词的内容"""
+            def replacer(match):
+                content = match.group(0)
+                inner = content[1:-1]  # 去掉｟和｠
+                # 如果内部包含日文台词（有汉字或完整假名词），保留
+                if re.search(r'[\u4e00-\u9fff]', inner):
+                    return content
+                # 如果主要是拟声词（娇喘），保留
+                if _is_moan_only(inner):
+                    return inner  # 返回内容，去掉｟｠标记
+                return ''
+            return re.sub(r'｟[^｠]*｠', replacer, text)
         
-        # 去除内联的括号内容（演技指示）
-        normalized = re.sub(r'[（(][^）)]*[）)]', '', normalized)
+        normalized = remove_se_marker(normalized)
         
-        # 去除内联的《...》标记（书名号）
-        normalized = re.sub(r'《[^》]*》', '', normalized)
+        # 改进的括号处理：保留娇喘，只删除纯演技指示
+        def remove_direction_keep_moans(text):
+            """移除演技指示，但保留娇喘内容"""
+            def replacer(match):
+                content = match.group(0)
+                inner = content[1:-1]  # 去掉括号
+                
+                # 如果是纯娇喘，保留（去掉括号）
+                if _is_moan_only(inner):
+                    return inner
+                
+                # 如果包含日文台词特征，保留
+                if re.search(r'[\u4e00-\u9fff]', inner):
+                    return content  # 保留原样（含括号）
+                
+                # 如果主要是拟声假名（可能是娇喘），保留
+                kana_count = len(re.findall(r'[\u3040-\u309f\u30a0-\u30fa]', inner))
+                if kana_count > 2:
+                    return inner  # 保留内容，去掉括号
+                
+                # 纯演技指示，删除
+                return ''
+            
+            return re.sub(r'[（(][^）)]*[）)]', replacer, text)
         
-        # 去除内联的<...>标记
-        normalized = re.sub(r'<[^>]*>', '', normalized)
+        normalized = remove_direction_keep_moans(normalized)
         
-        # 去除内联的{...}标记
-        normalized = re.sub(r'\{[^}]*\}', '', normalized)
+        # 去除内联的《...》标记（书名号）- 但保留含台词的内容
+        def remove_book_title(text):
+            """移除书名号，但保留含台词的内容"""
+            def replacer(match):
+                content = match.group(0)
+                inner = content[1:-1]  # 去掉《和》
+                # 如果内部包含日文台词，保留内容（去掉书名号）
+                if re.search(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', inner):
+                    return inner
+                return ''
+            return re.sub(r'《[^》]*》', replacer, text)
+        
+        normalized = remove_book_title(normalized)
+        
+        # 去除内联的<...>标记 - 但保留含台词的内容
+        def remove_angle_bracket(text):
+            def replacer(match):
+                content = match.group(0)
+                inner = content[1:-1]
+                if re.search(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', inner):
+                    return inner
+                return ''
+            return re.sub(r'<[^>]*>', replacer, text)
+        
+        normalized = remove_angle_bracket(normalized)
+        
+        # 去除内联的{...}标记 - 但保留含台词的内容
+        def remove_brace(text):
+            def replacer(match):
+                content = match.group(0)
+                inner = content[1:-1]
+                if re.search(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', inner):
+                    return inner
+                return ''
+            return re.sub(r'\{[^}]*\}', replacer, text)
+        
+        normalized = remove_brace(normalized)
+        
+        # 简化重复的娇喘（如 ん、ん、ん、ん → ん、ん…♡）
+        normalized = _simplify_repeated_moans(normalized)
         
         # 清理多余空格
         normalized = re.sub(r'\s+', ' ', normalized).strip()
@@ -813,15 +972,71 @@ def is_scriptbook_file(file_path: Path) -> bool:
     判断依据：
     1. 文件扩展名为 .txt 或 .pdf
     2. 文件名包含台本关键词
-    3. 文件内容包含典型的台本标记（角色名【】、SE、方向指示#等）
+    3. 文件名符合台本命名模式：
+       - 模式A：简单描述型（シナリオ.txt、台本 データ.pdf）
+       - 模式B：带章节/轨道编号（トラック1、track1、tr01、01-1、１、２）
+       - 模式C：编号 + 描述性标题（トラック1：xxx.txt）
+    4. 文件在"台本"文件夹中，且文件名是纯数字
+    5. 文件内容包含典型的台本标记（角色名【】、SE、方向指示#等）
+    
+    排除模式D：特殊用途文件
+    - Finishtime.txt / フィニッシュタイム.txt：标注高潮时间点
+    - クレジット.txt：演职员表
+    - お射精メモ！：射精备忘录
+    - read me.txt：说明文件
     """
     if file_path.suffix.lower() not in SCRIPTBOOK_EXTS:
         return False
     
+    filename = file_path.name  # 原始文件名（保留大小写）
+    filename_lower = filename.lower()
+    stem = file_path.stem  # 不含扩展名的文件名
+    
+    # 模式D：排除特殊用途文件（优先级最高）
+    for keyword in NON_SCRIPTBOOK_KEYWORDS:
+        if keyword.lower() in filename_lower:
+            return False
+    
     # 检查文件名是否包含台本关键词
-    filename = file_path.name.lower()
     for keyword in SCRIPTBOOK_KEYWORDS:
-        if keyword.lower() in filename:
+        if keyword.lower() in filename_lower:
+            return True
+    
+    stem = file_path.stem  # 不含扩展名的文件名
+    
+    # 模式B：检查文件名是否符合台本命名模式
+    # 1. トラック + 数字（如 トラック1、トラック２）
+    if re.match(r'^トラック[０-９0-9]+', stem, re.IGNORECASE):
+        return True
+    
+    # 2. track + 数字（如 track1、Track01、TRACK1）
+    if re.match(r'^track[０-９0-9]+', stem, re.IGNORECASE):
+        return True
+    
+    # 3. tr + 数字（如 tr01、TR01）
+    if re.match(r'^tr[０-９0-9]+', stem, re.IGNORECASE):
+        return True
+    
+    # 4. 纯数字编号（如 01、02、1、2、１、２）
+    # 但必须包含描述或位于台本文件夹中
+    if re.match(r'^[０-９0-9]+$', stem):
+        parent_name = file_path.parent.name.lower()
+        if parent_name in ('台本', 'だいほん', 'script', 'scripts', 'scenario', 'scenarios'):
+            return True
+        # 如果文件名是纯数字但不在台本文件夹中，继续检查内容
+    
+    # 5. 数字-数字格式（如 01-1、1-2）
+    if re.match(r'^[０-９0-9]+[-_][０-９0-9]+', stem):
+        parent_name = file_path.parent.name.lower()
+        if parent_name in ('台本', 'だいほん', 'script', 'scripts', 'scenario', 'scenarios'):
+            return True
+    
+    # 检查是否在"台本"文件夹中，且文件名是纯数字（全角或半角）
+    # 如: 台本/１.txt, 台本/２.txt, 台本/1.txt, 台本/2.txt
+    parent_name = file_path.parent.name.lower()
+    if parent_name in ('台本', 'だいほん', 'script', 'scripts', 'scenario', 'scenarios'):
+        # 检查文件名是否只包含数字（全角或半角）
+        if re.match(r'^[０-９0-9]+$', stem):
             return True
     
     # 检查文件内容是否包含台本特征

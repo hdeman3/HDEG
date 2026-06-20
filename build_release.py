@@ -6,7 +6,7 @@
 3. 复制 exe 到发布文件夹
 4. 收集以 Hde鸡 开头的所有 .bat 文件
 5. 提取 _DEFAULT_SYSTEM_PROMPT 写入 提示词.txt
-6. 复制 config.json 并抹去 key 信息，关闭 debug
+6. 复制 config.json 并抹去 key 信息，关闭 debug，设置台本翻译模式
 """
 
 import os
@@ -14,11 +14,24 @@ import sys
 import shutil
 import re
 import subprocess
+import importlib.util
 from pathlib import Path
 
 # 获取脚本所在目录
 SCRIPT_DIR = Path(__file__).parent.resolve()
 RELEASE_DIR = SCRIPT_DIR / "Hde_G_release"
+
+
+def get_package_path(package_name):
+    """获取包的安装路径"""
+    try:
+        spec = importlib.util.find_spec(package_name)
+        if spec and spec.origin:
+            return Path(spec.origin).parent
+    except Exception:
+        pass
+    return None
+
 
 def run_pyinstaller():
     """运行 PyInstaller 打包"""
@@ -26,19 +39,79 @@ def run_pyinstaller():
     print("步骤 1: 运行 PyInstaller 打包")
     print("=" * 50)
     
+    # 动态获取包路径
+    fugashi_path = get_package_path("fugashi")
+    unidic_path = get_package_path("unidic_lite")
+    
+    if not fugashi_path:
+        print(f"❌ 找不到 fugashi 包，请确保已安装: pip install fugashi")
+        sys.exit(1)
+    
+    if not unidic_path:
+        print(f"❌ 找不到 unidic_lite 包，请确保已安装: pip install unidic-lite")
+        sys.exit(1)
+    
+    print(f"  fugashi 路径: {fugashi_path}")
+    print(f"  unidic_lite 路径: {unidic_path}")
+    
+    # 查找 fugashi.libs 目录（包含 DLL 和 .load-order 文件）
+    fugashi_libs_path = fugashi_path.parent / "fugashi.libs"
+    
+    # 查找 pyopenjtalk 词典目录
+    pyopenjtalk_path = get_package_path("pyopenjtalk")
+    pyopenjtalk_dic_path = None
+    
+    if pyopenjtalk_path:
+        # 词典在 pyopenjtalk/open_jtalk_dic_utf_8-1.11 目录
+        for item in pyopenjtalk_path.iterdir():
+            if item.is_dir() and "open_jtalk_dic" in item.name:
+                pyopenjtalk_dic_path = item
+                print(f"  pyopenjtalk 词典: {pyopenjtalk_dic_path}")
+                break
+    
+    # 构建 PyInstaller 命令
     cmd = [
         "pyinstaller",
         "--clean",
         "--onefile",
+        # 排除不需要的大型库（减小体积）
         "--exclude-module", "PyQt5",
         "--exclude-module", "PyQt6",
         "--exclude-module", "PySide2",
         "--exclude-module", "PySide6",
+        "--exclude-module", "tkinter",
+        "--exclude-module", "matplotlib",
+        "--exclude-module", "numpy.f2py",
+        "--exclude-module", "pandas",
+        "--exclude-module", "scipy",
+        "--exclude-module", "unittest",
+        "--exclude-module", "pydoc",
+        "--exclude-module", "distutils",
+        "--exclude-module", "setuptools",
+        # 收集 fugashi, unidic_lite, pyopenjtalk
         "--collect-all", "fugashi",
-        "--add-binary", r"D:\anaconda_2022\Lib\site-packages\fugashi.libs\*;.",
-        "--add-data", r"D:\anaconda_2022\Lib\site-packages\unidic_lite\dicdir;unidic_lite/dicdir",
-        "translate.py"
+        "--collect-data", "unidic_lite",
+        "--collect-all", "pyopenjtalk",
     ]
+    
+    # 添加 fugashi.libs 目录中的所有文件（DLL 和 .load-order 文件）
+    if fugashi_libs_path.exists():
+        print(f"  fugashi.libs 目录: {fugashi_libs_path}")
+        for f in fugashi_libs_path.iterdir():
+            print(f"    - {f.name}")
+            # 添加为二进制文件（DLL）或数据文件（.load-order）
+            if f.suffix == '.dll':
+                cmd.extend(["--add-binary", f"{f};fugashi.libs"])
+            else:
+                cmd.extend(["--add-data", f"{f};fugashi.libs"])
+    else:
+        print("  ⚠ 未找到 fugashi.libs 目录，打包后可能无法运行 fugashi")
+    
+    # 添加 pyopenjtalk 词典（整个目录）
+    if pyopenjtalk_dic_path:
+        cmd.extend(["--add-data", f"{pyopenjtalk_dic_path};pyopenjtalk/{pyopenjtalk_dic_path.name}"])
+    
+    cmd.append("translate.py")
     
     print(f"执行命令: {' '.join(cmd)}")
     print()
@@ -51,6 +124,7 @@ def run_pyinstaller():
     
     print("✓ PyInstaller 打包完成")
     print()
+
 
 def create_release_dir():
     """创建发布文件夹"""
@@ -66,12 +140,14 @@ def create_release_dir():
     print(f"✓ 创建发布文件夹: {RELEASE_DIR}")
     print()
 
+
 def copy_exe():
     """复制 exe 到发布文件夹"""
     print("=" * 50)
     print("步骤 3: 复制 exe 文件")
     print("=" * 50)
     
+    # --onefile 模式下，exe 在 dist/translate.exe
     exe_src = SCRIPT_DIR / "dist" / "translate.exe"
     exe_dst = RELEASE_DIR / "translate.exe"
     
@@ -82,6 +158,7 @@ def copy_exe():
     shutil.copy2(exe_src, exe_dst)
     print(f"✓ 复制: {exe_src} -> {exe_dst}")
     print()
+
 
 def collect_bat_files():
     """收集以 Hde鸡 开头的 .bat 文件"""
@@ -102,6 +179,7 @@ def collect_bat_files():
     
     print(f"✓ 共收集 {len(bat_files)} 个 .bat 文件")
     print()
+
 
 def extract_system_prompt():
     """提取 _DEFAULT_SYSTEM_PROMPT 写入 提示词.txt"""
@@ -176,8 +254,9 @@ def extract_system_prompt():
     print(f"  提示词长度: {len(full_prompt)} 字符")
     print()
 
+
 def copy_config():
-    """复制 config.json 并抹去 key 信息，关闭 debug"""
+    """复制 config.json 并抹去 key 信息，关闭 debug，设置台本翻译模式"""
     print("=" * 50)
     print("步骤 6: 处理 config.json")
     print("=" * 50)
@@ -190,7 +269,7 @@ def copy_config():
     with open(config_src, 'r', encoding='utf-8') as f:
         config = json.load(f)
     
-    # 抹去 key 信息
+    # 抹去 API key
     if "api" in config and "key" in config["api"]:
         original_key = config["api"]["key"]
         config["api"]["key"] = ""  # 清空 key
@@ -202,11 +281,26 @@ def copy_config():
         config["app"]["debug"] = False
         print(f"  关闭 debug: {original_debug} -> False")
     
+    # 设置台本翻译模式
+    if "app" in config:
+        # 开启台本翻译
+        config["app"]["use_scriptbook_for_translation"] = True
+        print(f"  开启台本翻译: True")
+        
+        # 开启关键词模式
+        config["app"]["scriptbook_keyword_mode"] = True
+        print(f"  开启关键词模式: True")
+        
+        # 关闭全量模式
+        config["app"]["scriptbook_full_mode"] = False
+        print(f"  关闭全量模式: False")
+    
     with open(config_dst, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
     
     print(f"✓ 处理后的 config.json 已保存到: {config_dst}")
     print()
+
 
 def main():
     print()

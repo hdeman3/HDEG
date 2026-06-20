@@ -89,6 +89,12 @@ def _is_scene_description(text: str) -> bool:
     1. 以■、〇、●等符号开头
     2. 包含"本編"、"プロローグ"、"エピローグ"等章节标记
     3. 包含位置信息（ソファ上、ベッド上等）
+    4. 包含世界観、設定等说明文字
+    5. 【新增】描述性句子（不以对话标点结尾，不包含口语表达）
+    6. 【新增】以动词结尾的动作描述（如 ドアを開ける、布団の中に潜り込む）
+    7. 【新增】包含"〜と〜"格式的描述（如 ドアを開けると、兄の手をにぎりと）
+    8. 【新增】心理描写（如 いいのか…いいのだろうか…この子は俺のことが好きなのか？）
+    9. 【新增】以「」或『』包裹的旁白内容
     """
     text = text.strip()
     if not text:
@@ -102,6 +108,129 @@ def _is_scene_description(text: str) -> bool:
     if re.search(r'本編|プロローグ|エピローグ|トラック\d+|第[0-9０-９]+章', text):
         return True
     
+    # 世界観・設定等说明文字
+    setting_keywords = [
+        '世界観', '雰囲気', '設定', 'あらすじ', 'ストーリー',
+        'キャラクター', '登場人物', '人物紹介',
+        '台本初稿', '台本草案', 'セリフ初稿',
+        '演技指示', '演技の補助', '補助のため',
+    ]
+    for keyword in setting_keywords:
+        if keyword in text:
+            return True
+    
+    # 角色外观描述
+    if re.search(r'(小柄|大柄|華奢|無垢|雰囲気|口数|髪|目|包帯|眼帯)', text):
+        return True
+    
+    # 【新增】心理描写特征
+    # 心理描写通常：
+    # 1. 以问号结尾但不是对话（如 いいのか…いいのだろうか…）
+    # 2. 包含"…"或"…か？"格式
+    # 3. 包含"俺"、"私"等第一人称但不是对话
+    # 4. 包含"最低"、"辛い"等心理状态描述
+    
+    # 心理描写关键词
+    psychology_keywords = [
+        '最低', '辛い', '我慢', '耐えられ', '限界', '限り',
+        '思う', '考える', '感じる', '思える', '考えられる',
+        'だろうか', 'のだろうか', 'かもしれない', 'に違いない',
+        'してしまう', 'なってしまう', 'てしまった', 'になってしまった',
+        '慰めてもらおう', 'してもらおう', 'させよう',
+    ]
+    for keyword in psychology_keywords:
+        if keyword in text:
+            # 检查是否包含口语表达
+            has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', text))
+            if not has_colloquial:
+                return True
+    
+    # 【新增】检查以「」或『』包裹的旁白内容
+    # 如：「よかったですね…。おたがい退院できて。」
+    if re.match(r'^[「『][」』].*[」』]$', text):
+        # 检查内部是否包含口语表达
+        inner = text[1:-1]  # 去掉「」或『』
+        has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', inner))
+        if not has_colloquial:
+            return True
+    
+    # 【新增】检查是否为心理独白（以问号结尾但不是对话）
+    # 如：いいのか…いいのだろうか…この子は俺のことが好きなのか？
+    if text.endswith('？') or text.endswith('?'):
+        # 检查是否包含"俺"或"私"等第一人称
+        if re.search(r'(俺|私|僕|わたし|あたし)', text):
+            # 检查是否包含口语表达
+            has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', text))
+            if not has_colloquial:
+                return True
+    
+    # 【新增】检查是否为描述性句子（不以对话标点结尾）
+    # 对话标点：…、！、？、～、。
+    dialogue_endings = ['…', '！', '？', '～', '。', '!', '?', '.', '~']
+    has_dialogue_end = any(text.endswith(ending) for ending in dialogue_endings)
+    
+    # 如果不以对话标点结尾，检查是否为描述性句子
+    if not has_dialogue_end:
+        # 检查是否包含口语表达（如 です、ます、だよ 等）
+        has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', text))
+        
+        # 如果不包含口语表达，可能是描述性句子
+        if not has_colloquial:
+            # 检查是否以动词结尾（描述性句子）
+            # 常见动词结尾：する、なる、いる、ある、開ける、寝ていた 等
+            verb_endings = [
+                'する', 'なる', 'いる', 'ある', 'おる', 'まいる',
+                '開ける', '閉める', '入る', '出る', '寝る', '起きる',
+                '歩く', '走る', '座る', '立つ', '潜る', '潜り込む',
+                '握る', '触る', '撫でる', '舐める', '触らせる',
+                '震える', 'もじもじ', '様子', '気後れ', '告白',
+                '寝ていた', '起きて', '開けると', '閉めると',
+                '入ると', '出ると', '潜り込む', '触触らせる',
+                '低くなる', '突き動かされて', '抑えられなくなって',
+            ]
+            for ending in verb_endings:
+                if text.endswith(ending):
+                    return True
+            
+            # 检查是否包含"〜と〜"格式的描述（动作描述）
+            # 如：ドアを開けると、兄の手をにぎりと
+            if re.search(r'[を|に|で|へ|から|まで].*と', text):
+                # 如果不包含对话标点，可能是动作描述
+                if not any(punct in text for punct in ['…', '！', '？', '～']):
+                    return True
+            
+            # 检查是否为纯动作描述（包含动作动词但不包含对话标点）
+            action_keywords = [
+                'ドア', '部屋', '布団', 'ベッド', 'ソファ', '浴室',
+                '兄', '妹', '手', '足', '身体', '下半身', '躰',
+                '握り', '触', '撫で', '舐め', '潜り', '開け', '閉め',
+                '震える', 'もじもじ', '様子', '気後れ', '告白',
+                '低くなる', '突き動かされ', '抑えられなく',
+            ]
+            for keyword in action_keywords:
+                if keyword in text:
+                    # 如果不包含对话标点或口语表达，可能是动作描述
+                    if not any(punct in text for punct in ['…', '！', '？']) and not has_colloquial:
+                        return True
+    
+    # 【新增】检查以"…"结尾的句子（可能是心理描写）
+    if text.endswith('…') or text.endswith('…。'):
+        # 检查是否包含口语表达
+        has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', text))
+        if not has_colloquial:
+            # 检查是否包含心理描写关键词
+            for keyword in psychology_keywords:
+                if keyword in text:
+                    return True
+            
+            # 检查是否包含"〜てしまう"格式（表示遗憾或心理状态）
+            if re.search(r'[てで]しまう', text):
+                return True
+            
+            # 检查是否包含"〜だろう"格式（表示推测或疑问）
+            if re.search(r'だろう', text):
+                return True
+    
     return False
 
 
@@ -112,18 +241,58 @@ def _is_direction(text: str) -> bool:
     1. 以（）或［］包裹的内容
     2. 包含动作描述（キス、フェラ等动作说明）
     3. 包含表情/情绪描述
+    4. 包含心理描写（妹（...）、兄（...）等格式）
+    5. 包含位置指示（左耳、右耳等）
     """
     text = text.strip()
     if not text:
         return False
     
-    # 以（）包裹的内容
+    # 以（）包裹的内容（心理描写或演技指示）
     if text.startswith('（') and text.endswith('）'):
         return True
     
     # 以［］包裹的内容
     if text.startswith('［') and text.endswith('］'):
         return True
+    
+    # 心理描写格式：妹（...）、兄（...）、永海（...）等
+    # 匹配: 角色名（心理描写内容）
+    if re.match(r'^[ぁ-んァ-ン一-龯]{1,10}（[^）]+）', text):
+        return True
+    
+    # 心理描写格式：妹（...）开头但不完整（跨行）
+    # 匹配: 妹（...、兄（...、永海（...
+    if re.match(r'^[ぁ-んァ-ン一-龯]{1,10}（', text) and not text.endswith('）'):
+        # 这是不完整的心理描写开头，跳过
+        return True
+    
+    # 心理描写格式：以...）结尾但不以（开头（跨行的后半部分）
+    # 匹配: ...）结尾的内容
+    if text.endswith('）') and '（' not in text:
+        # 这是心理描写的后半部分，跳过
+        return True
+    
+    # 位置指示格式：左耳XXcm、右耳XXcm等
+    if re.match(r'^[左右]耳[０-９0-9]+[cｃ][mｍ]', text):
+        return True
+    
+    # 位置指示格式：包含"耳"和距离描述
+    if re.search(r'[左右]耳\s*[０-９0-9]+', text):
+        return True
+    
+    # 动作描述格式：以动词结尾但不包含对话标点
+    # 常见动作动词：する、なる、いる、ある、開ける、閉める等
+    action_endings = [
+        'する', 'なる', 'いる', 'ある', 'おる', 'まいる',
+        '開ける', '閉める', '入る', '出る', '寝る', '起きる',
+        '歩く', '走る', '座る', '立つ', '潜る', '潜り込む',
+        '握る', '触る', '撫でる', '舐める', 'キス', '告白',
+        '震える', 'もじもじ', '様子', '気後れ',
+    ]
+    for ending in action_endings:
+        if text.endswith(ending) and not re.search(r'[…！？～。]', text):
+            return True
     
     # 包含特定动作描述词
     direction_keywords = [
@@ -276,6 +445,72 @@ def _normalize_text(text: str) -> str:
     return result
 
 
+def _merge_fragmented_lines(text: str) -> str:
+    """合并碎片化的行（PDF提取后每行只有一个字符的情况）
+    
+    PyMuPDF提取竖排PDF时，可能每行只有一个字符：
+    ■
+    タ
+    イ
+    ト
+    ル
+    
+    这个函数会将这些碎片化的行合并成完整的句子：
+    ■タイトル
+    
+    合并规则：
+    1. 连续的单字符行（日文、数字、标点）合并为一行
+    2. 遇到分隔线（---）或空行时，结束当前合并
+    3. 保留原有的段落结构（通过空行分隔）
+    """
+    lines = text.split('\n')
+    merged_lines = []
+    current_line = ""
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        # 空行：结束当前合并，开始新段落
+        if not stripped:
+            if current_line:
+                merged_lines.append(current_line)
+                current_line = ""
+            merged_lines.append("")  # 保留空行
+            continue
+        
+        # 分隔线：结束当前合并，保留分隔线
+        if re.match(r'^[-]{3,}$', stripped):
+            if current_line:
+                merged_lines.append(current_line)
+                current_line = ""
+            merged_lines.append(stripped)
+            continue
+        
+        # 检查是否为单字符行（日文、数字、标点、符号）
+        is_single_char = len(stripped) == 1 and (
+            re.match(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff\uff00-\uffef]', stripped) or  # 日文
+            re.match(r'[０-９0-9a-zA-Z]', stripped) or  # 数字/字母
+            re.match(r'[、。！？…・〜～「」『』（）［］【】《》〈〉・]', stripped) or  # 标点
+            re.match(r'[■●○◆▲▽★☆♡♥❤♦️→←↑↓]', stripped)  # 符号
+        )
+        
+        if is_single_char:
+            # 单字符行：合并到当前行
+            current_line += stripped
+        else:
+            # 多字符行：结束当前合并，添加这一行
+            if current_line:
+                merged_lines.append(current_line)
+                current_line = ""
+            merged_lines.append(stripped)
+    
+    # 处理最后一行
+    if current_line:
+        merged_lines.append(current_line)
+    
+    return '\n'.join(merged_lines)
+
+
 def _is_moan_only(text: str) -> bool:
     """判断文本是否为纯娇喘（不承载台词）
     
@@ -360,6 +595,10 @@ def clean_script_for_translation(text: str) -> str:
     2. SE标记行、纯位置标记行
     3. 纯演技指示行（整行都是括号内容）
     4. 音效标记（｟...｠）、书名号（不含台词时）
+    5. 【新增】开头的人物设定部分（在第一个音轨标记之前）
+    6. 【新增】以 // 开头的指示文本（位置/麦克风指示）
+    7. 【新增】人物设定格式（如 髪の色：銀、瞳の色；黒か青）
+    8. 【新增】故事背景/世界观介绍（■タイトル、■おはなし等标记后的内容）
     
     保留内容：
     1. 角色对话（台词）
@@ -372,7 +611,91 @@ def clean_script_for_translation(text: str) -> str:
     lines = text.split('\n')
     cleaned_lines = []
     
-    for line in lines:
+    # === 第一阶段：检测音轨标记的位置 ===
+    # 找到第一个音轨标记的行号
+    # 扩展版：支持更多音轨标记格式
+    track_patterns = [
+        r'^Tr\.?\s*\d+[\.：:;\s]',  # Tr1.、Tr.2、Tr 1.、Tr1:、Tr3 （无点号）
+        r'^TR\d+[\s\.：:;]',  # TR6、TR7 （全大写）
+        r'^トラック\s*[０-９0-9]+[\s\.：:；]',  # トラック1、トラック4；、トラック０１
+        r'^■\s*トラック\s*[０-９0-9]+',  # ■トラック０１
+        r'^[Tt]rack\s*\d+[\s\.：:]',  # Track1、track01
+        r'^[-]{3,}$',  # 分隔线（如 ------------------------）
+    ]
+    
+    first_track_line = -1  # 第一个音轨标记的行号（0-based）
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        normalized = _normalize_text(stripped)
+        for pattern in track_patterns:
+            if re.match(pattern, normalized, re.IGNORECASE):
+                first_track_line = i
+                print(f"  [清洗] 检测到音轨标记在第 {i+1} 行: {normalized[:50]}，跳过开头设定部分")
+                break
+        if first_track_line >= 0:
+            break
+    
+    # 如果找到音轨标记，从该行之后开始处理
+    # 如果没有找到音轨标记，从第0行开始处理（但会跳过设定内容）
+    start_line = first_track_line + 1 if first_track_line >= 0 else 0
+    
+    # passed_intro 现在由 start_line 决定：行号 >= start_line 表示已过开头设定部分
+    # 不再需要单独的 passed_intro 变量
+    
+    # 人物设定格式模式（需要排除）
+    setting_patterns = [
+        r'^[髪瞳身服年齢血型性趣味特技好嫌苦悩願夢職業住所電話番号郵便番号メイル住所][:：；;]',  # 人物属性
+        r'^(服|髪の色|瞳の色|身長|年齢|血液型|性別|趣味|特技|好き|嫌い|苦手|悩み|願い|夢|職業)[:：；;]',  # 常见设定格式
+        r'^[ぁ-んァ-ン一-龥]{1,10}[:：；;][ぁ-んァ-ン一-龥0-9０-９\s]+$',  # 通用设定格式（属性名：属性值）
+    ]
+    
+    # 故事背景/世界观介绍模式（需要排除，除非有CV朗读的旁白）
+    story_intro_patterns = [
+        r'^■タイトル',  # ■タイトル
+        r'^■おはなし',  # ■おはなし
+        r'^■ストーリー',  # ■ストーリー
+        r'^■プロローグ',  # ■プロローグ
+        r'^■あらすじ',  # ■あらすじ
+        r'^■イントロダクション',  # ■イントロダクション
+        r'^■世界観',  # ■世界観
+        r'^■キャラクター',  # ■キャラクター
+        r'^■キャスト',  # ■キャスト
+        r'^■登場人物',  # ■登場人物
+        r'^■設定',  # ■設定
+        r'^■シナリオ',  # ■シナリオ
+        r'^■脚本',  # ■脚本
+        r'^■作品内容',  # ■作品内容
+        r'^■作品紹介',  # ■作品紹介
+        r'^■あらすじ',  # ■あらすじ
+        r'^■ストーリー',  # ■ストーリー
+        r'^■プロローグ',  # ■プロローグ
+        r'^■イントロダクション',  # ■イントロダクション
+        r'^■世界観',  # ■世界観
+        r'^■キャラクター',  # ■キャラクター
+        r'^■キャスト',  # ■キャスト
+        r'^■登場人物',  # ■登場人物
+        r'^■設定',  # ■設定
+        r'^■シナリオ',  # ■シナリオ
+        r'^■脚本',  # ■脚本
+        r'^■作品内容',  # ■作品内容
+        r'^■作品紹介',  # ■作品紹介
+    ]
+    
+    # 故事背景内容特征（长段落的背景介绍，不是角色对话）
+    story_content_keywords = [
+        '世界観', '設定', '背景', 'あらすじ', 'ストーリー', 'プロローグ',
+        'イントロダクション', '作品紹介', '作品内容', 'キャラクター紹介',
+        '登場人物', 'キャスト紹介', 'あらすじ', 'ストーリー', 'プロローグ',
+        'イントロダクション', '作品紹介', '作品内容', 'キャラクター紹介',
+        '登場人物', 'キャスト紹介',
+    ]
+    
+    # === 第二阶段：从 start_line 开始处理 ===
+    for line_idx, line in enumerate(lines):
+        # 跳过开头设定部分（行号 < start_line 的内容）
+        if line_idx < start_line:
+            continue
+        
         stripped = line.strip()
         
         # 跳过空行
@@ -381,6 +704,151 @@ def clean_script_for_translation(text: str) -> str:
         
         # 规范化文本（去除字符间空格）
         normalized = _normalize_text(stripped)
+        
+        # 判断是否已过开头设定部分（用于后续逻辑）
+        passed_intro = line_idx >= start_line
+        
+        # === 跳过开头设定部分 ===
+        # 注意：由于我们已经从 start_line 开始处理，这里的逻辑主要用于处理没有音轨标记的情况
+        if not passed_intro:
+            # 跳过所有以 ■ 开头的标记
+            if normalized.startswith('■'):
+                continue
+            
+            # 检查是否为人物设定格式
+            is_setting = False
+            for pattern in setting_patterns:
+                if re.match(pattern, normalized):
+                    is_setting = True
+                    break
+            if is_setting:
+                continue
+            
+            # 检查是否包含明显的设定关键词
+            setting_keywords = ['髪の色', '瞳の色', '身長', '年齢', '血液型', '趣味', '特技', 
+                               '服：', '服:', '義理の妹', '義理の父', '世界観', 'キャラクター',
+                               'おはなし', 'タイトル', 'ストーリー', 'プロローグ', 'あらすじ']
+            for kw in setting_keywords:
+                if kw in normalized:
+                    is_setting = True
+                    break
+            if is_setting:
+                continue
+            
+            # 【关键修改】在开头设定部分，严格跳过所有非对话内容
+            # 开头设定部分的特征：
+            # 1. 以 ■ 开头的标记（标题、世界观、角色等）
+            # 2. 标记后的描述性内容（故事背景、角色设定等）
+            # 3. 不包含明显的对话特征
+            
+            # 检查是否为对话（以对话标点结尾）
+            is_dialogue_end = bool(re.search(r'[…！？～。\.\?!]$', normalized))
+            
+            # 检查是否包含口语表达（如 です、ます、だよ 等）
+            has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', normalized))
+            
+            # 检查是否包含娇喘（可能是纯娇喘或娇喘+断句台词）
+            has_moan = bool(re.search(r'(んっ|あっ|うっ|はっ|ひっ|ふっ|んん|ああ|うう)', normalized))
+            
+            # 检查是否包含角色名标记（如 【角色名】）
+            has_character_mark = bool(re.search(r'【[^】]+】', normalized))
+            
+            # 检查是否为描述性内容（故事背景、角色设定等）
+            # 描述性内容的特征：
+            # 1. 不以对话标点结尾
+            # 2. 不包含口语表达
+            # 3. 不包含娇喘
+            # 4. 不包含角色名标记
+            # 5. 可能以动词结尾（如 してしまった、なってしまった、いる、なる 等）
+            is_descriptive = False
+            if not is_dialogue_end and not has_colloquial and not has_moan and not has_character_mark:
+                # 检查是否以动词/形容词结尾（描述性句子）
+                verb_endings = ['してしまった', 'なってしまった', 'ている', 'なる', 'いる', 'される', 'できる', 'される', 'なれる', 'おられる', 'いらっしゃる', 'まいる', '参る', '申し上げる', 'いただく', 'くださる', 'なさる', 'おっしゃる', 'いらっしゃる', 'おる', 'おります', 'います', 'あります', 'できます', 'なります', 'します', 'されます', 'できる', 'される', '思う', '考える', '感じる', '思える', '考えられる', '感じられる']
+                for ending in verb_endings:
+                    if normalized.endswith(ending):
+                        is_descriptive = True
+                        break
+                
+                # 检查是否为描述性的短语（不以名词结尾的长句）
+                # 如果句子长度超过10个字符且不以对话标点结尾，很可能是描述性内容
+                if not is_descriptive and len(normalized) > 10:
+                    # 检查是否以常见的描述性结尾
+                    desc_endings = ['ていく', 'てくる', 'てしまう', 'たことになる', 'てしまう', 'れている', 'られている', 'せられる', 'させられる', 'ことになる', 'ようになる', 'ようにする', 'ことにする', 'ものがある', 'ことがある', 'ところがある', 'わけがある', 'はずがある', 'かもしれない', 'にちがいない', 'に違いない', 'ようだ', 'みたいだ', 'そうだ', 'らしい']
+                    for ending in desc_endings:
+                        if normalized.endswith(ending):
+                            is_descriptive = True
+                            break
+                
+                # 如果仍然不确定，检查是否包含描述性关键词
+                if not is_descriptive:
+                    desc_keywords = ['事故', '療養', '生活', '島', '人口', '雰囲気', '性格', '外見', '特徴', '設定', '世界観', 'キャラクター', 'プロローグ', 'エピローグ', 'あらすじ', 'ストーリー', 'タイトル', '作品', '紹介', '登場人物', '関係', '家族', '両親', '兄弟', '姉妹', '友人', '恋人', '夫婦', '親子', '身長', '体重', '年齢', '血液型', '誕生日', '趣味', '特技', '好き', '嫌い', '苦手', '得意', '不得意', '長所', '短所', '夢', '目標', '願望', '悩み', '過去', '現在', '未来', '出自', '出身', '職業', '仕事', '学校', '家', '住所', '電話', 'メール']
+                    for kw in desc_keywords:
+                        if kw in normalized:
+                            is_descriptive = True
+                            break
+            
+            # 如果是描述性内容，跳过
+            if is_descriptive:
+                continue
+            
+            # 如果不是对话结尾，也不包含口语表达，也不是娇喘，也没有角色名标记，则跳过
+            if not is_dialogue_end and not has_colloquial and not has_moan and not has_character_mark:
+                # 这是故事背景介绍，跳过
+                continue
+            
+            # 如果开头部分包含明显的非对话特征，也跳过
+            # 例如：以「」或『』包裹的内容（通常是引用或标题）
+            if re.match(r'^[「『].*[」』]$', normalized):
+                continue
+            
+            # 如果行太短（少于5个字符），可能是残缺的设定内容
+            if len(normalized) < 5:
+                continue
+        
+        # === 新增：跳过以 // 开头的指示文本 ===
+        if normalized.startswith('//'):
+            # 这是指示文本（位置/麦克风指示），跳过
+            continue
+        
+        # === 关键新增：调用_is_scene_description等函数过滤非台词内容 ===
+        # 这些过滤在过了开头设定部分后也需要执行
+        if _is_scene_description(normalized):
+            continue
+        if _is_direction(normalized):
+            continue
+        if _is_position_marker(normalized):
+            continue
+        if _is_se_marker(normalized):
+            continue
+        if _is_page_number(normalized):
+            continue
+        if _is_header_footer(normalized):
+            continue
+        
+        # === 新增：跳过人物设定格式 ===
+        is_setting = False
+        for pattern in setting_patterns:
+            if re.match(pattern, normalized):
+                is_setting = True
+                break
+        if is_setting:
+            continue
+        
+        # === 新增：跳过故事背景/世界观介绍标记（如 ■タイトル、■おはなし 等）===
+        is_story_intro = False
+        for pattern in story_intro_patterns:
+            if re.match(pattern, normalized):
+                is_story_intro = True
+                break
+        if is_story_intro:
+            continue
+        
+        # === 新增：跳过以 ■ 开头的非对话内容（标题、设定等）===
+        # 注意：只跳过以 ■ 开头的标题行，不跳过角色对话
+        if normalized.startswith('■'):
+            # 其他以 ■ 开头的内容（如章节标题），也跳过
+            # 因为这些通常不是角色对话
+            continue
         
         # 跳过纯页码行（如 "1 / 57"、"1 / 35"）
         if re.match(r'^\d+\s*/\s*\d+$', normalized):
@@ -922,7 +1390,16 @@ def extract_pdf_text(file_path: Path, clean_for_translation: bool = False) -> st
         japanese_chars = len(re.findall(r'[\u3040-\u309f\u30a0-\u30fa]', raw_text))
         total_chars = len(raw_text.replace('\n', '').replace(' ', ''))
         if total_chars > 0 and japanese_chars / total_chars > 0.05:
-            # 原始提取质量良好，现在清洗（如果需要）
+            # 原始提取质量良好
+            # 检查是否需要合并碎片化的行（每行只有一个字符的情况）
+            lines = raw_text.split('\n')
+            single_char_lines = sum(1 for line in lines if len(line.strip()) == 1)
+            if single_char_lines > len(lines) * 0.5:
+                # 超过50%是单字符行，需要合并
+                print(f"  检测到碎片化文本（{single_char_lines}/{len(lines)}行是单字符），正在合并...")
+                raw_text = _merge_fragmented_lines(raw_text)
+            
+            # 现在清洗（如果需要）
             if clean_for_translation:
                 cleaned_text = clean_script_for_translation(raw_text)
                 print(f"  使用PyMuPDF提取成功: {len(cleaned_text)} 字符（清洗后）")
@@ -992,6 +1469,11 @@ def is_scriptbook_file(file_path: Path) -> bool:
     filename_lower = filename.lower()
     stem = file_path.stem  # 不含扩展名的文件名
     
+    # 【新增】排除清洗后的台本文件（_cleaned.txt）
+    # 这些是程序生成的清洗后输出文件，不应该被当作台本输入
+    if '_cleaned' in stem:
+        return False
+    
     # 模式D：排除特殊用途文件（优先级最高）
     for keyword in NON_SCRIPTBOOK_KEYWORDS:
         if keyword.lower() in filename_lower:
@@ -1041,9 +1523,16 @@ def is_scriptbook_file(file_path: Path) -> bool:
     
     # 检查文件内容是否包含台本特征
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        # PDF文件需要使用extract_pdf_text提取
+        if file_path.suffix.lower() == '.pdf':
+            content = extract_pdf_text(file_path, clean_for_translation=False)
+        else:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
     except Exception:
+        return False
+    
+    if not content:
         return False
     
     # 检测台本特征标记
@@ -1051,9 +1540,10 @@ def is_scriptbook_file(file_path: Path) -> bool:
     has_se_marks = bool(re.search(r'^SE[:：\s]', content, re.MULTILINE))
     has_direction = bool(re.search(r'^#[^\n]+$', content, re.MULTILINE))
     has_track = bool(re.search(r'トラック\d+', content))
+    has_track_mark = bool(re.search(r'^■トラック[０-９0-9]+', content, re.MULTILINE))  # ■トラック０１ 格式
     
     # 至少包含两种特征才认为是台本
-    features = sum([has_character_marks, has_se_marks, has_direction, has_track])
+    features = sum([has_character_marks, has_se_marks, has_direction, has_track, has_track_mark])
     return features >= 2
 
 
@@ -1066,11 +1556,13 @@ SE_PATTERNS = [
     r'^\s*SE\s*[:：]?\s*', # 可选空格
     r'^【効果音[:：]',     # 【効果音：xxx】
     r'^【効果音：',        # 【効果音：xxx】
+    r'^（ＳＥ[:：]',       # （ＳＥ：xxx）
 ]
 
 DIRECTION_PATTERN = r'^#[^\n]+$'
 CHARACTER_PATTERN = r'^【[^】]+】\s*$'
 TRACK_PATTERN = r'^【トラック\d+[：：][^\]]*】'
+TRACK_MARK_PATTERN = r'^■トラック[０-９0-9]+'  # ■トラック０１ 格式
 CHAPTER_TITLE_PATTERN = r'^《[^》]+》'
 POSITION_PATTERN = r'^【[左右中正遠近・→]+】\s*$'
 MOVE_PATTERN = r'^【移動[:：]'
@@ -1126,6 +1618,17 @@ def parse_scriptbook_content(content: str) -> list[dict]:
         
         # 音轨标记（如 【トラック1：xxx】）
         if re.match(TRACK_PATTERN, stripped):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 音轨标记（如 ■トラック０１）
+        if re.match(TRACK_MARK_PATTERN, stripped):
             parsed.append({
                 "line_num": i,
                 "character": "",

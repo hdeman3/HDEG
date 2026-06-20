@@ -5,10 +5,12 @@ set "cpath=%~dp0"
 set "cpath=%cpath:~0,-1%"
 
 :: 检测是否为50系显卡（RTX 5090/5080/5070等Blackwell架构）
+:: 注意：必须精确匹配 "RTX 50xx"，避免误识别 RTX 3050/4050 等
 set "gpu_compute_type=int8_float16"
 for /f "tokens=*" %%a in ('nvidia-smi --query-gpu^=name --format^=csv^,noheader 2^>nul') do (
     set "gpu_name=%%a"
-    echo !gpu_name! | findstr /I "RTX 50" >nul && (
+    REM 使用正则匹配：RTX空格50后跟两位数字（如5090, 5080, 5070）
+    echo !gpu_name! | findstr /I /R /C:"RTX 50[0-9][0-9]" >nul && (
         set "gpu_compute_type=float16"
         echo [检测到50系显卡: !gpu_name!]
         echo [自动切换compute_type为 float16]

@@ -36,6 +36,9 @@ NON_SCRIPTBOOK_KEYWORDS = [
     'キャスト', 'cast',  # 演员表
     '声優',  # 声优信息
     '購入特典', '購入特典',  # 购买特典
+    # 序言/前言/说明文件
+    'プロローグ', 'prologue', 'はじめに', '初めに', '必ず', '読んで',
+    'お読みください', '説明書', 'せつめいしょ', '注意事項',
 ]
 
 
@@ -1563,6 +1566,14 @@ DIRECTION_PATTERN = r'^#[^\n]+$'
 CHARACTER_PATTERN = r'^【[^】]+】\s*$'
 TRACK_PATTERN = r'^【トラック\d+[：：][^\]]*】'
 TRACK_MARK_PATTERN = r'^■トラック[０-９0-9]+'  # ■トラック０１ 格式
+
+# 新增：星号章节标记（如 ☆プロローグ、☆１、☆２、★１ 等）
+STAR_TRACK_PATTERN = r'^[☆★]\s*[０-９0-9]*'  # ☆１、☆２、★１ 等
+STAR_CHAPTER_PATTERN = r'^[☆★]\s*(プロローグ|エピローグ|おまけ|特典)'  # ☆プロローグ、☆エピローグ 等
+
+# 新增：Tr./Track 格式
+TR_DOT_PATTERN = r'^[Tr\.トラック]+\s*[０-９0-9]+'  # Tr.1、Tr.2、トラック1 等
+
 CHAPTER_TITLE_PATTERN = r'^《[^》]+》'
 POSITION_PATTERN = r'^【[左右中正遠近・→]+】\s*$'
 MOVE_PATTERN = r'^【移動[:：]'
@@ -1629,6 +1640,39 @@ def parse_scriptbook_content(content: str) -> list[dict]:
         
         # 音轨标记（如 ■トラック０１）
         if re.match(TRACK_MARK_PATTERN, stripped):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 新增：星号数字标记（如 ☆１、☆２、★１）
+        if re.match(STAR_TRACK_PATTERN, stripped):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 新增：星号章节标记（如 ☆プロローグ、☆エピローグ、☆おまけ）
+        if re.match(STAR_CHAPTER_PATTERN, stripped):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 新增：Tr./Track 格式（如 Tr.1、Tr.2、トラック1）
+        if re.match(TR_DOT_PATTERN, stripped, re.IGNORECASE):
             parsed.append({
                 "line_num": i,
                 "character": "",
@@ -2148,3 +2192,434 @@ if __name__ == "__main__":
     print("  - build_asr_correction_prompt(dialogue_lines, asr_text) -> str")
     print("  - correct_asr_with_scriptbook(scriptbook_path, asr_text) -> tuple")
     print("=" * 50)
+
+
+# ==================== LLM辅助台本识别与音轨划分 ====================
+
+def llm_identify_scriptbook_files(file_paths: list[str], llm_client, model: str = "gemini-2.0-flash") -> list[str]:
+    """使用LLM识别哪些文件是真正的台本文件
+    
+    参数:
+        file_paths: 候选文件路径列表（可能是台本的文件）
+        llm_client: OpenAI兼容的LLM客户端
+        model: 模型名称
+    
+    返回:
+        确认为台本文件的路径列表
+    """
+    if not file_paths:
+        return []
+    
+    # 构建文件列表
+    file_list = []
+    for i, path in enumerate(file_paths, 1):
+        file_list.append(f"{i}. {path}")
+    
+    file_list_text = '\n'.join(file_list)
+    
+    prompt = f"""你是一位日语ASMR音声作品台本识别专家。
+
+以下是目录中发现的候选文件列表，请判断哪些是真正的台本文件。
+
+【台本文件特征】
+- 文件名包含：台本、セリフ、シナリオ、script
+- 纯数字编号文件（如 01.txt, 02.txt）且内容为台词
+- PDF文件通常为台本
+
+【非台本文件特征】
+- 文件名包含：readme、クレジット、注意、説明、あとがき
+- 图片文件（jpg, png）
+- 音频文件（mp3, wav）
+
+【候选文件列表】
+{file_list_text}
+
+请返回JSON格式，包含确认的台本文件序号：
+```json
+{{
+  "scriptbook_indices": [1, 3, 5],
+  "reason": "简短说明判断依据"
+}}
+```
+
+注意：
+1. 如果没有台本文件，返回空列表：{{"scriptbook_indices": [], "reason": "无台本文件"}}
+2. 只返回确认是台本的文件序号，不确定的不返回
+3. 序号从1开始，对应上面的列表编号
+"""
+
+    try:
+        response = llm_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "你是一位日语台本识别专家，只返回JSON格式结果。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=300
+        )
+        
+        result_text = response.choices[0].message.content.strip()
+        
+        # 提取JSON部分
+        if '```json' in result_text:
+            result_text = result_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in result_text:
+            result_text = result_text.split('```')[1].split('```')[0].strip()
+        
+        import json
+        result = json.loads(result_text)
+        
+        indices = result.get("scriptbook_indices", [])
+        reason = result.get("reason", "")
+        
+        # 转换为文件路径
+        confirmed_paths = []
+        for idx in indices:
+            if 1 <= idx <= len(file_paths):
+                confirmed_paths.append(file_paths[idx - 1])
+        
+        if confirmed_paths:
+            print(f"  [LLM识别] 确认 {len(confirmed_paths)} 个台本文件: {reason}")
+        else:
+            print(f"  [LLM识别] 未发现台本文件: {reason}")
+        
+        return confirmed_paths
+        
+    except Exception as e:
+        print(f"  [LLM识别] 台本识别失败: {e}")
+        # 失败时返回所有候选文件（保守策略）
+        return file_paths
+
+
+def llm_analyze_track_structure(content: str, llm_client, model: str = "gemini-2.0-flash", debug_mode: bool = False) -> list[tuple[int, str]]:
+    """使用LLM分析台本的音轨结构
+    
+    当正则无法正确识别音轨边界时，调用LLM分析台本内容，
+    找出每个音轨的边界标记和标题。
+    
+    参数:
+        content: 台本内容（清洗后）
+        llm_client: OpenAI兼容的LLM客户端
+        model: 模型名称
+        debug_mode: 是否打印调试信息
+    
+    返回:
+        [(音轨编号, 边界标记文本), ...]
+        如 [(1, "☆プロローグ"), (2, "☆１"), (3, "☆２"), ...]
+    """
+    
+    lines = content.split('\n')
+    total_lines = len(lines)
+    
+    # 【改进】音轨标记特征模式
+    track_marker_patterns = [
+        r'^[☆★]',  # 星号标记（☆１、★1、☆プロローグ等）
+        r'[トトラック]',  # トラック、Track
+        r'^[Tt]r\.?\s*\d',  # Tr.1, Tr1
+        r'^【[^】]*(?:トラック|プロローグ|エピローグ|第[0-9０-９]+章)',  # 【トラック1】【プロローグ】等
+        r'^■[^■]*トラック',  # ■トラック01
+        r'^《[^》]+》',  # 《章节标题》
+    ]
+    
+    # 【改进】分两类收集关键行
+    # 1. 优先行：包含音轨标记特征的行
+    # 2. 普通行：其他非空行
+    priority_lines = []  # 优先行（包含音轨标记）
+    normal_lines = []    # 普通行（用于上下文）
+    
+    for i, line in enumerate(lines, 1):  # 从第1行开始
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r'^[\d\s]+$', stripped):
+            continue
+        
+        line_info = f"行{i}: {stripped[:100]}"
+        
+        # 检查是否包含音轨标记特征
+        is_track_marker = False
+        for pattern in track_marker_patterns:
+            if re.search(pattern, stripped):
+                is_track_marker = True
+                break
+        
+        # 额外检查：短行（<20字符）且包含数字或特殊符号，可能是音轨标记
+        if not is_track_marker and len(stripped) < 20:
+            if re.match(r'^[☆★◆■□●○◎◇]', stripped):
+                is_track_marker = True
+            # 纯数字行（全角或半角）
+            elif re.match(r'^[０-９0-9]+$', stripped):
+                is_track_marker = True
+            # 数字+分隔符（全角或半角点号、空格）
+            elif re.match(r'^[０-９0-9]+[\.．\s　]', stripped):
+                is_track_marker = True
+            # 全角数字+全角点号或其他分隔符
+            elif re.match(r'^[０-９]+[．。・、]', stripped):
+                is_track_marker = True
+            # 半角数字+半角点号或其他分隔符
+            elif re.match(r'^[0-9]+[\.\s]', stripped):
+                is_track_marker = True
+            # 带括号的数字（如 ①、②、⑴、⒈等）
+            elif re.match(r'^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳⒈⒉⒊⒋⒌⒍⒎⒏⒐⒑⒒⒓⒔⒕⒖⒗⒘⒙⒚⒛⑴⑵⑶⑷⑸⑹⑺⑻⑼⑽⑾⑿⒀⒁⒂]', stripped):
+                is_track_marker = True
+        
+        if is_track_marker:
+            priority_lines.append(line_info)
+        else:
+            normal_lines.append(line_info)
+    
+    # 【改进】构建发送给LLM的样本
+    # 策略：优先发送所有音轨标记行 + 开头部分普通行（提供上下文）
+    # 总行数限制：300行（增加上限以确保包含所有音轨标记）
+    max_total_lines = 300
+    max_normal_lines = 50  # 普通行最多50行（用于开头上下文）
+    
+    # 合并：开头普通行 + 所有优先行
+    sample_lines = normal_lines[:max_normal_lines] + priority_lines
+    
+    # 如果总行数超过限制，保留所有优先行，截断普通行
+    if len(sample_lines) > max_total_lines:
+        # 保留所有优先行
+        sample_lines = normal_lines[:max(0, max_total_lines - len(priority_lines))] + priority_lines
+    
+    # 按行号排序（保持原始顺序）
+    sample_lines = sorted(sample_lines, key=lambda x: int(x.split(':')[0].replace('行', '')))
+    sample_lines = sample_lines[:max_total_lines]
+    
+    sample_text = '\n'.join(sample_lines)
+    
+    # DEBUG: 打印发送给LLM的样本内容
+    if debug_mode:
+        print(f"  [DEBUG] LLM音轨分析 - 台本总行数: {total_lines}")
+        print(f"  [DEBUG] 发现音轨标记行: {len(priority_lines)} 行")
+        print(f"  [DEBUG] 发送样本: {len(sample_lines)} 行 (优先行 {len(priority_lines)} + 普通行 {len(sample_lines) - len(priority_lines)})")
+        print(f"  [DEBUG] 样本内容预览（前30行）:")
+        for line in sample_lines[:30]:
+            print(f"    {line}")
+        if len(priority_lines) > 0:
+            print(f"  [DEBUG] 音轨标记行列表:")
+            for line in priority_lines[:20]:
+                print(f"    {line}")
+            if len(priority_lines) > 20:
+                print(f"    ... (共 {len(priority_lines)} 行)")
+    
+    prompt = """你是一位日语ASMR音声作品台本分析专家。
+
+请分析以下台本内容样本，找出音轨（トラック）的边界标记。
+
+音轨边界通常是以下格式之一：
+- 【トラック1：xxx】
+- ■トラック01
+- ☆プロローグ、☆１、☆２、★1 等
+- Tr.1、Tr.2
+- 纯数字行（如单独的 1、2、3）
+- 章节标题（如 《xxx》、【プロローグ：xxx】）
+
+请返回JSON格式：
+```json
+[
+  {"track": 1, "marker": "边界标记原文"},
+  {"track": 2, "marker": "边界标记原文"},
+  ...
+]
+```
+
+注意：
+1. marker必须是台本中的原文（用于后续定位）
+2. track编号从1开始
+3. 如果无法识别边界，返回空列表 []
+
+台本内容样本：
+""" + sample_text + """
+
+请分析并返回音轨边界列表："""
+
+    try:
+        response = llm_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "你是一位日语台本分析专家，专注于识别音轨边界。只返回JSON格式结果，不要解释。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=500
+        )
+        
+        result_text = response.choices[0].message.content.strip()
+        
+        # 提取JSON部分
+        if '```json' in result_text:
+            result_text = result_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in result_text:
+            result_text = result_text.split('```')[1].split('```')[0].strip()
+        
+        import json
+        result = json.loads(result_text)
+        
+        # 转换为列表格式
+        track_markers = []
+        for item in result:
+            track_num = item.get("track", 0)
+            marker = item.get("marker", "")
+            if track_num > 0 and marker:
+                track_markers.append((track_num, marker))
+        
+        return track_markers
+        
+    except Exception as e:
+        print(f"  [LLM分析] 音轨结构分析失败: {e}")
+        return []
+
+
+def split_scriptbook_by_llm_markers(content: str, track_markers: list[tuple[int, str]]) -> dict[int, str]:
+    """根据LLM返回的边界标记划分台本内容
+    
+    参数:
+        content: 台本内容
+        track_markers: [(音轨编号, 边界标记), ...]
+    
+    返回:
+        {音轨编号: 台本内容片段}
+    """
+    if not track_markers:
+        return {1: content}  # 无法划分，返回整体
+    
+    lines = content.split('\n')
+    track_contents = {}
+    
+    # 找到每个标记的行号
+    marker_lines = {}  # {音轨编号: 行号}
+    for track_num, marker in track_markers:
+        marker_clean = marker.strip()
+        for i, line in enumerate(lines):
+            if marker_clean in line.strip() or line.strip() == marker_clean:
+                marker_lines[track_num] = i
+                break
+    
+    # 按行号排序
+    sorted_markers = sorted(marker_lines.items(), key=lambda x: x[1])
+    
+    # 划分内容
+    for idx, (track_num, start_line) in enumerate(sorted_markers):
+        if idx + 1 < len(sorted_markers):
+            end_line = sorted_markers[idx + 1][1]
+        else:
+            end_line = len(lines)
+        
+        track_content = '\n'.join(lines[start_line:end_line])
+        track_contents[track_num] = track_content
+    
+    return track_contents
+
+
+# ==================== 音轨标题提取与匹配 ====================
+
+def extract_track_titles_from_scriptbook(content: str) -> list[tuple[int, str, int]]:
+    """从台本内容中提取音轨标题
+    
+    支持格式：
+    - 【王女様の種搾り騎乗位おまんこ　4737文字】
+    - ②【王女様と正常位でセックス練習ラブラブおまんこ　3927文字】
+    - ③【共有財産法律種オス制度、寝バックおまんこ　2819文字】
+    
+    参数:
+        content: 台本内容
+    
+    返回:
+        [(音轨编号, 标题, 行号), ...]
+    """
+    lines = content.split('\n')
+    track_titles = []
+    circled_to_num = {'①': 1, '②': 2, '③': 3, '④': 4, '⑤': 5,
+                      '⑥': 6, '⑦': 7, '⑧': 8, '⑨': 9, '⑩': 10}
+    
+    for i, line in enumerate(lines):
+        line = line.strip()
+        # 匹配【xxx n文字】格式
+        match = re.match(r'^([①②③④⑤⑥⑦⑧⑨⑩])?【([^】]+?)　?\d+文字】', line)
+        if match:
+            circled = match.group(1)
+            title = match.group(2).strip()
+            if circled and circled in circled_to_num:
+                track_num = circled_to_num[circled]
+            else:
+                track_num = len(track_titles) + 1
+            track_titles.append((track_num, title, i + 1))
+    
+    return track_titles
+
+
+def extract_track_info_from_filename(filename: str):
+    """从音频文件名中提取音轨编号和标题
+    
+    支持格式：
+    - 01.王女様の種絞り騎乗位おまんこ-2.wav
+    - 02.王女様と正常位でセックス練習ラブラブおまんこ.mp3
+    
+    返回:
+        (音轨编号, 标题)，如果无法提取则对应位置为 None
+    """
+    from pathlib import Path
+    stem = Path(filename).stem
+    
+    # 尝试匹配 "数字.标题" 格式
+    match = re.match(r'^(\d+)[.．\-_]\s*(.+)', stem)
+    if match:
+        track_num = int(match.group(1))
+        title = match.group(2).strip()
+        # 去掉可能的数字后缀（如 -2）
+        title = re.sub(r'[-‐‑]\d+$', '', title)
+        return track_num, title
+    
+    return None, None
+
+
+def match_tracks_by_title(scriptbook_path: Path, audio_dir: Path) -> dict[int, int]:
+    """通过标题相似度匹配台本音轨与音频文件
+    
+    返回:
+        {音频编号: 台本音轨编号} 的映射
+    """
+    from difflib import SequenceMatcher
+    
+    # 读取台本
+    try:
+        with open(scriptbook_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception:
+        return {}
+    
+    # 提取台本标题
+    scriptbook_titles = extract_track_titles_from_scriptbook(content)
+    if not scriptbook_titles:
+        return {}
+    
+    # 查找音频文件
+    audio_files = sorted(list(audio_dir.glob('*.mp3')) + list(audio_dir.glob('*.wav')), 
+                        key=lambda x: x.name)
+    
+    # 匹配
+    matches = {}
+    for audio_file in audio_files:
+        track_num, title = extract_track_info_from_filename(audio_file.name)
+        if not title:
+            continue
+        
+        # 计算与每个台本音轨的相似度
+        best_match = None
+        best_sim = 0.0
+        for sb_track_num, sb_title, _ in scriptbook_titles:
+            sim = SequenceMatcher(None, title, sb_title).ratio()
+            if sim > best_sim:
+                best_sim = sim
+                best_match = sb_track_num
+        
+        # 相似度阈值 70%
+        if best_match and best_sim > 0.7:
+            matches[track_num] = best_match
+            print(f"  [标题匹配] {audio_file.name} -> 音轨{best_match} (相似度: {best_sim:.1%})")
+        else:
+            print(f"  [标题匹配] {audio_file.name} -> 无匹配 (最高相似度: {best_sim:.1%})")
+    
+    return matches

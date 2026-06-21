@@ -428,6 +428,28 @@ _DEFAULT_SYSTEM_PROMPT = (
     "【生物学字面翻译陷阱警告】\n"
     "メス/オス 在成人音声语境下通常指『雌性/雄性』或带有性别支配意味的表达，绝对不要按字面译成『母/公』这类普通动物词汇。\n"
     "遇到此类词汇请结合上下文判断是否为 R18 语境下的特殊用法。\n\n"
+    "【翻译忠实度与风格约束——严格遵守】\n"
+    "**核心原则：严格忠实于原文语义，禁止过度发挥或自行改写。**\n\n"
+    "1. **语义忠实**\n"
+    "   - 必须准确理解原文的主语、对象和动作，不得随意改变。\n"
+    "   - 例如「おちんちんで顔よすぎぃ」主语是「顔（脸）」，不是「おちんちん（肉棒）」，不能译成「被肉棒弄得好爽」。\n"
+    "   - 禁止将原文的陈述句自行改写为被动句或其他句式。\n\n"
+    "2. **隐语/俚语识别**\n"
+    "   - R18作品中存在大量隐语，需根据上下文正确理解。\n"
+    "   - 例如「口」在性行为语境中可能指「阴蒂（クリチンポ）」，而非口腔。\n"
+    "   - 例如「親愛い」是口语表达「亲爱的/亲亲的」，不应直译为书面语「亲爱」。\n\n"
+    "3. **口语风格保持**\n"
+    "   - 原文为口语化、粗暴、直白的表达时，译文必须保持同等风格。\n"
+    "   - 禁止将口语「文艺化」、「书面化」或「委婉化」。\n"
+    "   - 例如「勝ち越えてって神しなかった」应保持粗暴口吻，不得译成文艺腔「没能如愿以偿」。\n\n"
+    "4. **句式节奏保留**\n"
+    "   - 原文中的喘息、断续、短句必须保留，不得合并成完整长句。\n"
+    "   - 一口气读完的长句在R18场景中不合逻辑，必须按原文节奏拆分。\n"
+    "   - 禁止自行添加连接词使句子「更流畅」，这会破坏喘息感。\n\n"
+    "5. **禁止自行创作**\n"
+    "   - 本任务是翻译，不是创作。禁止添加原文不存在的内容。\n"
+    "   - 禁止「润色」、「美化」或「改写」原文表达。\n"
+    "   - 原文粗糙则译文粗糙，原文粗暴则译文粗暴，保持原汁原味。\n\n"
     "请严格遵守以上规则：优先根据上下文和 terms/alias 修复ASR错误，再基于修复后的理解进行忠实翻译。\n"
     "最终只输出与输入行数完全一致、带编号的中文翻译结果，不输出任何额外说明。"
 )
@@ -465,7 +487,8 @@ DEFAULT_CONFIG = {
     },
     "pricing": {
         "hit_per_1m": 0.025,
-        "miss_per_1m": 3.0
+        "miss_per_1m": 3.0,
+        "completion_per_1m": 2.0
     },
     "network": {
         "clear_proxy_on_startup": True
@@ -549,6 +572,7 @@ SCRIPTBOOK_FULL_MODE = _app_cfg.get("scriptbook_full_mode", False)
 _price_cfg = CONFIG["pricing"]
 PRICE_HIT_PER_1M = _price_cfg["hit_per_1m"]
 PRICE_MISS_PER_1M = _price_cfg["miss_per_1m"]
+PRICE_COMPLETION_PER_1M = _price_cfg.get("completion_per_1m", 8.0)
 
 # ==================== Prompt 加载 ====================
 _prompt_cfg = CONFIG["prompts"]
@@ -771,15 +795,19 @@ def is_freetalk_context(path: Path) -> bool:
         if keyword.lower() in path_str:
             return True, None
     
-    # 2. 检测热门CV名称
+    # 2. 检测热门CV名称（精确匹配）
+    # 只检测较长的CV名（>=3字符），避免误匹配如"エル"匹配到"エルフ"
     for part in path_parts:
-        part_lower = part.lower()
         for cv_name in POPULAR_ASMR_CV_NAMES:
-            if cv_name.lower() in part_lower:
-                # 检查是否是CV名（不是其他词的一部分）
-                # 例如 "山田" 在 "山田寿美子" 中
-                if len(cv_name) >= 2:
-                    return True, cv_name
+            # 只检测长度>=3的CV名，避免短名误匹配
+            if len(cv_name) < 3:
+                continue
+            # 使用正则表达式进行边界匹配
+            # 匹配：CV名前后是分隔符（空格、下划线、括号等）或字符串边界
+            import re
+            pattern = r'(^|[\s\_\-\(\)（）\[\]「」『』【】])' + re.escape(cv_name) + r'($|[\s\_\-\(\)（）\[\]「」『』【】])'
+            if re.search(pattern, part, re.IGNORECASE):
+                return True, cv_name
     
     return False, None
 
@@ -1874,10 +1902,19 @@ def extract_track_number_from_filename(filename: str) -> "int | None":
     return None
 
 
-def build_track_scriptbook_map(work_dir: Path) -> "tuple[dict[int, list[str]], dict[int, Path], set[str], dict[int, tuple[int, int]]]":
+def build_track_scriptbook_map(work_dir: Path, llm_client=None, model: str = "gemini-2.0-flash") -> "tuple[dict[int, list[str]], dict[int, Path], set[str], dict[int, tuple[int, int]]]":
     """构建音轨到台本的映射
     
     扫描目录中的台本文件，解析并按音轨编号组织。
+    
+    【新增 LLM辅助】
+    当只有单个台本文件且正则无法正确划分音轨时，
+    调用LLM分析台本结构，辅助音轨划分。
+    
+    参数:
+        work_dir: 作品目录
+        llm_client: OpenAI兼容的LLM客户端（可选）
+        model: 模型名称（默认 gemini-2.0-flash）
     
     返回: (台词映射, 台本文件路径映射, 角色名集合, 行号范围映射)
         - 台词映射: {音轨编号: [台词列表]}
@@ -1894,9 +1931,31 @@ def build_track_scriptbook_map(work_dir: Path) -> "tuple[dict[int, list[str]], d
     if not scriptbook_files:
         return track_map, track_file_map, character_names, track_line_ranges
     
-    print(f"    [台本扫描] 发现 {len(scriptbook_files)} 个台本文件:")
+    print(f"    [台本扫描] 发现 {len(scriptbook_files)} 个候选文件:")
     for sb_path in scriptbook_files:
         print(f"      - {sb_path.absolute()}")
+    
+    # 【新增】使用LLM确认哪些文件是真正的台本文件
+    if llm_client is not None:
+        from scriptbook_utils import llm_identify_scriptbook_files
+        
+        # 将路径转换为字符串列表
+        file_paths = [str(sb_path) for sb_path in scriptbook_files]
+        
+        print(f"    [LLM确认] 正在让LLM确认台本文件...")
+        confirmed_paths = llm_identify_scriptbook_files(file_paths, llm_client, model)
+        
+        # 将确认的路径转换回Path对象
+        scriptbook_files = [Path(p) for p in confirmed_paths]
+        
+        if not scriptbook_files:
+            print(f"    [LLM确认] LLM判断没有台本文件，跳过台本分析")
+            return track_map, track_file_map, character_names, track_line_ranges
+        
+        print(f"    [LLM确认] 确认 {len(scriptbook_files)} 个台本文件")
+    
+    # LLM客户端可用时使用LLM分析音轨结构
+    use_llm_analysis = llm_client is not None
     
     for sb_path in scriptbook_files:
         # 打印台本绝对路径
@@ -1959,6 +2018,167 @@ def build_track_scriptbook_map(work_dir: Path) -> "tuple[dict[int, list[str]], d
             if current_track not in track_dialogues:
                 track_dialogues[current_track] = []
             track_dialogues[current_track].extend(current_dialogues)
+        
+        # 【新增 LLM辅助】
+        # 【修复】如果文件名已经能提取到音轨编号，跳过 LLM 分析
+        # 只有当文件名无法确定音轨编号时，才需要 LLM 分析音轨结构
+        if use_llm_analysis and track_num is None:
+            print(f"    [LLM辅助] 文件名无法确定音轨编号，正则识别出 {len(track_dialogues)} 个音轨，使用LLM确认/重新划分...")
+            
+            from scriptbook_utils import llm_analyze_track_structure, split_scriptbook_by_llm_markers
+            
+            # === DEBUG模式：打印清洗后的台本行号信息 ===
+            if DEBUG_MODE:
+                content_lines = content.split('\n')
+                print(f"    [DEBUG] 清洗后台本总行数: {len(content_lines)}")
+                print(f"    [DEBUG] 清洗后前10行预览:")
+                for i, line in enumerate(content_lines[:10], 1):
+                    preview = line[:60] + "..." if len(line) > 60 else line
+                    print(f"    [DEBUG]   行{i:03d}: {preview}")
+            
+            # 调用LLM分析音轨结构（传入DEBUG_MODE以打印发送给LLM的样本）
+            track_markers = llm_analyze_track_structure(content, llm_client, model, debug_mode=DEBUG_MODE)
+            
+            if track_markers and len(track_markers) > 1:
+                print(f"    [LLM辅助] LLM识别出 {len(track_markers)} 个音轨边界:")
+                
+                # 在清洗后的内容中查找每个边界标记的行号
+                content_lines = content.split('\n')
+                marker_line_info = []  # [(track_num, marker, line_num), ...]
+                
+                for tnum, marker in track_markers:
+                    marker_clean = marker.strip()
+                    found_line = -1
+                    for i, line in enumerate(content_lines):
+                        if marker_clean in line.strip() or line.strip() == marker_clean:
+                            found_line = i + 1  # 行号从1开始
+                            break
+                    
+                    marker_line_info.append((tnum, marker, found_line))
+                    print(f"      - 音轨{tnum}: 标记 \"{marker[:40]}...\" 在第{found_line}行")
+                
+                # 根据LLM返回的标记重新划分台本
+                track_contents = split_scriptbook_by_llm_markers(content, track_markers)
+                
+                # === 导出清洗后的台本内容 ===
+                # 先计算所有音轨的行号范围（用于导出）
+                sorted_markers = sorted(marker_line_info, key=lambda x: x[2] if x[2] > 0 else 999999)
+                track_ranges_for_export = {}
+                for idx, (tnum, marker, start_line) in enumerate(sorted_markers):
+                    if idx + 1 < len(sorted_markers):
+                        end_line = sorted_markers[idx + 1][2] - 1
+                    else:
+                        end_line = len(content_lines)
+                    track_ranges_for_export[tnum] = (start_line, end_line)
+                
+                # === 导出清洗后的台本文件（_cleaned.txt）===
+                # 文件名处理：防止重复清洗导致 _cleaned_cleaned.txt
+                sb_stem = sb_path.stem
+                if sb_stem.endswith('_cleaned'):
+                    # 已经是清洗后的文件，不再添加 _cleaned
+                    cleaned_txt_path = sb_path
+                else:
+                    cleaned_txt_path = sb_path.with_name(f"{sb_stem}_cleaned.txt")
+                
+                try:
+                    # 写入清洗后的台本内容（纯文本，不带行号）
+                    with open(cleaned_txt_path, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(content_lines))
+                    print(f"    [导出] 清洗后台本: {cleaned_txt_path.name}")
+                except Exception as e:
+                    print(f"    [导出失败] 清洗后台本保存失败: {e}")
+                
+                # === 导出音轨行号范围信息（.cleaned_scriptbook.txt）===
+                # 只保存音轨划分信息，不含台本内容
+                cleaned_scriptbook_path = work_dir / ".cleaned_scriptbook.txt"
+                try:
+                    with open(cleaned_scriptbook_path, 'w', encoding='utf-8') as f:
+                        f.write(f"=== 音轨行号范围 ===\n")
+                        f.write(f"原始台本: {sb_path.name}\n")
+                        f.write(f"清洗后台本: {cleaned_txt_path.name}\n")
+                        f.write(f"总行数: {len(content_lines)}\n")
+                        f.write(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        f.write("=" * 60 + "\n\n")
+                        
+                        # 写入每个音轨的行号范围
+                        for tnum in sorted(track_ranges_for_export.keys()):
+                            start_line, end_line = track_ranges_for_export[tnum]
+                            line_count = end_line - start_line + 1
+                            # 查找对应的标记
+                            marker_text = ""
+                            for mn, mm, ml in marker_line_info:
+                                if mn == tnum:
+                                    marker_text = mm[:50] + "..." if len(mm) > 50 else mm
+                                    break
+                            f.write(f"【音轨{tnum:02d}】 第{start_line:04d}-{end_line:04d}行 (共{line_count}行)\n")
+                            f.write(f"  标记: {marker_text}\n")
+                            f.write(f"  内容预览:\n")
+                            # 写入该音轨的前5行内容预览
+                            for ln in range(start_line, min(start_line + 5, end_line + 1)):
+                                if ln > 0 and ln <= len(content_lines):
+                                    preview = content_lines[ln - 1][:60] + "..." if len(content_lines[ln - 1]) > 60 else content_lines[ln - 1]
+                                    f.write(f"    {ln:04d}: {preview}\n")
+                            f.write("\n")
+                        
+                        f.write("=" * 60 + "\n")
+                        f.write("=== 音轨行号范围结束 ===\n")
+                        
+                    print(f"    [导出] 音轨行号范围: {cleaned_scriptbook_path.name}")
+                    print(f"    [导出] 包含 {len(track_ranges_for_export)} 个音轨的行号范围")
+                except Exception as e:
+                    print(f"    [导出失败] 音轨行号范围保存失败: {e}")
+                
+                # === DEBUG模式：打印每个音轨的行号范围 ===
+                if DEBUG_MODE:
+                    print(f"    [DEBUG] ========== 音轨行号范围 ==========")
+                
+                # 对每个音轨内容重新解析
+                track_dialogues = {}
+                track_line_ranges = {}  # 新增：记录每个音轨在清洗后TXT中的行号范围
+                
+                # 计算每个音轨的行号范围
+                sorted_markers = sorted(marker_line_info, key=lambda x: x[2] if x[2] > 0 else 999999)
+                for idx, (tnum, marker, start_line) in enumerate(sorted_markers):
+                    # 计算结束行号
+                    if idx + 1 < len(sorted_markers):
+                        end_line = sorted_markers[idx + 1][2] - 1
+                    else:
+                        end_line = len(content_lines)
+                    
+                    # 保存行号范围
+                    track_line_ranges[tnum] = (start_line, end_line)
+                
+                for tnum, track_content in track_contents.items():
+                    track_parsed = parse_scriptbook_content(track_content)
+                    dialogues = []
+                    for p in track_parsed:
+                        if p["type"] == "dialogue" and p["text"].strip():
+                            char = p.get("character", "")
+                            if char:
+                                dialogues.append(f"{char}：{p['text']}")
+                                character_names.add(char)
+                            else:
+                                dialogues.append(p["text"])
+                    track_dialogues[tnum] = dialogues
+                    
+                    # 获取行号范围
+                    start_line, end_line = track_line_ranges.get(tnum, (0, 0))
+                    
+                    # 打印信息
+                    if DEBUG_MODE:
+                        print(f"    [DEBUG] 音轨{tnum:02d}: 第{start_line}-{end_line}行 ({end_line - start_line + 1}行) → {len(dialogues)}行台词")
+                        # 打印该音轨的前3行内容预览
+                        track_lines = track_content.split('\n')[:3]
+                        for i, line in enumerate(track_lines, start_line):
+                            preview = line[:50] + "..." if len(line) > 50 else line
+                            print(f"    [DEBUG]   行{i:03d}: {preview}")
+                    
+                    print(f"    [LLM辅助] 音轨{tnum:02d}: 第{start_line}-{end_line}行 → {len(dialogues)}行台词")
+                
+                if DEBUG_MODE:
+                    print(f"    [DEBUG] ========== 音轨行号范围结束 ==========")
+            else:
+                print(f"    [LLM辅助] LLM未能识别多个音轨边界，保持原划分")
         
         # 更新映射
         if track_num is not None:
@@ -3367,7 +3587,7 @@ def build_worldview_prompt(worldview: dict) -> str:
     return "\n".join(lines)
 
 
-def sample_all_lrc_files(work_dir: Path, lines_per_file: int = 40) -> tuple[list[str], dict[str, dict]]:
+def sample_all_lrc_files(work_dir: Path, lines_per_file: int = 20) -> tuple[list[str], dict[str, dict]]:
     """抽样所有 .ja.lrc 文件的内容，用于世界观和术语分析
     
     返回: (抽样内容列表, cores字典)
@@ -4343,7 +4563,7 @@ def analyze_characters_with_llm(cores: dict[str, dict], clusters: list[list[str]
         return -(int(from_filename) * 5000 + int(is_proper) * 1000 + int(is_katakana) * 100 + int(has_suffix) * 10 +
                  info['count'])
 
-    sorted_cores = sorted(cores.items(), key=core_priority)[:40]
+    sorted_cores = sorted(cores.items(), key=core_priority)[:20]
     lines.append("【高频词汇】")
     for core, info in sorted_cores:
         surfaces_str = ', '.join([f"{s}({c})" for s, c in sorted(info['surfaces'].items(), key=lambda x: -x[1])[:3]])
@@ -4354,8 +4574,8 @@ def analyze_characters_with_llm(cores: dict[str, dict], clusters: list[list[str]
             f"  {core} | reading:{info['reading']} | count:{info['count']} | surfaces:{surfaces_str}{from_file_mark}")
         if pronouns_str:
             lines.append(f"    共现人称代词: {pronouns_str}")
-        for ctx in info['contexts'][:2]:
-            lines.append(f"    上下文: {ctx[:60]}")
+        for ctx in info['contexts'][:1]:
+            lines.append(f"    上下文: {ctx[:40]}")
 
     # 2. 相似簇信息
     if clusters:
@@ -4618,7 +4838,7 @@ def extract_subtitle_texts(content: str, ext: str) -> list[str]:
             if match:
                 tags = match.group(1)
                 text_after = match.group(2)
-                if re.search(r'\[\d{1,2}:\d{2}\.\d{2,3}\]', tags):
+                if re.search(r'\[\d+:\d{2}\.\d{2,3}\]', tags):
                     lyric_texts.append(text_after)
 
     elif ext == '.srt':
@@ -5347,9 +5567,10 @@ def translate_lrc_file(source_path: Path, target_path: Path, terms: dict[str, st
 
     cost_hit = (total_hit_tokens / 1_000_000) * PRICE_HIT_PER_1M
     cost_miss = (total_miss_tokens / 1_000_000) * PRICE_MISS_PER_1M
-    cost_total = cost_hit + cost_miss
+    cost_completion = (total_completion_tokens / 1_000_000) * PRICE_COMPLETION_PER_1M
+    cost_total = cost_hit + cost_miss + cost_completion
     print(f" ✓ 完成 -> {target_path.name}")
-    print(f" 💰 累计费用: 命中{cost_hit:.4f}元 + 未命中{cost_miss:.4f}元 = {cost_total:.4f}元")
+    print(f" 💰 累计费用: 命中{cost_hit:.4f}元 + 未命中{cost_miss:.4f}元 + 输出{cost_completion:.4f}元 = {cost_total:.4f}元")
     print(f"    (命中{total_hit_tokens}tokens / 未命中{total_miss_tokens}tokens / 输出{total_completion_tokens}tokens)")
 
     # 返回原始歌词和翻译结果，用于动态术语更新
@@ -5364,6 +5585,27 @@ def translate_lrc_file_simple(source_path: Path, target_path: Path, terms: dict[
 
 
 # ==================== 作品级预处理 ====================
+
+def load_work_terms(work_dir: Path) -> tuple[dict[str, str], list[dict], dict]:
+    """加载已有的术语表、alias表和世界观
+    
+    当作品已完成所有翻译时，不需要重新分析，直接加载已有数据。
+    
+    返回: (terms, alias_list, worldview) 或 (None, None, None) 如果不存在
+    """
+    terms_path = get_terms_path(work_dir)
+    alias_path = get_alias_path(work_dir)
+    worldview_path = get_worldview_path(work_dir)
+    
+    if terms_path.exists() and alias_path.exists() and worldview_path.exists():
+        terms = load_terms(work_dir)
+        alias_list = load_alias(work_dir)
+        worldview = load_worldview(work_dir)
+        return terms, alias_list, worldview
+    
+    # 如果文件不存在，返回None表示需要分析
+    return None, None, None
+
 
 def analyze_work_terms(work_dir: Path) -> tuple[dict[str, str], list[dict], dict]:
     """分析作品目录，生成世界观、术语表和 alias 表
@@ -5773,7 +6015,9 @@ CHARACTER_PATTERN = r'^【[^】]+】\s*$'
 # 2. Tr1.、Tr.2、Tr3、TR6、Tr8. - 无括号的简写音轨标记
 # 3. トラック1、トラック4； - 无括号的日文音轨标记
 # 4. Track1、track1 - 英文音轨标记
-TRACK_PATTERN = r'^(【トラック\d+[：：][^\]]*】|Tr\.?\s*\d+[\.：:;\s]|TR\d+[\s\.：:;]|Tr\d+[\s\.：:;]|トラック\s*[０-９0-9]+[\s\.：:；]|[Tt]rack\s*\d+[\s\.：:])'
+# 5. 【标题文字数】格式 - 如【王女様の種搾り騎乗位おまんこ　4737文字】
+# 6. ①②③【标题文字数】格式 - 如②【王女様と正常位でセックス練習ラブラブおまんこ　3927文字】
+TRACK_PATTERN = r'^(【トラック\d+[：：][^\]]*】|Tr\.?\s*\d+[\.：:;\s]|TR\d+[\s\.：:;]|Tr\d+[\s\.：:;]|トラック\s*[０-９0-9]+[\s\.：:；]|[Tt]rack\s*\d+[\s\.：:]|[①②③④⑤⑥⑦⑧⑨⑩]?【[^】]+?\d+文字】)'
 
 # 章节标题模式（如 《トラック１　エルフの子作り日》）
 CHAPTER_TITLE_PATTERN = r'^《[^》]+》'
@@ -5816,7 +6060,10 @@ SCRIPTBOOK_EXTS = {'.txt', '.pdf'}
 NON_SCRIPTBOOK_KEYWORDS = [
     'Finishtime', 'クレジット', 'credit', 'readme', 'Readme',
     '使い方', 'つかいかた', '説明', 'せつめい', '注意', 'ちゅうい',
-    'あとがき', 'アトガキ', '感想', 'かんそう', '紹介', 'しょうかい'
+    'あとがき', 'アトガキ', '感想', 'かんそう', '紹介', 'しょうかい',
+    # 序言/前言/说明文件
+    'プロローグ', 'prologue', 'はじめに', '初めに', '必ず', '読んで',
+    'お読みください', '説明書', 'せつめいしょ', '注意事項',
 ]
 
 
@@ -6312,9 +6559,10 @@ def translate_scriptbook_file(source_path: Path, target_path: Path, terms: dict[
     
     cost_hit = (total_hit_tokens / 1_000_000) * PRICE_HIT_PER_1M
     cost_miss = (total_miss_tokens / 1_000_000) * PRICE_MISS_PER_1M
-    cost_total = cost_hit + cost_miss
+    cost_completion = (total_completion_tokens / 1_000_000) * PRICE_COMPLETION_PER_1M
+    cost_total = cost_hit + cost_miss + cost_completion
     print(f" ✓ 完成 -> {target_path.name}")
-    print(f" 💰 累计费用: 命中{cost_hit:.4f}元 + 未命中{cost_miss:.4f}元 = {cost_total:.4f}元")
+    print(f" 💰 累计费用: 命中{cost_hit:.4f}元 + 未命中{cost_miss:.4f}元 + 输出{cost_completion:.4f}元 = {cost_total:.4f}元")
     
     return True, original_texts, translated_texts
 
@@ -6506,6 +6754,24 @@ def process_all_lrc(work_dir: Path) -> tuple[int, int, int, int]:
     dir_worldviews = {}
     # 缓存每个目录的台本映射
     dir_scriptbook_maps = {}
+    # 缓存已完成翻译的目录（跳过世界观和术语分析）
+    fully_translated_dirs = set()
+
+    # 预检查：找出所有音轨已完成翻译的目录
+    dir_file_counts = defaultdict(int)
+    dir_translated_counts = defaultdict(int)
+    for (parent_dir, base_name, ext), status in file_groups.items():
+        if ext == '.lrc':
+            dir_file_counts[parent_dir] += 1
+            if (parent_dir, base_name) in already_translated:
+                dir_translated_counts[parent_dir] += 1
+    
+    for parent_dir, total_count in dir_file_counts.items():
+        if total_count > 0 and dir_translated_counts[parent_dir] == total_count:
+            fully_translated_dirs.add(parent_dir)
+    
+    if fully_translated_dirs:
+        print(f"检测到 {len(fully_translated_dirs)} 个目录已完成所有翻译，将跳过世界观和术语分析\n")
 
     total_tasks = len(file_groups)
     for task_idx, ((parent_dir, base_name, ext), status) in enumerate(sorted(file_groups.items()), 1):
@@ -6524,21 +6790,37 @@ def process_all_lrc(work_dir: Path) -> tuple[int, int, int, int]:
         # 分析作品级术语（每个文件夹只一次）
         if parent_dir not in processed_dirs:
             processed_dirs.add(parent_dir)
-            print(f"\n{'=' * 50}")
-            print(f"  [作品分析] 目录: {str(parent_dir)}")
-            print(f"  {'=' * 50}")
-            terms, alias_list, worldview = analyze_work_terms(parent_dir)
-            # 缓存世界观
-            dir_worldviews[parent_dir] = worldview
-            print(f"  术语表: {len(terms)} 个 | alias: {len(alias_list)} 个")
-            print(f"  世界观: {worldview.get('worldview', '')[:50]}...")
+            
+            # 检查是否已完成所有翻译，如果是则跳过世界观和术语分析
+            if parent_dir in fully_translated_dirs:
+                print(f"\n{'=' * 50}")
+                print(f"  [跳过分析] 目录: {str(parent_dir)}")
+                print(f"  {'=' * 50}")
+                print(f"  该作品所有音轨已完成翻译，跳过世界观和术语分析")
+                # 加载已有的术语表和alias表
+                terms, alias_list, worldview = load_work_terms(parent_dir)
+                if terms is None:
+                    terms = {}
+                    alias_list = []
+                    worldview = {}
+                dir_worldviews[parent_dir] = worldview
+                print(f"  已加载术语表: {len(terms)} 个 | alias: {len(alias_list)} 个")
+            else:
+                print(f"\n{'=' * 50}")
+                print(f"  [作品分析] 目录: {str(parent_dir)}")
+                print(f"  {'=' * 50}")
+                terms, alias_list, worldview = analyze_work_terms(parent_dir)
+                # 缓存世界观
+                dir_worldviews[parent_dir] = worldview
+                print(f"  术语表: {len(terms)} 个 | alias: {len(alias_list)} 个")
+                print(f"  世界观: {worldview.get('worldview', '')[:50]}...")
             
             # 加载台本映射（如果启用）
             scriptbook_map = {}
             scriptbook_file_map = {}
             if USE_SCRIPTBOOK_FOR_TRANSLATION:
                 print(f"\n  [台本分析] 正在扫描台本文件...")
-                scriptbook_map, scriptbook_file_map, scriptbook_characters, track_line_ranges = build_track_scriptbook_map(parent_dir)
+                scriptbook_map, scriptbook_file_map, scriptbook_characters, track_line_ranges = build_track_scriptbook_map(parent_dir, client, _api_cfg["model"])
                 
                 # 自动将台本中的角色名添加到术语表
                 if scriptbook_characters:
@@ -6761,13 +7043,14 @@ def main():
 
     cost_hit = (total_hit_tokens / 1_000_000) * PRICE_HIT_PER_1M
     cost_miss = (total_miss_tokens / 1_000_000) * PRICE_MISS_PER_1M
-    cost_total = cost_hit + cost_miss
+    cost_completion = (total_completion_tokens / 1_000_000) * PRICE_COMPLETION_PER_1M
+    cost_total = cost_hit + cost_miss + cost_completion
     print("=" * 50)
     print("API 费用统计")
     print("=" * 50)
     print(f"  缓存命中: {total_hit_tokens:,} tokens × {PRICE_HIT_PER_1M}元/百万 = {cost_hit:.4f} 元")
     print(f"  缓存未命中: {total_miss_tokens:,} tokens × {PRICE_MISS_PER_1M}元/百万 = {cost_miss:.4f} 元")
-    print(f"  输出tokens: {total_completion_tokens:,}")
+    print(f"  输出tokens: {total_completion_tokens:,} tokens × {PRICE_COMPLETION_PER_1M}元/百万 = {cost_completion:.4f} 元")
     print(f"  总费用: {cost_total:.4f} 元")
     print("=" * 50)
     print()

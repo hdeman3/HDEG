@@ -4,12 +4,48 @@ chcp 65001 >nul
 set "cpath=%~dp0"
 set "cpath=%cpath:~0,-1%"
 
-:: 检测是否为50系显卡（RTX 5090/5080/5070等Blackwell架构）
-:: 注意：必须精确匹配 "RTX 50xx"，避免误识别 RTX 3050/4050 等
-set "gpu_compute_type=int8_float16"
+:: ========================================
+:: 从 config.json 读取转录配置
+:: ========================================
+echo [配置] 正在读取 config.json 中的转录配置...
+
+:: Python 内部直接用 UTF-8 写文件，绕过 Shell 重定向前编码损坏
+set "cfg_tmp=%temp%\trans_cfg.txt"
+python -c "import json;c=json.load(open(r'!cpath!\config.json','r',encoding='utf-8'))['transcription'];t=c;f=open(r'!cfg_tmp!','w',encoding='utf-8');f.write(t.get('infer_exe','')+'\n');f.write(t.get('model_dir','')+'\n');f.write(t.get('device','cuda')+'\n');f.write(t.get('compute_type','int8_float16')+'\n');f.write(t.get('audio_suffixes','mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv')+'\n');f.write(t.get('sub_formats','lrc')+'\n');f.close()"
+
+< "!cfg_tmp!" (
+    set /p "infer_exe="
+    set /p "model_dir="
+    set /p "device="
+    set /p "compute_type="
+    set /p "audio_suffixes="
+    set /p "sub_formats="
+)
+del "!cfg_tmp!" 2>nul
+
+echo   转录工具: !infer_exe!
+echo   模型目录: !model_dir!
+echo   设备: !device!
+echo   计算类型: !compute_type!
+
+:: 移除可能存在的首尾空格
+for /f "tokens=*" %%a in ("!infer_exe!") do set "infer_exe=%%a"
+for /f "tokens=*" %%a in ("!model_dir!") do set "model_dir=%%a"
+
+:: 验证 infer.exe 是否存在
+if not exist "!infer_exe!" (
+    echo [警告] infer.exe 不存在: !infer_exe!
+    echo         请检查 config.json 中 transcription.infer_exe 路径是否正确
+    pause
+    exit /b 1
+)
+
+:: ========================================
+:: 检测50系显卡
+:: ========================================
+set "gpu_compute_type=!compute_type!"
 for /f "tokens=*" %%a in ('nvidia-smi --query-gpu^=name --format^=csv^,noheader 2^>nul') do (
     set "gpu_name=%%a"
-    REM 使用正则匹配：RTX空格50后跟两位数字（如5090, 5080, 5070）
     echo !gpu_name! | findstr /I /R /C:"RTX 50[0-9][0-9]" >nul && (
         set "gpu_compute_type=float16"
         echo [检测到50系显卡: !gpu_name!]
@@ -19,7 +55,9 @@ for /f "tokens=*" %%a in ('nvidia-smi --query-gpu^=name --format^=csv^,noheader 
 )
 :gpu_detected
 
+:: ========================================
 :: 获取拖入的文件夹路径
+:: ========================================
 if "%~1"=="" (
     echo 请将音视频文件夹拖到此窗口，然后按回车:
     set "src_dir="
@@ -48,6 +86,9 @@ echo 工作目录: !src_dir!
 echo ========================================
 echo.
 
+:: ========================================
+:: [0/2] 准备转录标记
+:: ========================================
 echo [0/2] 准备转录标记...
 
 set "has_ja_lrc=0"
@@ -68,6 +109,9 @@ for /f "delims=" %%f in ('dir /s /b "!src_dir!\*.ja.lrc" 2^>nul') do (
 echo [0/2] 准备完成。
 echo.
 
+:: ========================================
+:: 检测是否需要转录
+:: ========================================
 set "need_transcribe=0"
 set "audio_extensions=.mp3 .wav .flac .m4a .aac .ogg .wma .mp4 .mkv .avi .mov .webm .flv .wmv"
 
@@ -89,14 +133,18 @@ if "!need_transcribe!"=="0" (
     goto :translate
 )
 
-echo [1/2] 正在执行日文转录（低显存模式）...
+:: ========================================
+:: [1/2] 执行日文转录
+:: ========================================
+echo [1/2] 正在执行日文转录...
 echo     已存在同名 .lrc 的音频将自动跳过...
+echo     转录工具: !infer_exe!
 echo.
 
-"%cpath%\infer.exe" ^
-    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^
-    --sub_formats="lrc" ^
-    --device="cuda" ^
+"!infer_exe!" ^
+    --audio_suffixes="!audio_suffixes!" ^
+    --sub_formats="!sub_formats!" ^
+    --device="!device!" ^
     --task="transcribe" ^
     --compute_type="!gpu_compute_type!" ^
     "!src_dir!"
@@ -127,15 +175,22 @@ for %%e in (%audio_extensions%) do (
 
 echo.
 
+:: ========================================
+:: [2/2] 翻译
+:: ========================================
 :translate
 echo [2/2] 正在启动翻译...(自动处理留档和去重)
 > "%cpath%\input_path.txt" echo(!src_dir!
 
 cd /d "%cpath%"
 
-:: 使用 Python 直接运行 translate.py（调试模式，-u 禁用缓冲）
-echo [调试模式] 正在通过 Python 运行 translate.py...
-python -u translate.py
+:: 设置 MODEL_DIR 环境变量，让 model_config.py 从转录模型目录加载 PaddleOCR 模型
+set "MODEL_DIR=!model_dir!"
+echo [模型] MODEL_DIR=!MODEL_DIR!
+
+:: 使用 Python 直接运行 main.py（调试模式，-u 禁用缓冲）
+echo [DEBUG] Launching main.py...
+python -u main.py
 
 if errorlevel 1 (
     echo [错误] 翻译失败。

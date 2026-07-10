@@ -161,7 +161,7 @@ python modal_infer.py
 
 程序会交互式询问：
 - GPU 类型：T4（推荐）、A10G、A100、H100 等
-- 模型选择：基础版、海南鸡（日文转中文优化）、Jim 日文转录、自定义模型
+- 模型选择：基础版、海南鸡（日文转中文优化）、TransWithAI 日文转录、自定义模型
 - 输入文件：本地音频文件或文件夹路径
 - 批处理选项：是否启用批处理加速（需要更高显存）
 - 超时时间：任务超时时间（分钟）
@@ -184,7 +184,8 @@ python modal_infer.py
 
 - Faster Whisper: https://github.com/SYSTRAN/faster-whisper
 - 海南鸡模型 (日文转中文优化): https://huggingface.co/chickenrice0721/whisper-large-v2-translate-zh-v0.2-st-ct2
-- Jim 日文转录模型: https://huggingface.co/Jim6789/whisper-ja-1.5B-ct2
+- TransWithAI 日文转录模型: https://huggingface.co/TransWithAI/whisper-ja-1.5B-ct2
+- 日文转录原版模型: https://huggingface.co/efwkjn/whisper-ja-1.5B
 - 音声优化 VAD 模型: https://huggingface.co/TransWithAI/Whisper-Vad-EncDec-ASMR-onnx
 - OpenAI Whisper: https://github.com/openai/whisper
 - 参数详情: https://github.com/SYSTRAN/faster-whisper/blob/dea24cbcc6cbef23ff599a63be0bbb647a0b23d6/faster_whisper/transcribe.py#L733
@@ -192,6 +193,6 @@ python modal_infer.py
 致谢：
 - 基于 SYSTRAN/faster-whisper 开发
 - 使用 chickenrice0721 日文转中文优化模型（5000小时音频数据训练）
-- 可使用 Jim6789 日文原文转录模型
+- 可使用 TransWithAI 日文原文转录 bf16 模型，由 efwkjn/whisper-ja-1.5B 原版模型转换而来
 - 使用 TransWithAI 音声优化 VAD 模型 (Whisper-Vad-EncDec-ASMR-onnx)
 - 感谢某匿名群友的算力和技术支持

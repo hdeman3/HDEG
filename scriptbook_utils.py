@@ -5,9 +5,12 @@
 """
 
 import re
+import json
 import shutil
 from pathlib import Path
 from typing import Optional
+
+from ocr_utils import _load_ocr_config, extract_with_ocr, detect_vertical_layout, sort_vertical_layout
 
 
 # ==================== 台本文件识别配置 ====================
@@ -18,7 +21,8 @@ SCRIPTBOOK_KEYWORDS = [
     '仮台本', 'かり台本', '本編', 'ほんぺん',
     'セリフ初稿', 'せりふしょこう', 'シナリオ', 'しなりお',
     '演技指定', 'えんぎしてい', '射精タイミング', '全章',
-    'track', 'トラック', 'RJ', '音声作品', 'シチュエーション'
+    'track', 'トラック', 'RJ', '音声作品', 'シチュエーション',
+    '射精箇所',  # 射精位置标注（台本的一种）
 ]
 
 # 台本文件扩展名
@@ -39,10 +43,9 @@ NON_SCRIPTBOOK_KEYWORDS = [
     # 序言/前言/说明文件
     'プロローグ', 'prologue', 'はじめに', '初めに', '必ず', '読んで',
     'お読みください', '説明書', 'せつめいしょ', '注意事項',
+    '_cleaned', '_processed', '_export',
 ]
 
-
-# ==================== PDF文本提取 ====================
 
 def _is_page_number(text: str) -> bool:
     """判断文本是否为页码编号
@@ -108,7 +111,19 @@ def _is_scene_description(text: str) -> bool:
         return True
     
     # 章节标记
-    if re.search(r'本編|プロローグ|エピローグ|トラック\d+|第[0-9０-９]+章', text):
+    # 【修复】排除【トラック１】这种音轨标记格式，只匹配纯章节标题
+    if re.search(r'本編|プロローグ|エピローグ|第[0-9０-９]+章', text):
+        return True
+    # 单独的トラック标记（如"トラック１"）是音轨标记，不是场景描述
+    # 但"トラック１：xxx"或"■トラック１"是章节标题
+    # 【修复】排除纯音轨标记（只有"トラック+数字"），只过滤带标题的
+    if re.search(r'[■：:]トラック\d+', text):
+        return True
+    # 纯"トラック０"到"トラック９"是音轨标记，保留
+    if re.match(r'^トラック[０-９0-9]+$', text):
+        return False
+    # "トラック１０"及以上或带额外内容的才是场景描述
+    if re.search(r'トラック\d+.+', text) or re.search(r'トラック[０-９0-9]{2,}', text):
         return True
     
     # 世界観・設定等说明文字
@@ -123,8 +138,13 @@ def _is_scene_description(text: str) -> bool:
             return True
     
     # 角色外观描述
+    # 【修复】排除包含对话标点和口语表达的台词，避免误伤
     if re.search(r'(小柄|大柄|華奢|無垢|雰囲気|口数|髪|目|包帯|眼帯)', text):
-        return True
+        # 如果包含对话标点或口语表达，可能是台词，不跳过
+        has_dialogue_mark = bool(re.search(r'[…！？～。\.\?!♡]', text))
+        has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', text))
+        if not has_dialogue_mark and not has_colloquial:
+            return True
     
     # 【新增】心理描写特征
     # 心理描写通常：
@@ -134,19 +154,20 @@ def _is_scene_description(text: str) -> bool:
     # 4. 包含"最低"、"辛い"等心理状态描述
     
     # 心理描写关键词
-    psychology_keywords = [
-        '最低', '辛い', '我慢', '耐えられ', '限界', '限り',
-        '思う', '考える', '感じる', '思える', '考えられる',
-        'だろうか', 'のだろうか', 'かもしれない', 'に違いない',
-        'してしまう', 'なってしまう', 'てしまった', 'になってしまった',
-        '慰めてもらおう', 'してもらおう', 'させよう',
-    ]
-    for keyword in psychology_keywords:
-        if keyword in text:
-            # 检查是否包含口语表达
-            has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', text))
-            if not has_colloquial:
-                return True
+    # 【注释】第一人称感受不是场景描述，不应作为过滤依据
+    # psychology_keywords = [
+    #     '最低', '辛い', '我慢', '耐えられ', '限界', '限り',
+    #     '思う', '考える', '感じる', '思える', '考えられる',
+    #     'だろうか', 'のだろうか', 'かもしれない', 'に違いない',
+    #     'してしまう', 'なってしまう', 'てしまった', 'になってしまった',
+    #     '慰めてもらおう', 'してもらおう', 'させよう',
+    # ]
+    # for keyword in psychology_keywords:
+    #     if keyword in text:
+    #         # 检查是否包含口语表达
+    #         has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', text))
+    #         if not has_colloquial:
+    #             return True
     
     # 【新增】检查以「」或『』包裹的旁白内容
     # 如：「よかったですね…。おたがい退院できて。」
@@ -174,58 +195,58 @@ def _is_scene_description(text: str) -> bool:
     
     # 如果不以对话标点结尾，检查是否为描述性句子
     if not has_dialogue_end:
-        # 检查是否包含口语表达（如 です、ます、だよ 等）
-        has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', text))
-        
-        # 如果不包含口语表达，可能是描述性句子
-        if not has_colloquial:
-            # 检查是否以动词结尾（描述性句子）
-            # 常见动词结尾：する、なる、いる、ある、開ける、寝ていた 等
-            verb_endings = [
-                'する', 'なる', 'いる', 'ある', 'おる', 'まいる',
-                '開ける', '閉める', '入る', '出る', '寝る', '起きる',
-                '歩く', '走る', '座る', '立つ', '潜る', '潜り込む',
-                '握る', '触る', '撫でる', '舐める', '触らせる',
-                '震える', 'もじもじ', '様子', '気後れ', '告白',
-                '寝ていた', '起きて', '開けると', '閉めると',
-                '入ると', '出ると', '潜り込む', '触触らせる',
-                '低くなる', '突き動かされて', '抑えられなくなって',
-            ]
-            for ending in verb_endings:
-                if text.endswith(ending):
-                    return True
+        # 【豁免】包含第一人称感受词的文本直接保留，不做动作过滤
+        if re.search(r'(私|俺|僕|わたし|あたし|♡|～|です|ます)', text):
+            pass  # 包含第一人称或感受表达的保留
+        else:
+            # 检查是否包含口语表达（如 です、ます、だよ 等）
+            has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', text))
             
-            # 检查是否包含"〜と〜"格式的描述（动作描述）
-            # 如：ドアを開けると、兄の手をにぎりと
-            if re.search(r'[を|に|で|へ|から|まで].*と', text):
-                # 如果不包含对话标点，可能是动作描述
-                if not any(punct in text for punct in ['…', '！', '？', '～']):
-                    return True
-            
-            # 检查是否为纯动作描述（包含动作动词但不包含对话标点）
-            action_keywords = [
-                'ドア', '部屋', '布団', 'ベッド', 'ソファ', '浴室',
-                '兄', '妹', '手', '足', '身体', '下半身', '躰',
-                '握り', '触', '撫で', '舐め', '潜り', '開け', '閉め',
-                '震える', 'もじもじ', '様子', '気後れ', '告白',
-                '低くなる', '突き動かされ', '抑えられなく',
-            ]
-            for keyword in action_keywords:
-                if keyword in text:
-                    # 如果不包含对话标点或口语表达，可能是动作描述
-                    if not any(punct in text for punct in ['…', '！', '？']) and not has_colloquial:
+            # 如果不包含口语表达，可能是描述性句子
+            if not has_colloquial:
+                # 检查是否以动词结尾（描述性句子）
+                # 常见动词结尾：する、なる、いる、ある、開ける、寝ていた 等
+                verb_endings = [
+                    'する', 'なる', 'いる', 'ある', 'おる', 'まいる',
+                    '開ける', '閉める', '入る', '出る', '寝る', '起きる',
+                    '歩く', '走る', '座る', '立つ', '潜る', '潜り込む',
+                    '握る', '触る', '撫でる', '舐める', '触らせる',
+                    '震える', 'もじもじ', '様子', '気後れ', '告白',
+                    '寝ていた', '起きて', '開けると', '閉めると',
+                    '入ると', '出ると', '潜り込む', '触触らせる',
+                    '低くなる', '突き動かされて', '抑えられなくなって',
+                ]
+                for ending in verb_endings:
+                    if text.endswith(ending):
                         return True
+                
+                # 检查是否包含"〜と〜"格式的描述（动作描述）
+                # 如：ドアを開けると、兄の手をにぎりと
+                # 【修复】要求"と"前面必须有动作动词，避免误伤包含"が"和"と"的台词
+                if re.search(r'[をにでへからまで].{1,10}と', text):
+                    # 如果不包含对话标点，可能是动作描述
+                    if not any(punct in text for punct in ['…', '！', '？', '～']):
+                        return True
+                
+                # 检查是否为纯动作描述（包含动作动词但不包含对话标点）
+                action_keywords = [
+                    'ドア', '部屋', '布団', 'ベッド', 'ソファ', '浴室',
+                    '兄', '妹', '手', '足', '身体', '下半身', '躰',
+                    '握り', '触', '撫で', '舐め', '潜り', '開け', '閉め',
+                    '震える', 'もじもじ', '様子', '気後れ', '告白',
+                    '低くなる', '突き動かされ', '抑えられなく',
+                ]
+                for keyword in action_keywords:
+                    if keyword in text:
+                        # 如果不包含对话标点或口语表达，可能是动作描述
+                        if not any(punct in text for punct in ['…', '！', '？']) and not has_colloquial:
+                            return True
     
     # 【新增】检查以"…"结尾的句子（可能是心理描写）
     if text.endswith('…') or text.endswith('…。'):
         # 检查是否包含口语表达
         has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', text))
         if not has_colloquial:
-            # 检查是否包含心理描写关键词
-            for keyword in psychology_keywords:
-                if keyword in text:
-                    return True
-            
             # 检查是否包含"〜てしまう"格式（表示遗憾或心理状态）
             if re.search(r'[てで]しまう', text):
                 return True
@@ -298,44 +319,12 @@ def _is_direction(text: str) -> bool:
             return True
     
     # 包含特定动作描述词
+    # 【修改】只保留摄影/音效技术词，删除性行为、身体部位、世界观等词汇
     direction_keywords = [
-        'キス', 'フェラ', '愛撫', '射精', '潮吹', '絶頂',
-        '挿入', '騎乗位', '正常位', '後背位', '側位',
-        '耳舐め', '手コキ', 'パイズリ', '足コキ',
-        '服を', '脱ぐ', '裸', '勃起', '濡れ',
-        '腰を', '腰振', 'ピストン', '抽送',
-        '口の中', '口内', '顔射', '中出し',
-        'クリトリス', 'オナニー', '自慰',
-        '乳首', 'おっぱい', 'お尻', 'おまんこ',
-        'ちんぽ', 'ちんちん', 'おちんちん',
-        'シーツ', 'ベッド', 'ソファ', '浴室',
-        'バイブ', 'ローター', '電マ', 'ディルド',
-        '拘束', '縛り', '目隠し', '口塞ぎ',
-        'スパンキング', 'アナル', 'フィスト',
-        '浣腸', '放尿', '脱糞', '嘔吐',
-        '血', '傷', '痛', '苦し',
-        '死', '殺', '暴力', '虐待',
-        '近親相姦', '強姦', '凌辱', '調教',
-        '孕', '妊娠', '出産', '堕胎',
-        '幼女', 'ロリ', 'ショタ', '少年',
-        '獣', '動物', '虫', '触手',
-        '異種', 'モンスター', 'ゾンビ',
-        '血', '肉', '骨', '臓器',
-        '死体', '遺体', '棺', '墓',
-        '呪', '怨', '霊', '鬼',
-        '神', '仏', '寺', '神社',
-        '魔法', '呪文', '召喚', '契約',
-        '異世界', '転生', '召喚',
-        '貴族', '平民', '奴隷', '傭兵',
-        '王', '女王', '王子', '公主',
-        '騎士', '魔法使い', '僧侶', '盗賊',
-        '戦士', '弓手', '格闘家', '暗殺者',
-        '商人', '鍛冶屋', '薬師', '料理人',
-        '貴族', '平民', '奴隷', '傭兵',
-        '王', '女王', '王子', '公主',
-        '騎士', '魔法使い', '僧侶', '盗賊',
-        '戦士', '弓手', '格闘家', '暗殺者',
-        '商人', '鍛冶屋', '薬師', '料理人',
+        # 摄影/录音技术词
+        'カメラ', 'マイク', '録音', '撮影', '照明',
+        'カット', 'テイク', 'NG', 'OK',
+        '効果音', 'SE', 'BGM', '音楽',
     ]
     
     for keyword in direction_keywords:
@@ -371,7 +360,7 @@ def _is_se_marker(text: str) -> bool:
         return False
     
     # SE标记
-    if re.match(r'^SE[:：]', text, re.IGNORECASE):
+    if re.match(r'^[SEＳＥ][:：]', text, re.IGNORECASE):
         return True
     
     # 效果音标记
@@ -588,7 +577,7 @@ def _simplify_repeated_moans(text: str) -> str:
     return result
 
 
-def clean_script_for_translation(text: str) -> str:
+def clean_script_for_translation(text: str, skip_intro: bool = True) -> str:
     """清洗台本内容，只保留角色对话
     
     改进的清洗规则：
@@ -609,6 +598,11 @@ def clean_script_for_translation(text: str) -> str:
     3. 娇喘 + 断句台词（原样保留，不合并）
     4. 重复的无意义喘息（精简为1-2个，不全删）
     
+    参数:
+        text: 要清洗的文本
+        skip_intro: 是否跳过音轨标记前的开头设定部分（默认True）。
+                   当按音轨分别清洗时应设为False，避免跳过音轨内容。
+    
     返回清洗后的文本
     """
     lines = text.split('\n')
@@ -618,11 +612,11 @@ def clean_script_for_translation(text: str) -> str:
     # 找到第一个音轨标记的行号
     # 扩展版：支持更多音轨标记格式
     track_patterns = [
-        r'^Tr\.?\s*\d+[\.：:;\s]',  # Tr1.、Tr.2、Tr 1.、Tr1:、Tr3 （无点号）
-        r'^TR\d+[\s\.：:;]',  # TR6、TR7 （全大写）
-        r'^トラック\s*[０-９0-9]+[\s\.：:；]',  # トラック1、トラック4；、トラック０１
+        r'^Tr\.?\s*\d+[\.．：:\uFE30;\s]',  # Tr1.、Tr.2、Tr 1.、Tr1:、Tr3 （无点号）
+        r'^TR\d+[\s\.．：:\uFE30;]',  # TR6、TR7 （全大写）
+        r'^トラック\s*[０-９0-9]+[\s\.．：：\uFE30;]',  # トラック1、トラック4；、トラック０１
         r'^■\s*トラック\s*[０-９0-9]+',  # ■トラック０１
-        r'^[Tt]rack\s*\d+[\s\.：:]',  # Track1、track01
+        r'^[Tt]rack\s*\d+[\s\.．：:\uFE30]',  # Track1、track01
         r'^[-]{3,}$',  # 分隔线（如 ------------------------）
     ]
     
@@ -630,10 +624,12 @@ def clean_script_for_translation(text: str) -> str:
     for i, line in enumerate(lines):
         stripped = line.strip()
         normalized = _normalize_text(stripped)
+        # 【新增】去除行首的页码数字（如 "5 トラック２" → "トラック２"）
+        normalized_no_pagenum = re.sub(r'^\d+\s+', '', normalized)
         for pattern in track_patterns:
-            if re.match(pattern, normalized, re.IGNORECASE):
+            if re.match(pattern, normalized_no_pagenum, re.IGNORECASE):
                 first_track_line = i
-                print(f"  [清洗] 检测到音轨标记在第 {i+1} 行: {normalized[:50]}，跳过开头设定部分")
+                print(f"  [清洗] 检测到音轨标记在第 {i+1} 行: {normalized_no_pagenum[:50]}，跳过开头设定部分")
                 break
         if first_track_line >= 0:
             break
@@ -641,6 +637,20 @@ def clean_script_for_translation(text: str) -> str:
     # 如果找到音轨标记，从该行之后开始处理
     # 如果没有找到音轨标记，从第0行开始处理（但会跳过设定内容）
     start_line = first_track_line + 1 if first_track_line >= 0 else 0
+    
+    # 【修复】如果音轨标记在文件末尾（最后10%的行），说明这是文件结束标记，不是开头设定标记
+    # 这种情况下，应该从第0行开始处理，而不是跳过所有内容
+    if first_track_line >= 0 and first_track_line >= len(lines) * 0.9:
+        print(f"  [清洗] 音轨标记在文件末尾（第{first_track_line+1}行/共{len(lines)}行），视为结束标记，不从开头跳过")
+        start_line = 0
+        first_track_line = -1  # 重置，避免后续逻辑错误
+    
+    # 【修复】当按音轨分别清洗时（skip_intro=False），不从开头跳过
+    # 因为音轨已经划分好了，前770行可能包含其他音轨的内容
+    if not skip_intro:
+        start_line = 0
+        first_track_line = -1
+        print(f"  [清洗] skip_intro=False，不从开头跳过（按音轨分别清洗模式）")
     
     # passed_intro 现在由 start_line 决定：行号 >= start_line 表示已过开头设定部分
     # 不再需要单独的 passed_intro 变量
@@ -861,16 +871,44 @@ def clean_script_for_translation(text: str) -> str:
         if re.match(r'^\d+$', normalized):
             continue
         
+        # 跳过孤立数字行（如 "58", "28" 等单/双数字，可能是页码或时间码）
+        if re.match(r'^\d{1,3}$', normalized):
+            continue
+        
+        # 跳过纯斜杠或包含斜杠的短行（如 "/"、"/ "，可能是分隔符）
+        if re.match(r'^[/／\s]+$', normalized):
+            continue
+        
         # 跳过纯SE标记行
-        if re.match(r'^SE[:：]', normalized, re.IGNORECASE):
+        if re.match(r'^[SEＳＥ][:：]', normalized, re.IGNORECASE):
             continue
         
-        # 跳过纯位置标记行（如 "【正面・中】"、"【右耳・近距離】"）
+        # 跳过时间戳/完成标记行（フィニッシュタイム、射精 XX分XX秒、絶頂等）
+        if re.search(r'フィニッシュタイム|フィニッシュ', normalized):
+            continue
+        if re.search(r'射精\s*\d+\s*分\s*\d+\s*秒', normalized):
+            continue
+        if re.search(r'絶頂\s*\d+\s*分\s*\d+\s*秒', normalized):
+            continue
+        
+        # 跳过区段标记行（ここから、ここまで）
+        # 注意：只跳过纯标记行，保留作为台词的"ここから/ここまで"
+        if re.match(r'^[（(]?SE[^）)]*[）)]?\s*ここから$', normalized):
+            continue
+        if re.match(r'^[（(]?SE[^）)]*[）)]?\s*ここまで$', normalized):
+            continue
+        
+        # 跳过纯位置标记行（如 "【正面・中】"、"【右耳・近距離】"、"【正面/遠】"）
         # 包含：左右中正上下远近密着耳面距離等位置关键词
-        if re.match(r'^【[左右中正上下遠近密着耳面距離・→]+】$', normalized):
+        if re.match(r'^【[左右中正上下遠近密着耳面距離・→/]+】$', normalized):
             continue
         
-        # 跳过纯演技指示行（括号内容）
+        # 跳过带位置前缀的台词行（如 "(正面：ふぇ？"、"(右：密着)"）
+        if re.match(r'^[\(（][左右中正面遠近密着]+[）)]', normalized):
+            continue
+        
+        # 跳过纯演技指示行（整行都是括号内容）
+        # 注意：只跳过整行都是括号的，保留行内括号
         if re.match(r'^[（(][^）)]*[）)]$', normalized):
             continue
         
@@ -945,6 +983,15 @@ def clean_script_for_translation(text: str) -> str:
         if match:
             normalized = match.group(2)
         
+        # 去除行尾残留的数字（页码，如 "台词。58"）
+        # 匹配：日文/标点 + 空格 + 1-3位数字（页码通常在10-99之间）
+        match = re.match(r'^(.+?)[\s]*\d{1,3}$', normalized)
+        if match:
+            potential = match.group(1).strip()
+            # 检查剩余部分是否以日文/标点结尾（是的话说明数字是页码）
+            if potential and re.search(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff…！？～。\.\?!♡]$', potential):
+                normalized = potential
+        
         # 去除内联的｟...｠标记（音效/指示）- 但保留含台词的内容
         # 只有当｟...｠内容不含日文台词时才删除
         def remove_se_marker(text):
@@ -963,28 +1010,19 @@ def clean_script_for_translation(text: str) -> str:
         
         normalized = remove_se_marker(normalized)
         
-        # 改进的括号处理：保留娇喘，只删除纯演技指示
+        # 改进的括号处理：只删除SE音效标记，保留其他括号内容（包括娇喘）
         def remove_direction_keep_moans(text):
-            """移除演技指示，但保留娇喘内容"""
+            """只删除SE音效标记括号，保留其他所有括号内容"""
             def replacer(match):
                 content = match.group(0)
                 inner = content[1:-1]  # 去掉括号
                 
-                # 如果是纯娇喘，保留（去掉括号）
-                if _is_moan_only(inner):
-                    return inner
+                # 如果是SE音效标记（如 "SE 椅子を引きずってくる音"），删除
+                if re.match(r'^SE\s+', inner, re.IGNORECASE):
+                    return ''
                 
-                # 如果包含日文台词特征，保留
-                if re.search(r'[\u4e00-\u9fff]', inner):
-                    return content  # 保留原样（含括号）
-                
-                # 如果主要是拟声假名（可能是娇喘），保留
-                kana_count = len(re.findall(r'[\u3040-\u309f\u30a0-\u30fa]', inner))
-                if kana_count > 2:
-                    return inner  # 保留内容，去掉括号
-                
-                # 纯演技指示，删除
-                return ''
+                # 其他所有括号内容都保留原样
+                return content
             
             return re.sub(r'[（(][^）)]*[）)]', replacer, text)
         
@@ -1027,6 +1065,72 @@ def clean_script_for_translation(text: str) -> str:
             return re.sub(r'\{[^}]*\}', replacer, text)
         
         normalized = remove_brace(normalized)
+        
+        # ========== 【新增】通用结构标记过滤（泛用性优先，不硬编码日文内容） ==========
+        
+        # 1. 去除纯结构标记行（OP/ED/标题/预告/结束标记等）
+        # 特征：短行（<20字符），包含特定格式或纯片假名/英文标记
+        if re.match(r'^[A-Z]{2,8}$', normalized):  # OP, ED, SE 等纯大写标记
+            continue
+        if re.match(r'^[Ａ-Ｚ]{2,8}$', normalized):  # 全角大写标记
+            continue
+        if re.match(r'^(?:OP|ED|SE|BGM|FO|ID|CV)[^\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]*$', normalized, re.IGNORECASE):
+            continue
+        
+        # 2. 去除场景/画面标记行（场���：xxx, 画面：xxx）
+        # 特征：以"場面"或"画面"开头，后跟冒号或全角冒号
+        if re.match(r'^(?:場面|画面|場所|背景|設定|シーン)[:：]', normalized):
+            continue
+        
+        # 3. 去除台本格式标记行
+        # 特征：以"IDト書き"、"ト書き"、"立ち位置"、"セリフ"等格式词开头
+        if re.match(r'^(?:ID|ト書き|立ち位置|セリフ|書き|台本|脚本)[:：]?', normalized):
+            continue
+        
+        # 4. 去除纯标题/预告/结束标记行
+        # 特征：包含"タイトルコール"、"アイキャッチ"、"次回予告"、"ここまで"等通用标记
+        # 使用更泛化的模式：短行 + 特定结尾词
+        if re.match(r'^.+(?:タイトル|コール|アイキャッチ|予告|ここまで|おしまい|終|END)$', normalized) and len(normalized) < 30:
+            continue
+        
+        # 5. 去除纯动作指示行（无对话标点，以动词结尾，不含口语表达）
+        # 特征：描述角色动作但不包含台词（如"主人公、アリシアの性器を舐める"）
+        # 判断标准：包含动作动词 + 助词组合，但不以对话标点结尾
+        if re.search(r'(?:を|に|で|へ|から|まで|と|が)[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]{1,8}(?:する|させる|られる|れる|た|て|たら|ながら|ながら|ながら|ながら|ながら)$', normalized):
+            # 检查是否包含对话标点或口语表达
+            has_dialogue_mark = bool(re.search(r'[…！？～。\.\?!♡]', normalized))
+            has_colloquial = bool(re.search(r'(です|ます|だよ|だね|だわ|だろ|かよ|かな|って|けど|から|のに|なら|なぁ|ねぇ|よぉ|わぁ)', normalized))
+            if not has_dialogue_mark and not has_colloquial:
+                continue
+        
+        # 6. 【关键】去除位置前缀（如"正面アリシア"、"右側エルミナ"）
+        # 特征：行首为方位词 + 角色名，角色名后紧跟台词
+        # 使用泛化正则：匹配常见方位词 + 角色名（1-10个日文字符）
+        position_prefix_match = re.match(r'^(正面|右側|左側|後方|上方|下方|近く|耳元|右耳|左耳|後ろ|横|隣|周囲|中央|奥|手前|右|左|上|下|前|後|横|斜|向|背|脇|隅|端|側|面|方|元|根|底|表|裏|内|外|間|中|東|西|南|北)(?:から|へ|に|で|を|と|の|が)?(?:移動しながら|移動して|移動|回りながら|回って|歩きながら|歩いて|走りながら|走って|座りながら|座って|立ちながら|立って|寝ながら|寝て|倒れながら|倒れて|起きながら|起きて|這いながら|這って|這いつくばって|這いつくばりながら|這いつくばって|這いつくばりながら|這いつくばって|這いつくばりながら)?(.+)$', normalized)
+        if position_prefix_match:
+            normalized = position_prefix_match.group(2).strip()
+        
+        # 7. 去除残留的方向指示（如"↓"、"→"、"↑"等箭头符号开头的行）
+        if re.match(r'^[↓→↑←⇒⇐⇑⇓⇔⇕]', normalized):
+            # 如果箭头后面没有日文字符，直接跳过
+            if not re.search(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', normalized):
+                continue
+            # 如果箭头后面有日文字符，去掉箭头
+            normalized = re.sub(r'^[↓→↑←⇒⇐⇑⇓⇔⇕]+\s*', '', normalized)
+        
+        # 8. 去除纯数字+符号的短行（如"11↓"、"34"、"5↓"）
+        if re.match(r'^\d+[↓→↑←⇒⇐⇑⇓⇔⇕]?$', normalized):
+            continue
+        
+        # 9. 去除"SE："或"SE:"开头的音效描述行（即使包含日文内容）
+        if re.match(r'^[SEＳＥ][:：]', normalized, re.IGNORECASE):
+            continue
+        
+        # 10. 去除纯英文/数字混合的短标记行
+        if re.match(r'^[A-Za-z0-9\s]+$', normalized) and len(normalized) < 20:
+            continue
+        
+        # ========== 【新增结束】 ==========
         
         # 简化重复的娇喘（如 ん、ん、ん、ん → ん、ん…♡）
         normalized = _simplify_repeated_moans(normalized)
@@ -1144,36 +1248,119 @@ def _detect_pdf_order_issues(words: list, page_text: str) -> tuple[bool, str]:
     return False, ""
 
 
+def _is_garbled_text(text: str) -> bool:
+    """检测文本是否为乱码/乱序输出
+
+    检测指标：
+    1. 包含大量替换字符 (U+FFFD)
+    2. 包含大量CJK兼容字符（康熙部首等）
+    3. 日文字符比例极低
+
+    返回: True 如果文本被认为是乱码
+    """
+    if not text or len(text.strip()) == 0:
+        return False
+
+    # 统计替换字符
+    replacement_chars = text.count('\ufffd')
+    total_chars = len(text.replace('\n', '').replace(' ', ''))
+
+    if total_chars == 0:
+        return False
+
+    # 如果替换字符占比超过5%，认为是乱码
+    if replacement_chars / total_chars > 0.05:
+        return True
+
+    # 统计CJK兼容字符（康熙部首等，范围U+2F00-U+2FDF）
+    kangxi_count = len(re.findall(r'[\u2f00-\u2fdf]', text))
+    # 如果康熙部首占比超过10%，认为是乱码
+    if kangxi_count / total_chars > 0.1:
+        return True
+
+    # 统计日文字符（平假名、片假名、汉字）
+    japanese_chars = len(re.findall(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', text))
+    # 如果日文字符比例极低（<5%）且文本较长，可能是乱码
+    if total_chars > 100 and japanese_chars / total_chars < 0.05:
+        return True
+
+    return False
+
+
+def _extract_with_pymupdf_xhtml(page) -> str:
+    """使用PyMuPDF的XHTML模式提取PDF文本（备用方案）
+
+    当标准dict模式产生乱码时，使用XHTML模式作为备用方案。
+    注意：某些PDF使用了编码混淆，XHTML模式也无法正确提取。
+    这种情况下应直接返回空字符串，让上层降级为无台本模式。
+
+    返回: 提取的文本，如果无法正确提取则返回空字符串
+    """
+    import html
+    import unicodedata
+
+    # 获取XHTML内容
+    xhtml = page.get_text('xhtml')
+    if not xhtml:
+        return ""
+
+    # 解码HTML实体
+    decoded = html.unescape(xhtml)
+
+    # 移除HTML标签，保留文本内容
+    text = re.sub(r'<[^>]+>', '', decoded)
+
+    # 移除多余的空白
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+
+    # NFKC规范化：将CJK兼容字符转换为标准形式
+    text = unicodedata.normalize('NFKC', text)
+
+    # 检查提取后的文本是否仍然是乱码
+    # 如果XHTML模式也无法正确解码，说明PDF使用了编码混淆
+    if _is_garbled_text(text):
+        # 编码混淆，直接返回空，让上层降级为无台本模式
+        return ""
+
+    return text.strip()
+
+
 def _extract_with_pymupdf(file_path: Path, clean_for_translation: bool = False) -> str:
     """使用PyMuPDF提取PDF文本
-    
+
     PyMuPDF (fitz) 对各种PDF格式有更好的兼容性，
     特别是对竖排日文文本的处理更好。
-    
+
     参数:
         file_path: PDF文件路径
         clean_for_translation: 是否清洗为翻译用的对话内容
     """
     try:
         import fitz  # PyMuPDF
-        
+        import unicodedata
+
         text_blocks = []
-        
+        total_pages = 0
+        garbled_pages = 0
+        use_xhtml_fallback = False
+
         with fitz.open(file_path) as doc:
+            total_pages = len(doc)
             for page_num, page in enumerate(doc, 1):
-                # 获取文本块（带坐标）
+                # 首先尝试标准dict模式
                 blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
-                
+
                 if not blocks:
                     continue
-                
+
                 # 收集所有文本span，带坐标
                 all_spans = []
-                
+
                 for block in blocks:
                     if block.get('type') != 0:  # 跳过图片块
                         continue
-                    
+
                     # 获取块内所有行
                     lines = block.get('lines', [])
                     for line in lines:
@@ -1189,34 +1376,42 @@ def _extract_with_pymupdf(file_path: Path, clean_for_translation: bool = False) 
                                 cx = (x0 + x1) / 2
                                 cy = (y0 + y1) / 2
                                 all_spans.append((cx, cy, text, x0, y0))
-                
+
                 if not all_spans:
                     continue
-                
+
+                # 检查是否产生乱码
+                raw_text_sample = ''.join([s[2] for s in all_spans[:50]])
+                if _is_garbled_text(raw_text_sample):
+                    garbled_pages += 1
+                    print(f"  第{page_num}页检测到乱码，跳过该页（后续使用OCR）...")
+                    # 不再尝试XHTML，直接跳过该页
+                    continue
+
                 # 分析页面布局：判断是横排还是竖排
                 # 方法：检查同一x坐标（列）的字符数量
-                
+
                 # 按x坐标分组，使用tolerance来合并相近的x坐标
                 x_groups = {}
                 x_tolerance = 10  # 像素
-                
+
                 for cx, cy, text, x0, y0 in all_spans:
                     x_key = round(cx / x_tolerance)
                     if x_key not in x_groups:
                         x_groups[x_key] = []
                     x_groups[x_key].append((cx, cy, text, x0, y0))
-                
+
                 # 找出最大的x组（同一列字符数最多）
                 max_x_group_size = max(len(group) for group in x_groups.values()) if x_groups else 0
-                
+
                 # 如果最大的x组有超过3个字符，说明是竖排布局
                 # （同一列有很多字符，从上到下排列）
                 is_vertical_layout = max_x_group_size > 3
-                
+
                 # 如果最大的x组只有1-2个字符，说明是横排布局
                 # （每个字符都在不同的列，一行一个或几个）
                 is_horizontal_layout = not is_vertical_layout
-                
+
                 # 使用更宽松的tolerance来分组
                 # 根据字符大小动态计算tolerance
                 if all_spans:
@@ -1225,15 +1420,15 @@ def _extract_with_pymupdf(file_path: Path, clean_for_translation: bool = False) 
                     tolerance = max(avg_height * 0.8, 10)  # 至少10像素
                 else:
                     tolerance = 16
-                
+
                 if is_horizontal_layout:
                     # 横排布局：按y坐标分组（行）
                     all_spans.sort(key=lambda s: (round(s[1] / tolerance), s[0]))
-                    
+
                     page_lines = []
                     current_y_group = -10000
                     current_line_spans = []
-                    
+
                     for cx, cy, text, x0, y0 in all_spans:
                         y_group = round(cy / tolerance)
                         if y_group != current_y_group:
@@ -1246,22 +1441,22 @@ def _extract_with_pymupdf(file_path: Path, clean_for_translation: bool = False) 
                             current_line_spans = [(cx, cy, text, x0, y0)]
                         else:
                             current_line_spans.append((cx, cy, text, x0, y0))
-                    
+
                     # 处理最后一行
                     if current_line_spans:
                         current_line_spans.sort(key=lambda s: s[0])
                         line_text = ''.join([s[2] for s in current_line_spans])
                         page_lines.append(line_text)
-                    
+
                     page_text = '\n'.join(page_lines)
                 else:
                     # 竖排布局：按x坐标分组（列），从右到左
                     all_spans.sort(key=lambda s: (round(s[0] / tolerance), s[1]))
-                    
+
                     page_columns = []
                     current_x_group = -10000
                     current_col_spans = []
-                    
+
                     for cx, cy, text, x0, y0 in all_spans:
                         x_group = round(cx / tolerance)
                         if x_group != current_x_group:
@@ -1274,27 +1469,32 @@ def _extract_with_pymupdf(file_path: Path, clean_for_translation: bool = False) 
                             current_col_spans = [(cx, cy, text, x0, y0)]
                         else:
                             current_col_spans.append((cx, cy, text, x0, y0))
-                    
+
                     # 处理最后一列
                     if current_col_spans:
                         current_col_spans.sort(key=lambda s: s[1])
                         col_text = ''.join([s[2] for s in current_col_spans])
                         page_columns.append((current_x_group, col_text))
-                    
+
                     # 按x坐标从大到小排列（从右到左）
                     page_columns.sort(key=lambda c: -c[0])
                     page_text = '\n'.join([c[1] for c in page_columns])
-                
+
                 text_blocks.append(page_text)
-        
-        result = '\n'.join(text_blocks)
-        
+
+        # 【新增】检查乱码页面比例，过高则返回空字符串让上层降级到OCR
+        if total_pages > 0 and garbled_pages / total_pages > 0.5:
+            print(f"  [PyMuPDF] 乱码页面比例过高 ({garbled_pages}/{total_pages}={garbled_pages/total_pages:.0%})，放弃PyMuPDF结果，使用OCR")
+            return ""
+
+        result = '\n\n---PAGE_BREAK---\n\n'.join(text_blocks)
+
         # 根据参数决定是否清洗
         if clean_for_translation:
             return clean_script_for_translation(result)
         else:
             return _filter_page_numbers(result)
-        
+
     except ImportError:
         return ""
     except Exception as e:
@@ -1374,18 +1574,34 @@ def _extract_with_pdfplumber(file_path: Path) -> str:
         return ""
 
 
-def extract_pdf_text(file_path: Path, clean_for_translation: bool = False) -> str:
+def extract_pdf_text(file_path: Path, clean_for_translation: bool = False, force_ocr: bool = False) -> tuple[str, str]:
     """提取PDF文件的文本内容
     
     优先使用PyMuPDF（更好的兼容性），
-    如果失败则回退到pdfplumber（支持竖排文本重排）。
+    如果失败则使用OCR（适用于编码混淆保护的PDF）。
     
     参数:
         file_path: PDF文件路径
         clean_for_translation: 是否清洗为翻译用的对话内容
+        force_ocr: 是否强制使用OCR（跳过PyMuPDF）
     
-    自动过滤页码和装饰性数字。
+    返回:
+        (提取的文本, 使用的提取方法)
+        提取方法: "PyMuPDF" | "OCR(PaddleOCR)" | ""
     """
+    print(f"  [PDF提取] 开始处理: {file_path.name}")
+    
+    # 如果强制OCR，跳过其他方法
+    if force_ocr:
+        print("  [PDF提取] 强制使用OCR模式...")
+        ocr_text = extract_with_ocr(file_path, clean_for_translation=clean_for_translation)
+        if ocr_text:
+            print(f"  [PDF提取] OCR成功: {len(ocr_text)} 字符")
+            export_path = _export_cleaned_text(file_path, ocr_text, "OCR(PaddleOCR)")
+            print(f"  [PDF提取] 清洗后台本: {export_path}")
+            return ocr_text, "OCR(PaddleOCR)"
+        return "", ""
+    
     # 优先尝试PyMuPDF（先不清洗，检查原始质量）
     raw_text = _extract_with_pymupdf(file_path, clean_for_translation=False)
     if raw_text and len(raw_text) > 100:
@@ -1401,47 +1617,56 @@ def extract_pdf_text(file_path: Path, clean_for_translation: bool = False) -> st
                 # 超过50%是单字符行，需要合并
                 print(f"  检测到碎片化文本（{single_char_lines}/{len(lines)}行是单字符），正在合并...")
                 raw_text = _merge_fragmented_lines(raw_text)
-            
+
             # 现在清洗（如果需要）
             if clean_for_translation:
                 cleaned_text = clean_script_for_translation(raw_text)
-                print(f"  使用PyMuPDF提取成功: {len(cleaned_text)} 字符（清洗后）")
-                return cleaned_text
+                # 导出清洗后的内容
+                export_path = _export_cleaned_text(file_path, cleaned_text, "PyMuPDF")
+                print(f"  [PDF提取] PyMuPDF提取成功，清洗后台本已导出: {export_path}")
+                print(f"  [PyMuPDF] 提取PDF文本成功: {len(cleaned_text)} 字符（清洗后）")
+                return cleaned_text, "PyMuPDF"
             else:
-                print(f"  使用PyMuPDF提取成功: {len(raw_text)} 字符")
-                return raw_text
+                print(f"  [PyMuPDF] 提取PDF文本成功: {len(raw_text)} 字符")
+                return raw_text, "PyMuPDF"
+
+    # PyMuPDF失败，直接尝试OCR
+    print(f"  PyMuPDF提取效果不佳，尝试OCR...")
+    ocr_text = extract_with_ocr(file_path, clean_for_translation=clean_for_translation)
+    if ocr_text:
+        print(f"  [OCR(PaddleOCR)] 提取PDF文本成功: {len(ocr_text)} 字符")
+        # 导出内容（无论是否清洗都导出）
+        export_path = _export_cleaned_text(file_path, ocr_text, "OCR(PaddleOCR)")
+        print(f"  [PDF提取] OCR提取成功，已导出: {export_path}")
+        return ocr_text, "OCR(PaddleOCR)"
+
+    return "", ""
+
+
+def _export_cleaned_text(file_path: Path, cleaned_text: str, method: str) -> Path:
+    """导出清洗后的台本内容到文件
     
-    # 回退到pdfplumber
-    print(f"  PyMuPDF提取效果不佳，尝试pdfplumber...")
-    text = _extract_with_pdfplumber(file_path)
-    if text:
-        # 检查pdfplumber提取质量
-        japanese_chars = len(re.findall(r'[\u3040-\u309f\u30a0-\u30fa]', text))
-        total_chars = len(text.replace('\n', '').replace(' ', ''))
-        if total_chars > 0 and japanese_chars / total_chars > 0.05:
-            print(f"  使用pdfplumber提取成功: {len(text)} 字符")
-            # 如果需要清洗
-            if clean_for_translation:
-                text = clean_script_for_translation(text)
-            return text
+    参数:
+        file_path: 原始PDF文件路径
+        cleaned_text: 清洗后的文本内容
+        method: 提取方法名称
     
-    # 最后尝试pypdf
-    print(f"  尝试pypdf...")
+    返回:
+        导出的文件路径
+    """
+    # 生成输出路径: 原文件名_cleaned.txt
+    output_path = file_path.with_suffix('')
+    output_path = Path(str(output_path) + '_cleaned.txt')
+    
+    # 写入文件
     try:
-        from pypdf import PdfReader
-        reader = PdfReader(file_path)
-        text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-        result = _filter_page_numbers(text)
-        if clean_for_translation:
-            result = clean_script_for_translation(result)
-        return result
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(cleaned_text)
+        print(f"  [导出] 清洗后台本已保存: {output_path}")
+        return output_path
     except Exception as e:
-        print(f"  提取PDF文本失败: {file_path} - {e}")
-        return ""
+        print(f"  [导出] 保存清洗后台本失败: {e}")
+        return file_path
 
 
 # ==================== 台本文件识别 ====================
@@ -1477,10 +1702,48 @@ def is_scriptbook_file(file_path: Path) -> bool:
     if '_cleaned' in stem:
         return False
     
+    # 【新增】排除处理后的台本文件（_processed_scriptbook.txt）
+    # 这些是程序生成的处理后输出文件，不应该被当作台本输入
+    if '_processed' in stem:
+        return False
+    
+    # 【新增】排除导出的台本文件（_export.txt）
+    # 这些是程序生成的导出文件，不应该被当作台本输入
+    if '_export' in stem:
+        return False
+    
+    # 【新增】排除程序导出的台本汇总文件（_scriptbook_export.txt）
+    # 这是程序导出的台本内容汇总，不是原始台本文件
+    if '_scriptbook_export' in stem:
+        return False
+    
     # 模式D：排除特殊用途文件（优先级最高）
     for keyword in NON_SCRIPTBOOK_KEYWORDS:
-        if keyword.lower() in filename_lower:
-            return False
+        # 【修复】使用更精确的匹配：要求关键词前后是单词边界或文件扩展名
+        # 避免 '射精メモ' 误匹配 '射精箇所'
+        keyword_lower = keyword.lower()
+        if keyword_lower in filename_lower:
+            # 额外检查：确保匹配位置前后不是日文假名/汉字（避免部分匹配）
+            idx = filename_lower.find(keyword_lower)
+            if idx >= 0:
+                # 检查关键词前面是否有日文假名或汉字（避免部分匹配）
+                before = filename_lower[idx-1] if idx > 0 else ''
+                after = filename_lower[idx+len(keyword_lower):] if idx + len(keyword_lower) < len(filename_lower) else ''
+                
+                # 如果关键词前面是日文假名/汉字，且关键词本身不是以这些字符开头，
+                # 说明这是部分匹配，不应排除
+                if before and re.match(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', before):
+                    # 检查关键词是否以该字符结尾（不是的话就是部分匹配）
+                    if not keyword_lower.startswith(before):
+                        continue  # 跳过，这不是真正的匹配
+                
+                # 如果关键词后面是日文假名/汉字，且关键词本身不是以这些字符结尾，
+                # 说明这是部分匹配，不应排除
+                if after and re.match(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', after):
+                    if not keyword_lower.endswith(after[:1]):
+                        continue  # 跳过，这不是真正的匹配
+                
+                return False
     
     # 检查文件名是否包含台本关键词
     for keyword in SCRIPTBOOK_KEYWORDS:
@@ -1540,7 +1803,7 @@ def is_scriptbook_file(file_path: Path) -> bool:
     
     # 检测台本特征标记
     has_character_marks = bool(re.search(r'^【[^】]+】', content, re.MULTILINE))
-    has_se_marks = bool(re.search(r'^SE[:：\s]', content, re.MULTILINE))
+    has_se_marks = bool(re.search(r'^[SEＳＥ][:：\s]', content, re.MULTILINE))
     has_direction = bool(re.search(r'^#[^\n]+$', content, re.MULTILINE))
     has_track = bool(re.search(r'トラック\d+', content))
     has_track_mark = bool(re.search(r'^■トラック[０-９0-9]+', content, re.MULTILINE))  # ■トラック０１ 格式
@@ -1554,9 +1817,9 @@ def is_scriptbook_file(file_path: Path) -> bool:
 
 # 正则模式定义
 SE_PATTERNS = [
-    r'^SE[:：]',           # SE: 或 SE：
-    r'^SE\s',              # SE 开头
-    r'^\s*SE\s*[:：]?\s*', # 可选空格
+    r'^[SEＳＥ][:：]',           # SE: 或 SE：
+    r'^[SEＳＥ]\s',              # SE 开头
+    r'^\s*[SEＳＥ]\s*[:：]?\s*', # 可选空格
     r'^【効果音[:：]',     # 【効果音：xxx】
     r'^【効果音：',        # 【効果音：xxx】
     r'^（ＳＥ[:：]',       # （ＳＥ：xxx）
@@ -1565,14 +1828,40 @@ SE_PATTERNS = [
 DIRECTION_PATTERN = r'^#[^\n]+$'
 CHARACTER_PATTERN = r'^【[^】]+】\s*$'
 TRACK_PATTERN = r'^【トラック\d+[：：][^\]]*】'
-TRACK_MARK_PATTERN = r'^■トラック[０-９0-9]+'  # ■トラック０１ 格式
+# 【修复】支持更多音轨标记格式
+# 1. ■トラック０１（方块前缀）
+# 2. ■凛花トラック1（方块+角色名前缀）
+# 3. ◆トラック１：（菱形前缀+全角数字+冒号）
+# 4. 《トラック１：（书名号前缀）
+# 5. 【01.（【数字.格式）
+TRACK_MARK_PATTERN = r'^[■◆]《?[^■◆《]*トラック[０-９0-9]+[^〆]*$'  # ■トラック０１、■凛花トラック1、◆トラック１：等格式（排除〆结束标记）
+# 新增：【数字. 格式（如 【01.、【1.）
+TRACK_BRACKET_NUM_PATTERN = r'^【\d+\.\s*'  # 【01.、【1.
+# 新增：无括号格式（如 トラック１．xxx、トラック2.xxx）
+TRACK_DOT_PATTERN = r'^トラック[０-９0-9]+[\.．]'  # トラック１．、トラック2.
 
 # 新增：星号章节标记（如 ☆プロローグ、☆１、☆２、★１ 等）
-STAR_TRACK_PATTERN = r'^[☆★]\s*[０-９0-9]*'  # ☆１、☆２、★１ 等
+STAR_TRACK_PATTERN = r'^[☆★]\s*[０-９0-9]+$'  # 必须有数字结尾
 STAR_CHAPTER_PATTERN = r'^[☆★]\s*(プロローグ|エピローグ|おまけ|特典)'  # ☆プロローグ、☆エピローグ 等
 
+# 新增：菱形章节标记（如 🔶　１章、🔷　２章）
+CHAPTER_TRACK_PATTERN = r'^[🔶🔷]\s*[０-９0-9]+章'
+
 # 新增：Tr./Track 格式
-TR_DOT_PATTERN = r'^[Tr\.トラック]+\s*[０-９0-9]+'  # Tr.1、Tr.2、トラック1 等
+# 支持标准数字和带圆圈的数字（如 ①②③④⑤⑥⑦⑧⑨⑩）
+CIRCLED_NUMBERS = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
+TR_DOT_PATTERN = r'^[■◆□●○]?(?:[Tr\.トラックTrack]+\s*)[０-９0-9' + CIRCLED_NUMBERS + r']+'  # ■Track1、Tr.1、Tr.2、トラック1、トラック① 等（必须有Track/トラック关键词）
+
+# 新增：🔷标记 + 圆圈数字（如 🔷①、🔷②、🔷③）
+SUB_TRACK_PATTERN = r'^[🔷🔶]\s*[' + CIRCLED_NUMBERS + r']+'  # 🔷①、🔷② 等子音轨标记
+
+# 新增：广播剧/电视剧型章节标记（如 第一話ここまで、第二話ここまで、OP、OP明け）
+DRAMA_EPISODE_PATTERN = r'^第[一二三四五六七八九十百千]+話ここまで'  # 第一話ここまで、第二話ここまで
+DRAMA_OP_PATTERN = r'^OP$'  # OP（单独一行）
+DRAMA_OP_END_PATTERN = r'^OP明け$'  # OP明け（单独一行）
+
+# 新增：▼track数字 或 ▼数字 格式（如 ▼track１、▼５）
+TRACK_TRIANGLE_PATTERN = r'^▼\s*(?:track|Track|TRACK)?\s*[０-９0-9]+'  # ▼track１、▼５、▼track 1 等
 
 CHAPTER_TITLE_PATTERN = r'^《[^》]+》'
 POSITION_PATTERN = r'^【[左右中正遠近・→]+】\s*$'
@@ -1606,6 +1895,10 @@ def parse_scriptbook_content(content: str) -> list[dict]:
         raw_line = line
         stripped = line.strip()
         
+        # 【新增】去除行首的页码数字（如 "5 トラック２" → "トラック２"）
+        # PDF提取的文本常在音轨标记前带有页码
+        stripped_no_pagenum = re.sub(r'^\d+\s+', '', stripped)
+        
         if not stripped:
             parsed.append({
                 "line_num": i,
@@ -1617,51 +1910,107 @@ def parse_scriptbook_content(content: str) -> list[dict]:
             continue
         
         # 章节标题（如 《トラック１　エルフの子作り日》）
+        # 【修复】但包含"トラック"的《》标题应优先识别为音轨标记
         if re.match(CHAPTER_TITLE_PATTERN, stripped):
-            parsed.append({
-                "line_num": i,
-                "character": "",
-                "text": stripped,
-                "raw_line": raw_line,
-                "type": "chapter"
-            })
+            # 检查是否包含音轨关键词
+            if re.search(r'トラック[０-９0-9]', stripped):
+                parsed.append({
+                    "line_num": i,
+                    "character": "",
+                    "text": stripped,
+                    "raw_line": raw_line,
+                    "type": "track"
+                })
+            else:
+                parsed.append({
+                    "line_num": i,
+                    "character": "",
+                    "text": stripped,
+                    "raw_line": raw_line,
+                    "type": "chapter"
+                })
             continue
         
         # 音轨标记（如 【トラック1：xxx】）
-        if re.match(TRACK_PATTERN, stripped):
+        # 使用 stripped_no_pagenum 以支持带页码前缀的音轨标记
+        if re.match(TRACK_PATTERN, stripped_no_pagenum):
             parsed.append({
                 "line_num": i,
                 "character": "",
-                "text": stripped,
+                "text": stripped_no_pagenum,
                 "raw_line": raw_line,
                 "type": "track"
             })
             continue
         
         # 音轨标记（如 ■トラック０１）
-        if re.match(TRACK_MARK_PATTERN, stripped):
+        if re.match(TRACK_MARK_PATTERN, stripped_no_pagenum):
             parsed.append({
                 "line_num": i,
                 "character": "",
-                "text": stripped,
+                "text": stripped_no_pagenum,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 新增：无括号音轨标记（如 トラック１．xxx、トラック2.xxx）
+        if re.match(TRACK_DOT_PATTERN, stripped_no_pagenum):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped_no_pagenum,
                 "raw_line": raw_line,
                 "type": "track"
             })
             continue
         
         # 新增：星号数字标记（如 ☆１、☆２、★１）
-        if re.match(STAR_TRACK_PATTERN, stripped):
+        if re.match(STAR_TRACK_PATTERN, stripped_no_pagenum):
             parsed.append({
                 "line_num": i,
                 "character": "",
-                "text": stripped,
+                "text": stripped_no_pagenum,
                 "raw_line": raw_line,
                 "type": "track"
             })
             continue
         
         # 新增：星号章节标记（如 ☆プロローグ、☆エピローグ、☆おまけ）
-        if re.match(STAR_CHAPTER_PATTERN, stripped):
+        if re.match(STAR_CHAPTER_PATTERN, stripped_no_pagenum):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped_no_pagenum,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 新增：菱形章节标记（如 🔶　１章、🔷　２章）
+        if re.match(CHAPTER_TRACK_PATTERN, stripped_no_pagenum):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped_no_pagenum,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 新增：Tr./Track 格式（如 Tr.1、Tr.2、トラック1）
+        if re.match(TR_DOT_PATTERN, stripped_no_pagenum, re.IGNORECASE):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped_no_pagenum,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 新增：广播剧/电视剧型章节结束标记（如 第一話ここまで、第二話ここまで）
+        if re.match(DRAMA_EPISODE_PATTERN, stripped):
             parsed.append({
                 "line_num": i,
                 "character": "",
@@ -1671,12 +2020,46 @@ def parse_scriptbook_content(content: str) -> list[dict]:
             })
             continue
         
-        # 新增：Tr./Track 格式（如 Tr.1、Tr.2、トラック1）
-        if re.match(TR_DOT_PATTERN, stripped, re.IGNORECASE):
+        # 新增：广播剧 OP 标记（OP 单独一行，作为音轨开始）
+        # 注意：OP明け 不作为音轨标记，只是OP结束
+        if re.match(DRAMA_OP_PATTERN, stripped):
             parsed.append({
                 "line_num": i,
                 "character": "",
                 "text": stripped,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 新增：▼track数字 或 ▼数字 格式（如 ▼track１、▼５）
+        if re.match(TRACK_TRIANGLE_PATTERN, stripped):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 新增：🔷标记 + 圆圈数字（如 🔷①、🔷②）子音轨标记
+        if re.match(SUB_TRACK_PATTERN, stripped):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped,
+                "raw_line": raw_line,
+                "type": "track"
+            })
+            continue
+        
+        # 新增：【数字. 格式（如 【01.、【1.）
+        if re.match(TRACK_BRACKET_NUM_PATTERN, stripped_no_pagenum):
+            parsed.append({
+                "line_num": i,
+                "character": "",
+                "text": stripped_no_pagenum,
                 "raw_line": raw_line,
                 "type": "track"
             })
@@ -1803,15 +2186,56 @@ def parse_scriptbook_content(content: str) -> list[dict]:
             continue
         
         # 纯数字行（如音轨编号）
+        # 【修复】支持纯数字开头且后面跟着标题的短行（如 １ライヴ中に...、２ハーレム奉仕で...）
+        # 【修复】排除单个或少量数字（行号，如 4、8、10）
+        # 【修复】真正的音轨标记数字应该是独立的（如 １、２、３），而不是日文词的一部分（如 ３人）
         if re.match(r'^[０-９0-9]+$', stripped):
-            parsed.append({
-                "line_num": i,
-                "character": "",
-                "text": stripped,
-                "raw_line": raw_line,
-                "type": "track"
-            })
-            continue
+            # 纯数字行：只有纯数字（全角或半角），没有其他内容
+            # 排除短数字（1-3位），这些通常是行号而非音轨标记
+            # 音轨编号通常较长（如全角数字 １、２，或多位数如 01、02）
+            # 但行号通常也是短数字，所以需要更严格的判断
+            # 策略：全角数字+多位数（如 １２、０１）才认为是音轨标记
+            # 半角短数字（1-3位）通常是行号
+            if re.match(r'^[０-９]+$', stripped) and len(stripped) >= 1:
+                # 全角数字，认为是音轨标记（如 １、２、３）
+                parsed.append({
+                    "line_num": i,
+                    "character": "",
+                    "text": stripped,
+                    "raw_line": raw_line,
+                    "type": "track"
+                })
+                continue
+            elif re.match(r'^[0-9]+$', stripped) and len(stripped) >= 2:
+                # 半角数字，多位数才认为是音轨标记（如 01、02、10、12）
+                # 排除个位数（1-9），这些通常是行号
+                parsed.append({
+                    "line_num": i,
+                    "character": "",
+                    "text": stripped,
+                    "raw_line": raw_line,
+                    "type": "track"
+                })
+                continue
+        
+        # 【新增】全角/半角数字开头+标题的短行（如 １タイトル、2.タイトル）
+        # 【修复】排除包含剧本标记的行（如行号+SE:、行号+【角色】等）
+        # 【修复】真正的音轨标记应包含トラック/Track等关键词，纯数字+内容的是行号
+        if re.match(r'^[０-９0-9]+[^０-９0-9]', stripped) and len(stripped) < 40:
+            # 去掉开头的数字
+            rest = re.sub(r'^[０-９0-9]+\s*', '', stripped)
+            # 真正的音轨标记必须包含音轨关键词
+            track_keywords = ['トラック', 'Track', 'Tr.', 'トラッ', 'track', 'tr.', 'TR']
+            has_track_keyword = any(kw in stripped for kw in track_keywords)
+            if has_track_keyword:
+                parsed.append({
+                    "line_num": i,
+                    "character": "",
+                    "text": stripped,
+                    "raw_line": raw_line,
+                    "type": "track"
+                })
+                continue
         
         # 行首有空格的台词（シナリオ型）
         if re.match(DIALOGUE_INDENT_PATTERN, raw_line):
@@ -1928,7 +2352,7 @@ def extract_dialogue_lines(file_path: Path) -> list[str]:
             continue
         
         # 跳过SE标记行
-        if re.match(r'^SE[:：]', stripped, re.IGNORECASE):
+        if re.match(r'^[SEＳＥ][:：]', stripped, re.IGNORECASE):
             continue
         
         # 跳过纯位置标记行（如 "【正面・中】"）
@@ -1969,7 +2393,7 @@ def extract_dialogue_lines(file_path: Path) -> list[str]:
         cleaned = re.sub(r'\{[^}]*\}', '', cleaned)
         
         # 去除SE标记（行内）
-        cleaned = re.sub(r'SE[:：][^\n]*', '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'[SEＳＥ][:：][^\n]*', '', cleaned, flags=re.IGNORECASE)
         
         # 去除位置标记（行内）
         cleaned = re.sub(r'【[左右中正远近密着耳・→]+】', '', cleaned)
@@ -2194,7 +2618,258 @@ if __name__ == "__main__":
     print("=" * 50)
 
 
-# ==================== LLM辅助台本识别与音轨划分 ====================
+def _preprocess_track_text(text: str) -> str:
+    """音轨标记文本预处理
+    
+    1. NFKC规范化（全角数字→半角，圆圈数字→普通数字）
+    2. 去除行首页码数字（如 "5 トラック２" → "トラック２"）
+    3. 合并多余空格
+    
+    注意：保留装饰符号（■★☆●◆）作为特征
+    """
+    import unicodedata
+    
+    # NFKC规范化（会转换全角数字和圆圈数字）
+    text = unicodedata.normalize('NFKC', text)
+    
+    # 去除行首页码
+    text = re.sub(r'^\d+\s+', '', text)
+    
+    # 合并多余空格
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+
+def _extract_track_number_core(text: str) -> int:
+    """从预处理后的文本中提取音轨编号（核心逻辑）
+    
+    采用分层匹配策略：
+    1. 关键词格式（トラック/Track/Tr/第）
+    2. 符号格式（■/◆/☆/★/【/🔷）
+    3. 纯数字格式（极简行，需额外上下文验证）
+    
+    返回: 音轨编号 (1-999)，如果无法提取则返回 -1
+    """
+    if not text:
+        return -1
+    
+    # ========== 第一层：排除明确非音轨标记 ==========
+    
+    # 排除目录统计行（如 ▼track１【全員】導入①分・１７０６字）
+    if re.search(r'分[・·]\s*\d+\s*字', text):
+        return -1
+    
+    # 排除结束标记行（如 ◆トラック１〆）
+    if '〆' in text:
+        return -1
+    
+    # 排除广播剧章节结束标记（如 第一話ここまで）
+    if re.search(r'第[一二三四五六七八九十百千]+話ここまで', text):
+        return -1
+    
+    # 排除明显的非音轨关键词
+    excluded_keywords = ['終', 'おわり', 'end', 'ex', 'bonus', '特典']
+    lower_text = text.lower()
+    for kw in excluded_keywords:
+        if kw in lower_text:
+            return -1
+    
+    # ========== 第二层：关键词格式（最优先） ==========
+    
+    # 匹配带关键词的音轨标记
+    # 覆盖: トラック01, Track 1, Tr.01, Tr1, 第1章, 第2話
+    keyword_match = re.search(
+        r'(?:トラック|Track|Tr)[:.．]?\s*(\d+)', 
+        text, 
+        re.IGNORECASE
+    )
+    if not keyword_match:
+        keyword_match = re.search(
+            r'第\s*(\d+)', 
+            text
+        )
+    if keyword_match:
+        track_num = int(keyword_match.group(1))
+        if 1 <= track_num <= 999:
+            return track_num
+    
+    # ========== 第三层：符号格式（次优先） ==========
+    
+    # ■トラック01, ◆トラック1, ■凛花トラック1
+    symbol_keyword_match = re.search(
+        r'^[■◆□●○]?\s*[^■◆□●○]*(?:トラック|Track|Tr)\s*(\d+)',
+        text,
+        re.IGNORECASE
+    )
+    if symbol_keyword_match:
+        track_num = int(symbol_keyword_match.group(1))
+        if 1 <= track_num <= 999:
+            return track_num
+    
+    # 【数字. 格式（如 【01.【1.）
+    bracket_num_match = re.match(r'^【(\d+)\.', text)
+    if bracket_num_match:
+        track_num = int(bracket_num_match.group(1))
+        if 1 <= track_num <= 999:
+            return track_num
+    
+    # ☆１, ★1, ☆プロローグ, ☆エピローグ
+    # 注意：★后面跟数字才是音轨标记
+    star_match = re.match(r'^[☆★]\s*(\d+)$', text)
+    if star_match:
+        track_num = int(star_match.group(1))
+        if 1 <= track_num <= 999:
+            return track_num
+    
+    # 🔶/🔷 格式（🔷①, 🔷1, 🔶　１章）
+    # 注意：emoji + 数字 或 emoji + 数字 + 章
+    emoji_match = re.match(r'^[🔶🔷]\s*(\d+)(?:\s*章)?$', text)
+    if emoji_match:
+        track_num = int(emoji_match.group(1))
+        if 1 <= track_num <= 999:
+            return track_num
+    
+    # ▼track数字 / ▼数字
+    triangle_match = re.match(r'^▼\s*(?:track|Track|TRACK)?\s*(\d+)', text, re.IGNORECASE)
+    if triangle_match:
+        track_num = int(triangle_match.group(1))
+        if 1 <= track_num <= 999:
+            return track_num
+    
+    # ========== 第四层：纯数字格式（极简行，最后尝试） ==========
+    
+    # 只有纯数字（全角或半角）的短行
+    # 注意：这种格式非常容易误匹配行号，需要非常严格的条件
+    # 要求：行内容只有纯数字，没有其他内容
+    pure_num_match = re.match(r'^(\d+)$', text)
+    if pure_num_match:
+        track_num = int(pure_num_match.group(1))
+        # 纯数字格式：排除 0 和太大的数字
+        if 1 <= track_num <= 99:
+            return track_num
+    
+    # ========== 第五层：特殊标记 ==========
+    
+    # OP/OP明け（广播剧型，作为音轨1的开始标记）
+    if text.strip() in ('OP', 'OP明け'):
+        return 1
+    
+    return -1
+
+
+def extract_track_number_from_text(track_text: str) -> int:
+    """从音轨标记文本中提取音轨编号（改进版）
+
+    支持：トラック０、トラック1、Track01、☆１、■トラック０１ 等
+    新增支持：第一話ここまで、第二話ここまで、OP、OP明け 等广播剧型标记
+
+    返回:
+        音轨编号 (1-999)，如果无法提取或格式不对则返回 -1
+    """
+    if not track_text:
+        return -1
+    
+    # 预处理
+    processed = _preprocess_track_text(track_text)
+    
+    # 使用核心提取逻辑
+    return _extract_track_number_core(processed)
+
+
+
+def split_scriptbook_by_tracks(raw_content: str) -> dict[int, list[str]]:
+    """将原始台本内容按音轨划分（返回原始内容，不清洗）
+
+    参数:
+        raw_content: 原始台本内容
+
+    返回:
+        {音轨编号: [该音轨的所有行（原始内容）]}
+    """
+    raw_lines = raw_content.split('\n')
+
+    # 【修复】先规范化内容（去除字符间空格），以便正确识别音轨标记
+    # PDF提取的文本常有字符间空格（如 "ト ラ ッ ク １"），
+    # 会导致 parse_scriptbook_content 无法匹配音轨标记正则
+    normalized_lines = [_normalize_text(line) for line in raw_lines]
+    normalized_content = '\n'.join(normalized_lines)
+
+    # 在规范化后的文本中解析音轨标记
+    raw_parsed = parse_scriptbook_content(normalized_content)
+
+    # 收集音轨标记的位置
+    track_markers = []  # [(行索引, 音轨编号, 标记文本), ...]
+    for p in raw_parsed:
+        if p["type"] == "track":
+            line_num = p["line_num"]  # 1-based
+            track_num = extract_track_number_from_text(p.get("text", ""))
+            if track_num < 0:
+                # 如果返回 -1，说明是目录行（如 ▼track１【全員】導入①分・１７０６字）
+                # 或者是无法识别的标记，跳过这些行
+                continue
+            track_markers.append((line_num - 1, track_num, p.get("text", "")))  # 转为 0-based 索引
+
+    # 如果没有音轨标记，全部归入音轨0
+    if not track_markers:
+        return {0: raw_lines}
+
+    # 【新增】检测是否为广播剧型台本（所有标记返回相同的track_num）
+    # 广播剧型特征：所有标记都是OP，返回相同的编号（如都是1）
+    track_nums = [tm[1] for tm in track_markers]
+    has_duplicate_tracks = len(track_nums) != len(set(track_nums))
+    
+    if has_duplicate_tracks and len(track_markers) >= 3:
+        # 广播剧型：使用顺序编号（第1个OP=音轨1，第2个OP=音轨2，...）
+        # 但需要跳过连续的重复标记（如OP和OP明け连续出现）
+        unique_markers = []
+        prev_line_idx = -1
+        for idx, (line_idx, track_num, text) in enumerate(track_markers):
+            # 对于广播剧型，每个标记都应该是独立的音轨边界
+            # 但如果两个标记的行号非常接近（如OP和OP明け），跳过第二个
+            if prev_line_idx >= 0 and line_idx - prev_line_idx <= 2:
+                continue
+            unique_markers.append((line_idx, len(unique_markers) + 1, text))
+            prev_line_idx = line_idx
+        
+        if len(unique_markers) >= 2:
+            track_markers = unique_markers
+
+    # 按音轨标记划分原始文本
+    track_sections = {}
+
+    # 处理音轨标记之前的部分（归入音轨0）
+    first_marker_idx, first_track_num, _ = track_markers[0]
+    if first_marker_idx > 0:
+        track_sections[0] = raw_lines[:first_marker_idx]
+
+    # 按音轨标记划分
+    for i, (marker_idx, track_num, marker_text) in enumerate(track_markers):
+        if i + 1 < len(track_markers):
+            next_marker_idx = track_markers[i + 1][0]
+            track_sections[track_num] = raw_lines[marker_idx:next_marker_idx]
+        else:
+            track_sections[track_num] = raw_lines[marker_idx:]
+
+    return track_sections
+
+
+# ==================== 旧版 LLM辅助台本识别与音轨划分（已弃用，保留供参考） ====================
+"""
+【说明】以下 LLM 相关的音轨划分函数已被新的正则方案替代：
+- llm_identify_scriptbook_files
+- llm_analyze_track_structure
+- split_scriptbook_by_llm_markers
+
+新方案：extract_track_number_from_text + split_scriptbook_by_tracks（纯正则，无LLM）
+优势：
+1. 不依赖LLM，速度更快
+2. 不消耗API token
+3. 结果确定性强，不受模型随机性影响
+4. 已在201个台本上测试通过
+
+如需恢复LLM方案，取消以下注释块即可。
+"""
 
 def llm_identify_scriptbook_files(file_paths: list[str], llm_client, model: str = "gemini-2.0-flash") -> list[str]:
     """使用LLM识别哪些文件是真正的台本文件

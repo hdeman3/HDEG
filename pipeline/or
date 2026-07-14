@@ -1,0 +1,626 @@
+# -*- coding: utf-8 -*-
+"""
+翻译管道编排器
+
+连接 core、engines、io_adapter 完成端到端 LRC 字幕翻译流程：
+  1. 扫描 .lrc / .ja.lrc 字幕文件
+  2. 恢复留档（.ja.lrc → .lrc 如果缺失）
+  3. 解析 LRC 时间轴
+  4. 分块翻译
+  5. 覆盖写入 .lrc（翻译后的中文）
+
+替代 translate.py 中分散的流程控制逻辑。
+"""
+
+from __future__ import annotations
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Callable
+
+
+# ==================== 工具函数 ====================
+
+_OUTPUT_FLUSH_COUNT = 0
+
+
+def _log(msg: str = "", *, flush: bool = True):
+    """输出日志并立即刷新 stdout，确保实时可见"""
+    global _OUTPUT_FLUSH_COUNT
+    print(msg, flush=flush)
+    sys.stderr.flush()
+    _OUTPUT_FLUSH_COUNT += 1
+
+
+def _sep(title: str = ""):
+    """打印分隔线"""
+    if title:
+        _log(f"\n{'='*60}")
+        _log(f"  {title}")
+        _log(f"{'='*60}")
+    else:
+        _log("=" * 60)
+
+
+def _progress(current: int, total: int, label: str = "") -> str:
+    """生成进度条字符串"""
+    pct = current / max(total, 1) * 100
+    bar_len = 20
+    filled = int(bar_len * current / max(total, 1))
+    bar = '█' * filled + '░' * (bar_len - filled)
+    return f"  [{bar}] {pct:.0f}% ({current}/{total}) {label}"
+
+
+# ==================== 管道上下文 ====================
+
+class PipelineContext:
+    """管道运行上下文，承载整个过程的状态"""
+
+    def __init__(self, config_path: Path = None):
+        # 延迟导入避免循环依赖
+        from io_adapter.config_loader import load_config
+        self.config = load_config(config_path)
+        self.start_time = time.time()
+        self.app_cfg = self.config.get('app', {})
+        self.api_cfg = self.config.get('api', {})
+        self.pricing = self.config.get('pricing', {})
+        self.stats = {
+            'archived': 0,
+            'translated': 0,
+            'skipped': 0,
+            'kept': 0,
+            'total_lines': 0,
+            'success_lines': 0,
+            'api_calls': 0,
+            'total_cost': 0.0,
+            'total_hit_tokens': 0,
+            'total_miss_tokens': 0,
+            'total_completion_tokens': 0,
+        }
+        self._translate_engine = None
+
+    @property
+    def translate_engine(self):
+        if self._translate_engine is None:
+            from io_adapter.config_loader import get_api_config
+            from engines.translate_engine import create_translate_engine
+            api_config = get_api_config(self.config)
+            self._translate_engine = create_translate_engine(api_config)
+        return self._translate_engine
+
+    @property
+    def elapsed(self) -> float:
+        return time.time() - self.start_time
+
+
+# ==================== LRC 文件扫描 ====================
+
+def scan_lrc_files(work_dir: Path) -> tuple:
+    """扫描并列出所有 LRC 字幕文件（待翻译 + 留档）"""
+    _log(f"\n[扫描] 递归扫描目录: {work_dir.absolute()}")
+
+    all_lrc = [f for f in work_dir.rglob('*.lrc')
+               if not f.name.endswith('.ja.lrc')]
+    ja_lrc_files = list(work_dir.rglob('*.ja.lrc'))
+
+    _log(f"  → 找到 .lrc 待翻译文件: {len(all_lrc)} 个")
+    for f in all_lrc:
+        _log(f"      {f.absolute()}")
+
+    _log(f"  → 找到 .ja.lrc 日文留档: {len(ja_lrc_files)} 个")
+    for f in ja_lrc_files:
+        _log(f"      {f.absolute()}")
+
+    # 从留档恢复缺失的 .lrc
+    restored = 0
+    for ja_f in ja_lrc_files:
+        stem = ja_f.name[:-7]  # 去掉 .ja.lrc
+        base_name = stem + '.lrc'
+        lrc_path = ja_f.parent / base_name
+        if not lrc_path.exists():
+            shutil.copy2(ja_f, lrc_path)
+            _log(f"  [恢复] {base_name} (从 {ja_f.name})")
+            _log(f"         → {lrc_path.absolute()}")
+            all_lrc.append(lrc_path)
+            restored += 1
+
+    if restored > 0:
+        _log(f"\n  → 从留档恢复: {restored} 个文件")
+    else:
+        _log(f"\n  → 无需恢复")
+
+    # 按修改时间排序
+    all_lrc.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+
+    _log(f"\n  处理顺序（按文件修改时间升序）:")
+    for i, f in enumerate(all_lrc):
+        mtime_str = time.strftime('%Y-%m-%d %H:%M:%S',
+                                  time.localtime(f.stat().st_mtime))
+        _log(f"    [{i+1:02d}] {f.name}")
+        _log(f"           路径: {f.absolute()}")
+        _log(f"           时间: {mtime_str}")
+
+    return all_lrc, ja_lrc_files, restored
+
+
+# ==================== 台本加载 ====================
+
+def _load_scriptbook(work_dir: Path, ctx: PipelineContext) -> list | None:
+    """加载台本参考（原文-译文对照）"""
+    from core.scriptbook_parser import (
+        find_scriptbooks_in_dir,
+        load_scriptbook_content,
+        build_raw_scriptbook_map,
+    )
+
+    scriptbook_files = find_scriptbooks_in_dir(work_dir)
+    if scriptbook_files:
+        _log(f"\n[台本] 发现台本目录/文件: {len(scriptbook_files)} 个")
+        for f in scriptbook_files[:5]:
+            _log(f"  → {f.absolute()}")
+        if len(scriptbook_files) > 5:
+            _log(f"  → ... 还有 {len(scriptbook_files) - 5} 个")
+
+        raw_map = build_raw_scriptbook_map(scriptbook_files)
+        all_lines = []
+        for track_num in sorted(raw_map.keys()):
+            all_lines.extend(raw_map[track_num])
+
+        _log(f"  → 合并台本: {len(all_lines)} 行参考原文-译文对照")
+        return all_lines
+
+    # 回退：搜索带 | 分隔符的台本 txt
+    candidates = list(work_dir.rglob('*.txt'))
+    scriptbook_path = None
+    for cand in candidates:
+        try:
+            content = cand.read_text(encoding='utf-8')[:500]
+            if '|' in content and any(
+                k in content for k in ('日本語', '中文', 'セリフ', '台词', '原文', '译文')
+            ):
+                scriptbook_path = cand
+                break
+        except Exception:
+            continue
+
+    if not scriptbook_path:
+        _log(f"\n[台本] 未发现台本文件")
+        return None
+
+    _log(f"\n[台本] 发现台本文件: {scriptbook_path.absolute()}")
+    try:
+        content = load_scriptbook_content(scriptbook_path)
+        if content:
+            lines = [line.strip() for line in content.split('\n') if line.strip()]
+            _log(f"  → 加载台本: {len(lines)} 行参考原文")
+            return lines
+    except Exception as e:
+        _log(f"  [警告] 台本加载失败: {e}")
+
+    try:
+        lines = [line.strip()
+                 for line in scriptbook_path.read_text(encoding='utf-8').split('\n')
+                 if line.strip()]
+        _log(f"  → 兜底加载台本: {len(lines)} 行")
+        return lines
+    except Exception as e:
+        _log(f"  [警告] 台本兜底加载也失败: {e}")
+        return None
+
+
+# ==================== 世界观加载 ====================
+
+def _load_worldview(work_dir: Path, ctx: PipelineContext) -> dict | None:
+    """加载世界观/角色/场景设定"""
+    from engines.worldview_engine import load_worldview_from_dir
+
+    _log(f"\n[世界观] 搜索世界观文件: {work_dir.absolute()}")
+
+    try:
+        worldview = load_worldview_from_dir(work_dir)
+        if worldview:
+            wv_text = worldview.get('worldview', '')
+            chars = worldview.get('characters', {})
+            scene = worldview.get('scene', '')
+
+            _log(f"  ✓ 世界观设定: {'已加载' if wv_text else '无'} ({len(wv_text)} 字符)")
+            if chars:
+                _log(f"  ✓ 角色设定: {len(chars)} 个角色")
+                for name, info in list(chars.items())[:5]:
+                    _log(f"      {name}: {info}")
+                if len(chars) > 5:
+                    _log(f"      ... 还有 {len(chars) - 5} 个角色")
+            else:
+                _log(f"  ✓ 角色设定: 无")
+            _log(f"  ✓ 场景信息: {'已加载' if scene else '无'}")
+            return worldview
+        else:
+            _log("  → 未发现世界观文件")
+            return None
+    except Exception as e:
+        _log(f"  [警告] 世界观加载失败: {e}")
+        return None
+
+
+# ==================== 分词 + 文本分析 ====================
+
+def _analyze_texts(texts: list, ctx: PipelineContext) -> dict:
+    """对提取的全部文本进行分词和统计分析"""
+    from core.text_analysis import analyze_japanese_texts
+
+    _log(f"\n[分词] 分析 {len(texts)} 行文本...")
+    _log(f"  开始时间: {time.strftime('%H:%M:%S')}")
+
+    try:
+        analysis = analyze_japanese_texts(texts)
+
+        _log(f"  ✓ 日文行数: {analysis.get('japanese_lines', 0)}/{len(texts)}")
+        _log(f"  ✓ 总字符数: {analysis.get('total_chars', 0)}")
+        _log(f"  ✓ 唯一词汇: {analysis.get('unique_words', 0)} 个")
+        if analysis.get('top_words'):
+            top = analysis['top_words'][:10]
+            _log(f"  ✓ 高频词 (top 10): {', '.join(top)}")
+
+        _log(f"  完成时间: {time.strftime('%H:%M:%S')}")
+        return analysis
+    except Exception as e:
+        _log(f"  [警告] 分词分析失败: {e}")
+        return {}
+
+
+# ==================== 单文件翻译 ====================
+
+def translate_one_lrc(
+    lrc_path: Path,
+    ctx: PipelineContext,
+    *,
+    worldview: dict = None,
+    scriptbook_lines: list = None,
+    progress_callback: Callable = None,
+) -> bool:
+    """翻译单个 LRC 文件（解析 → 分块 → API → 写入）"""
+    from io_adapter.lrc_handler import parse_lrc_file, generate_single_language_lrc
+    from io_adapter.config_loader import load_terms_from_config
+    from core.text_segmentation import split_into_batches
+
+    abs_path = lrc_path.absolute()
+    file_dir = lrc_path.parent.absolute()
+
+    _log(f"\n{'─'*60}")
+    _log(f"📄 [翻译文件] {lrc_path.name}")
+    _log(f"   绝对路径: {abs_path}")
+    _log(f"   所在目录: {file_dir}")
+
+    # 步骤 1: 解析 LRC
+    _log(f"\n  ① 解析 LRC 时间轴...")
+    entries = parse_lrc_file(lrc_path)
+    if not entries:
+        _log(f"  ✗ 无时间戳条目，跳过")
+        return False
+
+    texts = [e.text for e in entries]
+    _log(f"     解析完成: {len(entries)} 条时间戳, {len(texts)} 行文本")
+    if texts:
+        _log(f"     文本预览(前3行):")
+        for i in range(min(3, len(texts))):
+            _log(f"       [{i+1:04d}] {texts[i][:60]}")
+
+    # 步骤 2: 中文检测
+    _log(f"\n  ② 中文含量检测...")
+    non_jp_count = 0
+    for t in texts:
+        has_kana = any('\u3040' <= c <= '\u30ff' for c in t)
+        if not has_kana and t.strip():
+            cjk_count = sum(1 for c in t if '\u4e00' <= c <= '\u9fff')
+            if cjk_count > 0 and cjk_count / max(len(t), 1) > 0.5:
+                non_jp_count += 1
+
+    if non_jp_count > len(texts) * 0.8:
+        _log(f"  ⚠ 已有中文内容（{non_jp_count}/{len(texts)} 行 ≥ 80%），跳过翻译")
+        ctx.stats['kept'] += 1
+        return False
+    _log(f"     中文行: {non_jp_count}/{len(texts)}，需要翻译")
+
+    # 步骤 3: 术语表
+    _log(f"\n  ③ 加载术语表...")
+    terms = load_terms_from_config(ctx.config)
+    if terms:
+        _log(f"     术语条目: {len(terms)} 条")
+        _log(f"     术语样例: {dict(list(terms.items())[:5])}")
+    else:
+        _log(f"     无术语表")
+
+    # 步骤 4: 世界观/台本参考状态
+    _log(f"\n  ④ 辅助上下文...")
+    _log(f"     世界观: {'已加载' if worldview else '未加载'}")
+    _log(f"     台本参考: {f'{len(scriptbook_lines)} 行' if scriptbook_lines else '无'}")
+
+    # 步骤 5: 分块
+    _log(f"\n  ⑤ 文本分块...")
+    numbered = [f"{i+1:04d}: {t}" for i, t in enumerate(texts)]
+    batches = split_into_batches(numbered)
+    _log(f"     {len(texts)} 行 → {len(batches)} 个批次")
+    for bi, batch in enumerate(batches):
+        first_idx = batch[0].split(':')[0]
+        last_idx = batch[-1].split(':')[0]
+        _log(f"       批次{bi+1}: 行{first_idx}~{last_idx} ({len(batch)}行)")
+
+    # 步骤 6: API 翻译
+    _log(f"\n  ⑥ 调用 LLM 翻译（JSON 输入/输出格式）...")
+    translated_texts = []
+
+    for bi, batch in enumerate(batches):
+        _log(f"\n      {'·'*45}")
+        _log(f"      [API #{bi+1}/{len(batches)}] 文件: {lrc_path.name}")
+        _log(f"        输入: {len(batch)} 行 → JSON {{\"ja\": [...]}} 格式")
+        _log(f"        时间: {time.strftime('%H:%M:%S')}")
+
+        call_start = time.time()
+        try:
+            result = ctx.translate_engine.translate_batch(
+                batch, terms=terms,
+                worldview=worldview,
+                scriptbook_lines=scriptbook_lines,
+                skip_hallucination_check=True,
+            )
+        except Exception as e:
+            _log(f"        ✗ API 异常: {e}")
+            # 回退：用原文填充
+            for line in batch:
+                if ': ' in line:
+                    translated_texts.append(line.split(': ', 1)[1])
+                else:
+                    translated_texts.append(line)
+            continue
+
+        call_elapsed = time.time() - call_start
+        translated_batch = result.get('translated_lines', [])
+
+        for t_line in translated_batch:
+            if not t_line:
+                translated_texts.append('')
+            elif isinstance(t_line, str) and ': ' in t_line:
+                translated_texts.append(t_line.split(': ', 1)[1])
+            else:
+                translated_texts.append(t_line)
+
+        hit = result.get('hit_tokens', 0)
+        miss = result.get('miss_tokens', 0)
+        completion = result.get('completion_tokens', 0)
+
+        _log(f"        响应: {len(translated_batch)} 行, 耗时 {call_elapsed:.1f}s")
+        _log(f"        Token: 缓存命中 {hit} + 未命中 {miss} + 输出 {completion}")
+        _log(f"        费用: ¥{result.get('cost', 0):.6f}")
+
+        ctx.stats['success_lines'] += len(translated_batch)
+        ctx.stats['total_lines'] += len(translated_batch)
+        ctx.stats['api_calls'] += 1
+        ctx.stats['total_cost'] += result.get('cost', 0)
+        ctx.stats['total_hit_tokens'] += hit
+        ctx.stats['total_miss_tokens'] += miss
+        ctx.stats['total_completion_tokens'] += completion
+
+    # 步骤 7: 补齐 + 写入
+    _log(f"\n  ⑦ 对齐检查 + 写入文件...")
+    shortage = 0
+    while len(translated_texts) < len(entries):
+        idx = len(translated_texts)
+        translated_texts.append(entries[idx].text)
+        shortage += 1
+    if shortage > 0:
+        _log(f"     ⚠ 翻译缺失 {shortage} 行，已用原文回退")
+    else:
+        _log(f"     ✓ 翻译行数匹配: {len(translated_texts)}/{len(entries)}")
+
+    output_text = generate_single_language_lrc(entries, translated_texts)
+    lrc_path.write_text(output_text, encoding='utf-8')
+
+    _log(f"     ✓ 已写入: {abs_path}")
+    _log(f"     ✓ 翻译完成: {len(translated_texts)} 行中文")
+    ctx.stats['translated'] += 1
+    return True
+
+
+# ==================== 主管道 ====================
+
+def run_pipeline(
+    root: Path,
+    *,
+    config_path: Path = None,
+    use_gpu: bool = False,
+    progress_callback: Callable = None,
+) -> dict:
+    """运行 LRC 字幕翻译管道完整流程"""
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    ctx = PipelineContext(config_path)
+    root_abs = root.absolute()
+
+    # ──── 启动信息 ────
+    _sep("🎬 字幕翻译管道启动")
+    _log(f"启动时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    _log(f"工作目录: {root_abs}")
+    _log(f"配置文件: {(config_path or Path('config.json')).absolute()}")
+    _log()
+
+    api_cfg = ctx.api_cfg
+    gen_params = api_cfg.get('generation_params', {})
+    _log("┌─ API 配置 ─────────────────────────────")
+    _log(f"│  模型:       {api_cfg.get('model', 'N/A')}")
+    _log(f"│  Base URL:   {api_cfg.get('base_url', 'N/A')}")
+    _log(f"│  Timeout:    {api_cfg.get('timeout', 'N/A')}s")
+    _log(f"│  temperature:{gen_params.get('temperature', 'N/A')}")
+    _log(f"│  top_p:      {gen_params.get('top_p', 'N/A')}")
+    _log(f"│  max_tokens: {gen_params.get('max_tokens', 'N/A')}")
+    _log("└──────────────────────────────────────────")
+    _log()
+
+    if not root.exists():
+        _log(f"❌ 错误: 工作目录不存在 - {root_abs}")
+        sys.exit(1)
+
+    # ──── 第 1 步: 扫描 ────
+    _sep("📂 第 1/5 步: 扫描字幕文件")
+    lrc_files, ja_lrc_files, archived = scan_lrc_files(root)
+    ctx.stats['archived'] = archived
+
+    _log(f"\n  扫描结果汇总:")
+    _log(f"    待翻译 .lrc: {len(lrc_files)} 个")
+    _log(f"    日文留档 .ja.lrc: {len(ja_lrc_files)} 个")
+    _log(f"    从留档恢复: {archived} 个")
+    _log()
+
+    if not lrc_files:
+        _log("未发现 .lrc 字幕文件，无需翻译。")
+        return ctx.stats
+
+    # ──── 第 2 步: 台本 ────
+    _sep("📖 第 2/5 步: 加载台本参考")
+    scriptbook_lines = _load_scriptbook(root, ctx)
+    if scriptbook_lines:
+        _log(f"  ✓ 台本加载成功: {len(scriptbook_lines)} 行\n")
+    else:
+        _log(f"  → 无台本参考（仅依赖 LLM 自有知识）\n")
+
+    # ──── 第 3 步: 世界观 ────
+    _sep("🌍 第 3/5 步: 加载世界观/角色/场景")
+    worldview = _load_worldview(root, ctx)
+    if worldview:
+        _log(f"  ✓ 世界观加载成功\n")
+    else:
+        _log(f"  → 无世界观设定\n")
+
+    # ──── 第 4 步: 分词 ────
+    _sep("🔤 第 4/5 步: 文本分词与统计分析")
+    all_texts = []
+    _log(f"  收集所有文件文本...")
+    for f in lrc_files:
+        try:
+            from io_adapter.lrc_handler import parse_lrc_file
+            entries = parse_lrc_file(f)
+            texts = [e.text for e in entries if e.text.strip()]
+            all_texts.extend(texts)
+            _log(f"    {f.name}: {len(texts)} 行")
+        except Exception:
+            pass
+
+    _log(f"\n  合计: {len(all_texts)} 行文本")
+    if all_texts:
+        _analyze_texts(all_texts, ctx)
+    else:
+        _log("  → 无有效文本行")
+    _log()
+
+    # ──── 第 5 步: 翻译 ────
+    _sep("🌐 第 5/5 步: 逐文件翻译")
+    _log(f"待处理文件: {len(lrc_files)} 个")
+    _log(f"JSON 格式: 输入 {{\"ja\": [...]}} → 输出 {{\"zh\": [...]}}\n")
+
+    for i, lrc_path in enumerate(lrc_files):
+        _log(f"\n{'#'*60}")
+        _log(f"# 📁 文件 [{i+1}/{len(lrc_files)}] {_progress(i+1, len(lrc_files))}")
+        _log(f"# {lrc_path.absolute()}")
+        _log(f"{'#'*60}")
+
+        try:
+            success = translate_one_lrc(
+                lrc_path, ctx,
+                worldview=worldview,
+                scriptbook_lines=scriptbook_lines,
+            )
+            if success:
+                _log(f"\n  ✅ 文件 [{i+1}/{len(lrc_files)}] 翻译成功: {lrc_path.name}")
+            else:
+                ctx.stats['skipped'] += 1
+                _log(f"\n  ⏭️ 文件 [{i+1}/{len(lrc_files)}] 跳过: {lrc_path.name}")
+
+            _log(f"  📊 累计: 已翻译 {ctx.stats['translated']} 个 | "
+                 f"跳过 {ctx.stats['skipped']} 个 | "
+                 f"API {ctx.stats['api_calls']} 次 | "
+                 f"耗时 {ctx.elapsed:.0f}s")
+
+        except Exception as e:
+            _log(f"\n  ❌ 文件 [{i+1}/{len(lrc_files)}] 错误: {lrc_path.name}")
+            _log(f"  异常: {e}")
+            import traceback
+            _log(f"  堆栈:\n{traceback.format_exc()}")
+            ctx.stats['skipped'] += 1
+
+    # ──── 最终报告 ────
+    _sep("📊 处理完成")
+    _log(f"完成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    _log()
+
+    _log("┌─ 文件统计 ─────────────────────────────")
+    _log(f"│  日文留档 (.ja.lrc):     {ctx.stats['archived']:>4} 个")
+    _log(f"│  翻译中文 (.lrc):        {ctx.stats['translated']:>4} 个")
+    _log(f"│  跳过:                   {ctx.stats['skipped']:>4} 个")
+    _log(f"│  保留(已中文):           {ctx.stats['kept']:>4} 个")
+    _log(f"│  总计:                   {len(lrc_files):>4} 个")
+    _log("└──────────────────────────────────────────")
+    _log()
+
+    _log("┌─ 翻译统计 ─────────────────────────────")
+    _log(f"│  翻译行数:               {ctx.stats['success_lines']:>6}")
+    _log(f"│  API 调用次数:           {ctx.stats['api_calls']:>6}")
+    _log("└──────────────────────────────────────────")
+    _log()
+
+    elapsed = ctx.elapsed
+    _log(f"  总耗时: {elapsed:.1f} 秒 ({elapsed/60:.1f} 分钟)")
+    if ctx.stats['translated'] > 0:
+        _log(f"  平均每文件: {elapsed/ctx.stats['translated']:.1f} 秒")
+    _log()
+
+    # 费用
+    pricing = ctx.pricing
+    hit_per_1m = pricing.get('hit_per_1m', 0)
+    miss_per_1m = pricing.get('miss_per_1m', 0)
+    completion_per_1m = pricing.get('completion_per_1m', 0)
+
+    hit_tokens = ctx.stats['total_hit_tokens']
+    miss_tokens = ctx.stats['total_miss_tokens']
+    completion_tokens = ctx.stats['total_completion_tokens']
+
+    cost_hit = (hit_tokens / 1_000_000) * hit_per_1m
+    cost_miss = (miss_tokens / 1_000_000) * miss_per_1m
+    cost_completion = (completion_tokens / 1_000_000) * completion_per_1m
+    cost_total = cost_hit + cost_miss + cost_completion
+
+    _sep("💰 API 费用明细")
+    _log(f"  缓存命中:   {hit_tokens:>10,} tokens × ¥{hit_per_1m}/百万 = ¥{cost_hit:.4f}")
+    _log(f"  缓存未命中: {miss_tokens:>10,} tokens × ¥{miss_per_1m}/百万 = ¥{cost_miss:.4f}")
+    _log(f"  输出tokens:  {completion_tokens:>10,} tokens × ¥{completion_per_1m}/百万 = ¥{cost_completion:.4f}")
+    _log(f"  {'─'*55}")
+    _log(f"  总费用:                               ¥{cost_total:.4f}")
+    _sep()
+    _log()
+    _log("📝 文件说明:")
+    _log("  .lrc     = 翻译后的中文歌词（播放器读取）")
+    _log("  .ja.lrc  = 日文原版留档（同目录）")
+    _log()
+
+    return ctx.stats
+
+
+# ==================== 命令行入口 ====================
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description='LRC 字幕翻译管道')
+    parser.add_argument('root', nargs='?', default='.', help='工作目录')
+    parser.add_argument('--config', help='配置文件路径')
+
+    args = parser.parse_args()
+
+    run_pipeline(
+        Path(args.root),
+        config_path=Path(args.config) if args.config else None,
+    )
+
+
+if __name__ == '__main__':
+    main()

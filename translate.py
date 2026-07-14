@@ -1310,7 +1310,7 @@ def build_scriptbook_prompt(scriptbook_lines: list[str], scriptbook_parsed: list
     if SCRIPTBOOK_MODE == "full":
         # 【新 full mode】在一个请求中发送所有原始台本 + 所有 ASR
         if TRANSLATION_MODE == "all_at_once":
-            from scriptbook_utils import clean_script_for_translation
+            from utils.text_filter import clean_script_for_translation
             scriptbook_text = "\n".join(scriptbook_lines)
             cleaned_text = clean_script_for_translation(scriptbook_text)
             cleaned_lines = [line.strip() for line in cleaned_text.split('\n') if line.strip()]
@@ -1334,7 +1334,7 @@ def build_scriptbook_prompt(scriptbook_lines: list[str], scriptbook_parsed: list
         
         # 【优化】使用clean_script_for_translation过滤非台词内容
         # 全量模式下只发送清洗后的台词，排除场景描述、动作说明、心理描写等噪音
-        from scriptbook_utils import clean_script_for_translation
+        from utils.text_filter import clean_script_for_translation
         
         # 将台本行合并为文本，进行清洗
         scriptbook_text = "\n".join(scriptbook_lines)
@@ -2316,7 +2316,7 @@ def build_track_scriptbook_map(work_dir: Path, llm_client=None, model: str = Non
                 # TXT文件：读取并清洗
                 with open(sb_path, 'r', encoding='utf-8') as f:
                     raw_content = f.read()
-                from scriptbook_utils import clean_script_for_translation
+                from utils.text_filter import clean_script_for_translation
                 content = clean_script_for_translation(raw_content)
                 file_extract_method = "txt"
         except Exception as e:
@@ -2395,7 +2395,7 @@ def build_track_scriptbook_map(work_dir: Path, llm_client=None, model: str = Non
         for tnum in sorted(track_sections.keys()):
             tlines = track_sections[tnum]
             # 清洗该音轨的内容
-            from scriptbook_utils import clean_script_for_translation
+            from utils.text_filter import clean_script_for_translation
             track_content = '\n'.join(tlines)
             # 【修复】按音轨分别清洗时，不跳过开头设定（因为音轨已划分好）
             track_cleaned = clean_script_for_translation(track_content, skip_intro=False)
@@ -2481,7 +2481,8 @@ def build_raw_scriptbook_map(work_dir: Path, preloaded_contents: dict[Path, str]
         - 台本文件路径映射: {音轨编号: 台本文件绝对路径}
         - 提取方式映射: {音轨编号: 提取方式} "txt" | "pdf" | "ocr"
     """
-    from scriptbook_utils import split_scriptbook_by_tracks, clean_script_for_translation
+    from scriptbook_utils import split_scriptbook_by_tracks
+    from utils.text_filter import clean_script_for_translation
     
     track_map = {}
     track_file_map = {}
@@ -2576,14 +2577,12 @@ def build_raw_scriptbook_map(work_dir: Path, preloaded_contents: dict[Path, str]
                 track_map[target_track].extend(cleaned_lines)
                 track_file_map[target_track] = abs_path
                 track_extraction_method[target_track] = file_extract_method
-                print(f"    [清洗后台本] 音轨00 → 合并到音轨{target_track:02d} ({len(cleaned_lines)}行)")
             else:
                 if tnum not in track_map:
                     track_map[tnum] = []
                 track_map[tnum].extend(cleaned_lines)
                 track_file_map[tnum] = abs_path
                 track_extraction_method[tnum] = file_extract_method
-                print(f"    [清洗后台本] 音轨{tnum:02d} ({len(cleaned_lines)}行)")
     
     return track_map, track_file_map, track_extraction_method
 

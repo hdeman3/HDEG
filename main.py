@@ -34,31 +34,35 @@ try:
     from datetime import datetime as _dt
     _log_file = _log_dir / f'run_{_dt.now().strftime("%Y-%m-%d_%H-%M-%S")}.log'
 
+    # 打开日志文件句柄，atexit 确保退出时关闭
+    _log_fh = open(_log_file, 'wb', buffering=0)
+
     class _TeeWriter:
-        """同时写入原始 stdout 和日志文件"""
-        def __init__(self, original, log_path):
+        """同时写入原始 stdout 和日志文件（二进制层）"""
+        def __init__(self, original, log_fh):
             self.original = original
-            self.log = open(log_path, 'wb', buffering=0)  # 二进制模式，无缓冲
+            self.log = log_fh
         def write(self, data):
-            self.original.write(data)
-            self.log.write(data)
+            try: self.original.write(data)
+            except: pass
+            try: self.log.write(data)
+            except: pass
         def flush(self):
-            self.original.flush()
-            self.log.flush()
+            try: self.original.flush()
+            except: pass
+            try: self.log.flush()
+            except: pass
         def readable(self): return False
         def writable(self): return True
         def seekable(self): return False
         @property
-        def closed(self): return self.log.closed
+        def closed(self): return getattr(self.original, 'closed', False)
         def fileno(self):
             if hasattr(self.original, 'fileno'):
                 return self.original.fileno()
             raise OSError('fileno not available')
-        def close(self):
-            self.log.flush()
-            self.log.close()
 
-    _tee = _TeeWriter(sys.stdout.buffer, _log_file)
+    _tee = _TeeWriter(sys.stdout.buffer, _log_fh)
     sys.stdout = io.TextIOWrapper(_tee, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(_tee, encoding='utf-8')
 

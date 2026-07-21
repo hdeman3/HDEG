@@ -35,7 +35,7 @@ def find_scriptbooks_in_dir(
 
     candidates: list[Path] = []
 
-    # 优先检查「台本」子文件夹
+    # 优先检查「台本」子文件夹（精确匹配 + 包含匹配，如 05.台本）
     for scriptbook_dir_name in ('台本', 'だいほん', 'script', 'scripts', 'scenario', 'scenarios'):
         sb_dir = work_dir / scriptbook_dir_name
         if sb_dir.is_dir():
@@ -44,8 +44,21 @@ def find_scriptbooks_in_dir(
                     if _is_scriptbook_file(f):
                         candidates.append(f)
             if candidates:
-                # 按文件名中的数字排序
                 return _sort_scriptbook_files(candidates)
+
+    # 回退：检查名称中包含「台本」的子目录（如 05.台本）
+    if not candidates:
+        try:
+            for entry in sorted(work_dir.iterdir()):
+                if entry.is_dir() and '台本' in entry.name:
+                    for ext in SCRIPTBOOK_EXTS:
+                        for f in sorted(entry.glob(f'*{ext}')):
+                            if _is_scriptbook_file(f):
+                                candidates.append(f)
+                    if candidates:
+                        return _sort_scriptbook_files(candidates)
+        except Exception:
+            pass
 
     # 回退：递归扫描根目录
     for ext in SCRIPTBOOK_EXTS:
@@ -116,26 +129,10 @@ def _is_scriptbook_file(file_path: Path) -> bool:
     for exclusion in ('_cleaned', '_processed', '_export', '_scriptbook_export'):
         if exclusion in stem:
             return False
-
-    # 排除特殊用途文件
+    # 排除特殊用途文件（直接子串匹配，不做 CJK 边界检查）
     for keyword in NON_SCRIPTBOOK_KEYWORDS:
-        keyword_lower = keyword.lower()
-        if keyword_lower in filename_lower:
-            idx = filename_lower.find(keyword_lower)
-            if idx >= 0:
-                before = filename_lower[idx - 1] if idx > 0 else ''
-                after = (
-                    filename_lower[idx + len(keyword_lower):]
-                    if idx + len(keyword_lower) < len(filename_lower)
-                    else ''
-                )
-                if before and re.match(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', before):
-                    if not keyword_lower.startswith(before):
-                        continue
-                if after and re.match(r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', after):
-                    if not keyword_lower.endswith(after[:1]):
-                        continue
-                return False
+        if keyword.lower() in filename_lower:
+            return False
 
     # 台本关键词
     for keyword in SCRIPTBOOK_KEYWORDS:
@@ -160,6 +157,14 @@ def _is_scriptbook_file(file_path: Path) -> bool:
         if re.match(r'^[０-９0-9]+[-_][０-９0-9]+', stem):
             return True
 
+    # 父目录名包含「台本」（如 05.台本）→ 目录内所有 txt/pdf 都视为台本
+    if '台本' in file_path.parent.name:
+        return True
+
+    # 文件名以数字编号开头（如 01_xxx, 02_xxx）→ 很可能是台本音轨文件
+    if re.match(r'^[０-９0-9]{2,3}[_\-．. ]', stem):
+        return True
+
     return False
 
 
@@ -175,16 +180,22 @@ def load_scriptbook_content(file_path: Path) -> Optional[str]:
 
     支持 .txt 和 .pdf 格式。
     PDF 使用 PyMuPDF 或 PaddleOCR 提取。
+    TXT 尝试多种编码（UTF-8, Shift-JIS, CP932, EUC-JP）。
 
     返回: 文本内容，失败返回 None
     """
     if file_path.suffix.lower() == '.pdf':
         return _load_pdf_scriptbook(file_path)
     else:
-        try:
-            return file_path.read_text(encoding='utf-8')
-        except Exception:
-            return None
+        # 尝试多种编码，日文 Windows 上常见 Shift-JIS
+        for encoding in ('utf-8', 'shift-jis', 'cp932', 'euc-jp', 'iso-2022-jp'):
+            try:
+                text = file_path.read_text(encoding=encoding)
+                if text.strip():
+                    return text
+            except Exception:
+                continue
+        return None
 
 
 def _load_pdf_scriptbook(file_path: Path) -> Optional[str]:
@@ -232,58 +243,41 @@ def _extract_with_pymupdf(file_path: Path) -> Optional[str]:
         with fitz.open(file_path) as doc:
             total_pages = len(doc)
             for page_num, page in enumerate(doc, 1):
-                blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE).get("blocks", [])
-                if not blocks:
+                # 先用 plain text 获取正确阅读顺序的文本
+                plain_text = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+                if not plain_text or not plain_text.strip():
                     continue
 
-                all_spans: list[tuple[float, float, str, float, float]] = []
+                # 乱码检测：用 dict 模式取少量 spans 做采样
+                blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE).get("blocks", [])
+                sample_spans: list[str] = []
                 for block in blocks:
                     if block.get('type') != 0:
                         continue
                     for line in block.get('lines', []):
                         for span in line.get('spans', []):
-                            text = span.get('text', '')
-                            if text.strip():
-                                bbox = span.get('bbox', [0, 0, 0, 0])
-                                cx = (bbox[0] + bbox[2]) / 2
-                                cy = (bbox[1] + bbox[3]) / 2
-                                all_spans.append((cx, cy, text, bbox[0], bbox[1]))
+                            t = span.get('text', '')
+                            if t.strip():
+                                sample_spans.append(t)
+                            if len(sample_spans) >= 50:
+                                break
+                        if len(sample_spans) >= 50:
+                            break
+                    if len(sample_spans) >= 50:
+                        break
 
-                if not all_spans:
-                    continue
-
-                # 乱码检测
-                raw_sample = ''.join(s[2] for s in all_spans[:50])
-                if _is_garbled_text(raw_sample):
+                if sample_spans and _is_garbled_text(''.join(sample_spans)):
                     garbled_pages += 1
                     continue
 
-                # 布局分析
-                tolerance = max(
-                    sum(abs(s[4] - s[1]) for s in all_spans) / len(all_spans) * 0.8,
-                    10
-                ) if all_spans else 16
-
-                # 竖排检测
-                x_groups: dict[int, list] = {}
-                x_tolerance = 10
-                for cx, cy, text, x0, y0 in all_spans:
-                    x_key = round(cx / x_tolerance)
-                    x_groups.setdefault(x_key, []).append((cx, cy, text, x0, y0))
-                max_x_group_size = max(len(g) for g in x_groups.values()) if x_groups else 0
-                is_vertical = max_x_group_size > 3
-
-                if is_vertical:
-                    page_text = _sort_vertical_spans(all_spans, tolerance)
-                else:
-                    page_text = _sort_horizontal_spans(all_spans, tolerance)
-
-                text_blocks.append(page_text)
+                text_blocks.append(plain_text.strip())
 
         if total_pages > 0 and garbled_pages / total_pages > 0.5:
             return None
 
         result = '\n\n'.join(text_blocks)
+        # 检测并修复"逐字分行"的竖排PDF：每行只有一个有效字符时自动拼接
+        result = _fix_single_char_lines(result)
         from utils.text_filter import _filter_page_numbers
         return _filter_page_numbers(result)
 
@@ -347,6 +341,59 @@ def _sort_vertical_spans(
 
     columns.sort(key=lambda c: -c[0])
     return '\n'.join(c[1] for c in columns)
+
+
+def _fix_single_char_lines(text: str) -> str:
+    """修复竖排 PDF 的逐字分行问题。
+
+    PyMuPDF 提取竖排日文 PDF 时，每个字符可能独占一行。
+    检测并拼接这种模式：如果大部分非空行只有一个 CJK 字符，
+    则将所有单字符行按顺序拼接，用空行保留段落边界。
+    """
+    import re
+    lines = text.split('\n')
+    if len(lines) < 20:
+        return text
+
+    # 统计单 CJK 字符行的比例
+    cjk_single = 0
+    empty = 0
+    multi = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            empty += 1
+        elif re.fullmatch(r'[　-〿぀-ヿ一-鿿㐀-䶿豈-﫿＀-￯ -⁯ -/:-@[-`{-~　-〃〈-】〔-〟・！-／：-＠［-｀｛-～\w]', stripped):
+            cjk_single += 1
+        else:
+            multi += 1
+
+    total = cjk_single + multi
+    if total == 0 or cjk_single / total < 0.6:
+        return text  # 不是逐字分行模式
+
+    # 拼接：连续的单字符行合并，空行保留为段落分隔
+    result: list[str] = []
+    buf: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if buf:
+                result.append(''.join(buf))
+                buf = []
+            if result and result[-1] != '':
+                result.append('')
+        elif re.fullmatch(r'[　-〿぀-ヿ一-鿿㐀-䶿豈-﫿＀-￯ -⁯ -/:-@[-`{-~　-〃〈-】〔-〟・！-／：-＠［-｀｛-～\w]', stripped):
+            buf.append(stripped)
+        else:
+            if buf:
+                result.append(''.join(buf))
+                buf = []
+            result.append(stripped)
+    if buf:
+        result.append(''.join(buf))
+
+    return '\n'.join(result)
 
 
 def _is_garbled_text(text: str) -> bool:

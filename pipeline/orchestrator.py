@@ -100,8 +100,13 @@ class PipelineContext:
         if self._translate_engine is None:
             api_config = get_api_config(self.config)
             prompt_file = self.config.get('prompts', {}).get('system_prompt_file', '')
+            # verbose 由 config["app"]["debug"] 控制，默认关闭调试输出
+            debug_mode = self.config.get('app', {}).get('debug', False)
             self._translate_engine = create_translate_engine(
-                api_config, system_prompt_file=prompt_file if prompt_file else None)
+                api_config,
+                system_prompt_file=prompt_file if prompt_file else None,
+                verbose=debug_mode,
+            )
         return self._translate_engine
 
     def update_stats(self, **kwargs):
@@ -229,10 +234,12 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext) -> list[str] | None:
         cleaned_lines = [l for l in cleaned_text.split('\n') if l.strip()]
         _log(f"  → 合并台本: {len(all_lines)} 行 → 清洗后: {len(cleaned_lines)} 行")
 
-        # 导出台本（供调试）
+        # 导出台本（与源台本同目录）
         export_scriptbook = ctx.config.get('app', {}).get('export_scriptbook_content', False)
         if export_scriptbook:
-            export_path = work_dir / '_scriptbook_export.txt'
+            # 导出到第一个台本文件所在目录
+            export_dir = scriptbook_files[0].parent
+            export_path = export_dir / '_scriptbook_export.txt'
             try:
                 export_path.write_text(cleaned_text, encoding='utf-8')
                 _log(f"  → 导出清洗后台本: {export_path.absolute()}")
@@ -250,8 +257,15 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext) -> list[str] | None:
     scriptbook_path = None
     for cand in candidates:
         try:
-            content = cand.read_text(encoding='utf-8')[:500]
-            if '|' in content and any(
+            # 尝试多种编码读取文件头部
+            content = None
+            for enc in ('utf-8', 'shift-jis', 'cp932'):
+                try:
+                    content = cand.read_text(encoding=enc)[:500]
+                    break
+                except Exception:
+                    continue
+            if content and '|' in content and any(
                 k in content for k in ('日本語', '中文', 'セリフ', '台词', '原文', '译文')
             ):
                 scriptbook_path = cand
@@ -273,11 +287,12 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext) -> list[str] | None:
     except Exception as e:
         _log(f"  [警告] 台本加载失败: {e}")
 
-    # 兜底：直接按行读取
+    # 兜底：直接按行读取（load_scriptbook_content 已支持多编码，这里作为最后保险）
     try:
+        text = load_scriptbook_content(scriptbook_path)
         lines = [
             line.strip()
-            for line in scriptbook_path.read_text(encoding='utf-8').split('\n')
+            for line in (text or '').split('\n')
             if line.strip()
         ]
         _log(f"  → 兜底加载台本: {len(lines)} 行")
@@ -293,24 +308,25 @@ def _load_worldview(work_dir: Path, ctx: PipelineContext) -> dict | None:
     """加载世界观/角色/场景设定
 
     返回:
-        世界观字典 {worldview, characters, scene} 或 None
+        世界观字典 {worldview, characters, scene, _source} 或 None
     """
     from engines.worldview_engine import load_worldview_from_dir
 
-    _log(f"\n[世界观] 搜索世界观文件: {work_dir.absolute()}")
+    _log(f"\n[世界观] 搜索目录: {work_dir.absolute()}")
 
     try:
-        worldview = load_worldview_from_dir(work_dir)
-        if worldview:
+        worldview, source_files = load_worldview_from_dir(work_dir)
+        if worldview and source_files:
             wv_text = worldview.get('worldview', '')
             chars = worldview.get('characters', {})
             scene = worldview.get('scene', '')
 
-            _log(f"  → 世界观设定: {'有' if wv_text else '无'} ({len(wv_text)} 字符)")
-            _log(f"  → 角色设定: {len(chars)} 个 ({', '.join(list(chars.keys())[:5])}...)" if chars else "  → 角色设定: 无")
-            _log(f"  → 场景信息: {'有' if scene else '无'}")
+            worldview['_source'] = source_files
+            _log(f"  → 来源: {', '.join(str(p) for p in source_files)}")
+            _log(f"  → 世界观: {'有' if wv_text else '无'} ({len(wv_text)} 字符)")
+            _log(f"  → 角色: {len(chars)} 个")
+            _log(f"  → 场景: {'有' if scene else '无'}")
 
-            # 将世界观信息注入系统 prompt（后续翻译时使用）
             return worldview
         else:
             _log("  → 未发现世界观文件")
@@ -372,9 +388,10 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
         terms = load_terms_from_file(terms_path)
         alias_list = load_alias(work_dir)
         worldview = load_worldview(work_dir)
-        _log(f"  加载已有术语表: {len(terms)} 个")
-        _log(f"  加载已有 alias 表: {len(alias_list)} 个")
-        _log(f"  加载已有世界观: {worldview.get('worldview', '')[:50]}...")
+        _log(f"  加载已有术语表: {len(terms)} 个 ({terms_path.absolute()})")
+        _log(f"  加载已有 alias 表: {len(alias_list)} 个 ({alias_path.absolute()})")
+        _log(f"  加载已有世界观: {worldview_path.absolute()}")
+        _log(f"    内容预览: {str(worldview.get('worldview', ''))[:80]}...")
         return terms, alias_list, worldview
 
     # 检测是否为 freetalk 或热门CV
@@ -570,7 +587,9 @@ def translate_one_lrc(
     if worldview:
         chars = worldview.get('characters', {})
         char_count = len(chars) if isinstance(chars, (dict, list)) else 0
-        _log(f"\n[世界观] 已加载（角色: {char_count} 个, 场景: {'有' if worldview.get('scene') else '无'}）")
+        source = worldview.get('_source', [])
+        src_str = '\n  → 来源: ' + ', '.join(str(p) for p in source) if source else ''
+        _log(f"\n[世界观] 已加载（角色: {char_count} 个, 场景: {'有' if worldview.get('scene') else '无'}）{src_str}")
     else:
         _log(f"\n[世界观] 未加载")
 
@@ -608,8 +627,21 @@ def translate_one_lrc(
         translated_texts.append(t_line)
 
     _log(f"  ← 响应: {len(translated_batch)} 行, 耗时 {call_elapsed:.1f}s")
-    _log(f"  ← Token: 命中{result.get('hit_tokens',0)} + 未命中{result.get('miss_tokens',0)} + 输出{result.get('completion_tokens',0)}")
-    _log(f"  ← 费用: ¥{result.get('cost', 0):.4f}")
+    hit = result.get('hit_tokens', 0)
+    miss = result.get('miss_tokens', 0)
+    comp = result.get('completion_tokens', 0)
+    total_tok = hit + miss + comp
+    hit_rate = (hit / (hit + miss) * 100) if (hit + miss) > 0 else 0
+    cost = result.get('cost', 0)
+    _log(f"  📊 Token: 总计{total_tok:,}  🟢命中{hit:,}({hit_rate:.0f}%)  🔵未命中{miss:,}  🟣输出{comp:,}")
+    # 费用明细使用实际定价
+    ph = ctx.pricing.get('hit_per_1m', 0)
+    pm = ctx.pricing.get('miss_per_1m', 0)
+    pc = ctx.pricing.get('completion_per_1m', 0)
+    ch = hit / 1_000_000 * ph
+    cm = miss / 1_000_000 * pm
+    cc = comp / 1_000_000 * pc
+    _log(f"  💰 费用: ¥{cost:.4f}  (🟢命中¥{ch:.4f} + 🔵未命中¥{cm:.4f} + 🟣输出¥{cc:.4f})")
 
     ctx.stats['success_lines'] += len(translated_batch)
     ctx.stats['total_lines'] += len(translated_batch)
@@ -647,6 +679,249 @@ def translate_one_lrc(
     _log(f"  -> 翻译完成: {len(translated_texts)} 行中文")
     ctx.stats['translated'] += 1
     return True
+
+
+# ==================== 语音转录 ====================
+
+def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext) -> None:
+    """检测音频文件，自动调用 infer.exe 转录生成 .ja.lrc
+
+    参照 翻译_debug.bat 的流程：
+    1. 恢复 .ja.lrc -> .lrc（如果 .lrc 缺失）
+    2. 检测未转录的音频
+    3. 调用 infer.exe 转录
+    4. 将生成的 .lrc 留档为 .ja.lrc
+    """
+    import os
+    import subprocess
+
+    tc = ctx.config.get('transcription', {})
+    infer_exe = tc.get('infer_exe', '')
+    model_dir = tc.get('model_dir', '')
+    device = tc.get('device', 'cuda')
+    compute_type = tc.get('compute_type', 'int8_float16')
+
+    if not infer_exe:
+        _log("[转录] 未配置 infer.exe，跳过转录步骤")
+        return
+
+    # 解析相对路径（从 HDEG 根目录，不是作品目录）
+    import sys
+    if getattr(sys, 'frozen', False):
+        hdeg_root = Path(sys.executable).parent
+    else:
+        hdeg_root = Path(__file__).parent.parent  # pipeline/ -> HDEG/
+    exe_path = Path(infer_exe)
+    if not exe_path.is_absolute():
+        exe_path = hdeg_root / exe_path
+    if not exe_path.exists():
+        _log(f"[转录] infer.exe 不存在: {exe_path}，跳过转录步骤")
+        return
+
+    # 检测 RTX 50 系列 GPU，自动切换 compute_type 为 float16
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=10
+        )
+        import re
+        if re.search(r'RTX\s*50\d\d', result.stdout):
+            compute_type = 'float16'
+            _log(f"[转录] 检测到 RTX 50 系列 GPU，自动切换 compute_type 为 float16")
+    except Exception:
+        pass
+
+    _sep("第 0 步: 语音转录 (infer.exe)")
+    _log(f"[转录] 引擎: {exe_path}")
+    _log(f"[转录] 设备: {device}  精度: {compute_type}")
+
+    audio_exts = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.wma',
+                  '.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'}
+
+    pending: list[Path] = []
+    restored = 0
+
+    # ── 步骤 0a: 恢复 .ja.lrc → .lrc（如果 .lrc 缺失），同时收集待转录音频 ──
+    for f in sorted(work_dir.rglob('*')):
+        if not f.is_file():
+            continue
+        suffix = f.suffix.lower()
+
+        # 恢复日文留档
+        if suffix == '.ja.lrc' or (suffix == '.lrc' and f.stem.endswith('.ja')):
+            base_name = f.stem
+            if base_name.endswith('.ja'):
+                base_name = base_name[:-3]
+            lrc_path = f.parent / f'{base_name}.lrc'
+            if not lrc_path.exists():
+                try:
+                    shutil.copy2(str(f), str(lrc_path))
+                    restored += 1
+                except Exception:
+                    pass
+            continue
+
+        # 收集未转录的音频
+        if suffix not in audio_exts:
+            continue
+        ja_path = f.parent / f'{f.stem}.ja.lrc'
+        if ja_path.exists():
+            continue
+        pending.append(f)
+
+    if restored:
+        _log(f"[转录] 恢复 .ja.lrc -> .lrc: {restored} 个")
+
+    if not pending:
+        _log("[转录] 所有音频已有 .ja.lrc，无需转录")
+        return
+
+    _log(f"[转录] 待转录音频: {len(pending)} 个")
+    for p in pending[:10]:
+        _log(f"  → {p.relative_to(work_dir)}")
+    if len(pending) > 10:
+        _log(f"  → ... 还有 {len(pending) - 10} 个")
+
+    # ── 步骤 0b: 执行 infer.exe 转录（直接调用，避免 bat 中文路径问题）──
+    audio_suffixes = tc.get('audio_suffixes', 'mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv')
+    sub_formats = tc.get('sub_formats', 'lrc')
+
+    if not pending:
+        _log("[转录] 所有音频已有 .ja.lrc，无需转录")
+        return
+
+    _log(f"[转录] 待转录: {len(pending)} 个音频")
+    _log(f"[转录] 开始调用 infer.exe，这可能需要较长时间...")
+    _log()
+
+    env = os.environ.copy()
+    if model_dir:
+        env['MODEL_DIR'] = model_dir
+
+    cmd = [
+        str(exe_path),
+        f'--audio_suffixes={audio_suffixes}',
+        f'--sub_formats={sub_formats}',
+        f'--device={device}',
+        f'--task=transcribe',
+        f'--compute_type={compute_type}',
+        str(work_dir),
+    ]
+
+    _log(f"[转录] {' '.join(cmd)}")
+    _log()
+
+    import threading
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(exe_path.parent),
+            env=env,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+        )
+
+        # 超时监控：infer.exe 超过 10 分钟无输出则判定卡死
+        last_output = [time.time()]
+        output_lock = threading.Lock()
+
+        def kill_if_stuck():
+            while proc.poll() is None:
+                time.sleep(30)
+                with output_lock:
+                    elapsed = time.time() - last_output[0]
+                if elapsed > 600:  # 10 分钟无输出
+                    _log(f"[转录] infer.exe 超过 {int(elapsed)}s 无输出，判定卡死，强制终止")
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return
+
+        watchdog = threading.Thread(target=kill_if_stuck, daemon=True)
+        watchdog.start()
+
+        for line in proc.stdout:
+            line = line.rstrip('\n\r')
+            if line.strip():
+                _log(f"[infer] {line}")
+                with output_lock:
+                    last_output[0] = time.time()
+
+        proc.wait()
+
+        if proc.returncode != 0:
+            _log(f"[转录] infer.exe 退出码: {proc.returncode}")
+            if proc.returncode == -9:
+                _log(f"[转录] infer.exe 因卡死被强制终止，跳过转录")
+            return
+    except FileNotFoundError:
+        _log(f"[转录] 找不到 infer.exe: {exe_path}")
+        return
+    except Exception as e:
+        _log(f"[转录] 异常: {e}")
+        return
+
+    # ── 步骤 0c: 生成的 .lrc 留档为 .ja.lrc ──
+    _log()
+    _log("[转录] 转录完成，生成 .ja.lrc 留档...")
+    archived = 0
+    for f in pending:
+        lrc_path = f.parent / f'{f.stem}.lrc'
+        ja_path = f.parent / f'{f.stem}.ja.lrc'
+        if lrc_path.exists() and not ja_path.exists():
+            try:
+                shutil.copy2(str(lrc_path), str(ja_path))
+                archived += 1
+            except Exception:
+                pass
+
+    _log(f"[转录] 留档: {archived} 个，恢复: {restored} 个")
+    ctx.stats['archived'] = ctx.stats.get('archived', 0) + archived + restored
+
+
+# ==================== 余额查询 ====================
+
+def _fetch_balance(ctx: PipelineContext) -> None:
+    """翻译完成后查询 DeepSeek 账户余额"""
+    import json
+    import urllib.request
+
+    api_key = ctx.api_cfg.get('key', '')
+    base_url = ctx.api_cfg.get('base_url', 'https://api.deepseek.com')
+
+    if not api_key:
+        _log("[余额] 未配置 API Key，跳过余额查询")
+        return
+
+    # 去掉 base_url 的协议前缀和尾部斜杠
+    host = base_url.replace('https://', '').replace('http://', '').rstrip('/')
+    url = f'https://{host}/user/balance'
+
+    try:
+        req = urllib.request.Request(url)
+        req.add_header('Accept', 'application/json')
+        req.add_header('Authorization', f'Bearer {api_key}')
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode('utf-8'))
+
+        if data.get('is_available') and data.get('balance_infos'):
+            _log("💰 账户余额:")
+            for info in data['balance_infos']:
+                currency = info.get('currency', 'CNY')
+                total = info.get('total_balance', '0')
+                topped_up = info.get('topped_up_balance', '0')
+                granted = info.get('granted_balance', '0')
+                _log(f"   总余额:      {total} {currency}")
+                _log(f"   充值余额:    {topped_up} {currency}")
+                _log(f"   赠金余额:    {granted} {currency}")
+        else:
+            _log(f"[余额] 查询失败: {data}")
+    except Exception as e:
+        _log(f"[余额] 查询异常: {e}")
 
 
 # ==================== 主管道 ====================
@@ -699,6 +974,10 @@ def run_pipeline(
         _log(f"❌ 错误: 工作目录不存在 - {root_abs}")
         sys.exit(1)
 
+    # ──── 第 0 步: 语音转录（infer.exe）──
+    _run_transcription_if_needed(root, ctx)
+    _log()
+
     # ──── 第 1 步: 扫描字幕文件 ────
     _sep("第 1 步: 扫描字幕文件")
     lrc_files, ja_lrc_files, archived, file_groups = scan_subtitle_files(root)
@@ -709,14 +988,13 @@ def run_pipeline(
         _log("未发现字幕文件，无需翻译")
         return ctx.stats
 
-    # ──── 第 2 步: 加载台本 ────
+    # ──── 第 2 步: 加载台本（按 RJ 目录，避免跨作品污染）──
     _sep("第 2 步: 加载台本参考")
-    scriptbook_lines = _load_scriptbook(root, ctx)
+    # 延迟到第 4.5 步按目录加载，此处仅占位
     _log()
 
-    # ──── 第 3 步: 加载世界观（尝试从已有文件） ────
-    _sep("第 3 步: 加载世界观/角色/场景")
-    worldview = _load_worldview(root, ctx)
+    # ──── 第 3 步: 世界观延迟到第 4.5 步按目录加载（避免跨作品污染）──
+    _sep("第 3 步: 加载世界观/角色/场景（按 RJ 目录）")
     _log()
 
     # ──── 第 4 步: 分词 + 文本分析 ────
@@ -739,10 +1017,12 @@ def run_pipeline(
     # ──── 第 4.5 步: 自动分析语料（术语/世界观） ────
     _sep("第 4.5 步: 自动分析语料 — 术语提取 & 世界观生成")
 
-    # 按 RJ 根目录归组分析（同一 RJ 号的子目录共享术语/世界观）
+    # 按 RJ 根目录归组分析（同一 RJ 号的子目录共享术语/世界观/台本）
     from io_adapter.file_scanner import find_rj_work_root
-    work_terms: dict = {}
-    work_alias: list = []
+    work_terms: dict = {}        # group_key -> {jp: zh}
+    work_alias: dict = {}        # group_key -> [alias_items]
+    work_scriptbook: dict = {}   # group_key -> scriptbook_lines
+    work_worldview: dict = {}    # group_key -> worldview_dict
     analyzed_dirs: set = set()
 
     for fpath in lrc_files:
@@ -753,33 +1033,79 @@ def run_pipeline(
         analyzed_dirs.add(group_key)
 
         _log(f"\n  分析目录: {group_key.absolute()}" + (f" (RJ{rj_number})" if rj_number else ""))
+        _dir_key = str(group_key)
+
+        # 加载该目录的台本（只在该 RJ 目录内搜索，不跨作品）
+        dir_scriptbook = _load_scriptbook(group_key, ctx)
+        if dir_scriptbook:
+            work_scriptbook[_dir_key] = dir_scriptbook
+            _log(f"  -> 台本: {len(dir_scriptbook)} 行")
+
+        # 分析/加载该目录的术语、alias 和世界观（只在该 RJ 目录内）
         dir_terms, dir_alias, dir_worldview = _analyze_work_terms(group_key, ctx)
 
-        # 合并术语（目录级覆盖全局）
-        work_terms.update(dir_terms)
-        work_alias.extend(dir_alias)
-
-        # 以第一个有结果的 worldview 为准
-        if dir_worldview and not worldview:
-            worldview = dir_worldview
-            # 转换 characters 为数组格式（用于 worldview prompt）
-            if isinstance(worldview.get('characters'), dict):
-                worldview['characters'] = [
+        # 合并从文件加载的已有世界观（如果有的话，已被 _analyze_work_terms 加载）
+        if dir_worldview:
+            work_worldview[_dir_key] = dir_worldview
+            if isinstance(dir_worldview.get('characters'), dict):
+                dir_worldview['characters'] = [
                     {'name': k, 'personality': str(v)}
-                    for k, v in worldview['characters'].items()
+                    for k, v in dir_worldview['characters'].items()
                 ]
+            wv_text = dir_worldview.get('worldview', '')
+            _log(f"  -> 世界观: {'有' if wv_text else '无'} ({len(wv_text)} 字符), 角色: {len(dir_worldview.get('characters', {}))} 个")
 
-    # 从 config.json 也加载术语（与作品级术语合并）
-    config_terms = load_terms_from_config(ctx.config)
-    for jp, zh in config_terms.items():
-        if jp not in work_terms:
-            work_terms[jp] = zh
+        # 从 config.json 合并全局术语到该目录
+        config_terms = load_terms_from_config(ctx.config)
+        for jp, zh in config_terms.items():
+            if jp not in dir_terms:
+                dir_terms[jp] = zh
 
-    _log(f"\n  -> 全局术语: {len(work_terms)} 个, alias: {len(work_alias)} 个")
+        work_terms[_dir_key] = dir_terms
+        work_alias[_dir_key] = dir_alias
+        _log(f"  -> 术语: {len(dir_terms)} 个, alias: {len(dir_alias)} 个")
     _log()
 
     # ──── 第 5 步: 翻译 ────
     translation_mode = ctx.config.get('app', {}).get('translation_mode', 'per_track')
+
+    # 过滤已翻译文件（参照 translate.py 的 process_all_lrc 逻辑）
+    # 关键：不能只看 .ja.lrc 是否存在（转录也会产生 .ja.lrc），
+    # 必须检测 .lrc 文件内容的实际语言
+    from io_adapter.lrc_handler import detect_lrc_language  # 已从 translate.py 迁移过来
+    skip_translated = ctx.config.get('app', {}).get('skip_translated', True)
+    if skip_translated:
+        skipped = 0
+        remaining: list[Path] = []
+        for f in lrc_files:
+            ext = f.suffix
+            ja_path = f.parent / f"{f.stem}.ja{ext}"
+            if ja_path.exists():
+                # .ja.lrc 存在 + .lrc 内容已变成中文 → 确实翻译过
+                lang = detect_lrc_language(f)
+                if lang == 'chinese':
+                    _log(f"  [跳过] 已翻译: {f.name}")
+                    ctx.stats['skipped'] += 1
+                    skipped += 1
+                    continue
+                # .ja.lrc 存在但 .lrc 仍是日文 → 只转录未翻译，需要翻译
+            else:
+                # 没有 .ja.lrc 但 .lrc 已经是中文 → 翻译过但留档丢失，跳过
+                lang = detect_lrc_language(f)
+                if lang == 'chinese':
+                    _log(f"  [跳过] 已翻译(无留档): {f.name}")
+                    ctx.stats['skipped'] += 1
+                    skipped += 1
+                    continue
+            remaining.append(f)
+        if skipped > 0:
+            _log(f"  → 跳过 {skipped} 个已翻译文件, 剩余 {len(remaining)} 个")
+            new_groups: dict = {}
+            for f in remaining:
+                new_groups.setdefault(f.parent, []).append(f)
+            file_groups = new_groups
+        lrc_files = remaining
+
     _sep(f"第 5 步: 翻译（模式: {translation_mode}）")
     _log(f"待处理文件: {len(lrc_files)} 个\n")
 
@@ -807,12 +1133,19 @@ def run_pipeline(
             if not files_data:
                 continue
 
+            # 获取当前目录的术语/世界观（不跨作品）
+            _batch_rj_root, _ = find_rj_work_root(parent_dir)
+            _batch_key = str(_batch_rj_root) if _batch_rj_root else str(parent_dir)
+            _batch_terms = work_terms.get(_batch_key, {})
+            _batch_alias = work_alias.get(_batch_key, [])
+            _batch_worldview = work_worldview.get(_batch_key, None)
+
             # 调用批量翻译
             result = ctx.translate_engine.translate_directory(
                 files_data,
-                terms=work_terms,
-                alias_list=work_alias,
-                worldview=worldview,
+                terms=_batch_terms,
+                alias_list=_batch_alias,
+                worldview=_batch_worldview,
             )
 
             # 写回结果
@@ -841,20 +1174,26 @@ def run_pipeline(
                     _log(f"  [写入] {fpath.name}: {len(translated)} 行")
 
     else:
-        # 跟踪当前目录的开始状态
+        # 跟踪当前 RJ 作品目录（而非 LRC 文件的直接父目录）
         _current_dir = None
+        _current_rj = None
         _dir_start_translated = 0
         _dir_start_lines = 0
         _dir_start_time = 0.0
 
         # 方案 B：逐文件翻译（利用缓存）
         for i, lrc_path in enumerate(lrc_files):
-            # 目录切换时记录上一目录的报告
-            if _current_dir is not None and lrc_path.parent != _current_dir:
+            # 找到该文件所属的 RJ 作品根目录
+            rj_root, rj_number = find_rj_work_root(lrc_path)
+            _effective_dir = rj_root if rj_root else lrc_path.parent
+
+            # RJ 作品切换时记录上一作品的报告
+            if _current_rj is not None and rj_number != _current_rj:
                 _record_dir_report(ctx, _current_dir, _dir_start_translated,
                                    _dir_start_lines, _dir_start_time)
-            if lrc_path.parent != _current_dir:
-                _current_dir = lrc_path.parent
+            if rj_number != _current_rj:
+                _current_rj = rj_number
+                _current_dir = _effective_dir
                 _dir_start_translated = ctx.stats['translated']
                 _dir_start_lines = ctx.stats['total_lines']
                 _dir_start_time = time.time()
@@ -864,12 +1203,18 @@ def run_pipeline(
             _log(f"{'#'*60}")
 
             try:
+                # 获取当前文件所属 RJ 目录的术语/台本/世界观（不跨作品）
+                _dir_key = str(_effective_dir)
+                _dir_terms = work_terms.get(_dir_key, {})
+                _dir_alias = work_alias.get(_dir_key, [])
+                _dir_scriptbook = work_scriptbook.get(_dir_key, None)
+                _dir_worldview = work_worldview.get(_dir_key, None)
                 success = translate_one_lrc(
                     lrc_path, ctx,
-                    terms=work_terms,
-                    alias_list=work_alias,
-                    worldview=worldview,
-                    scriptbook_lines=scriptbook_lines,
+                    terms=_dir_terms,
+                    alias_list=_dir_alias,
+                    worldview=_dir_worldview,
+                    scriptbook_lines=_dir_scriptbook,
                 )
                 if success:
                     _log(f"\n✓ 文件 [{i+1}/{len(lrc_files)}] 翻译成功: {lrc_path.name}")
@@ -933,13 +1278,21 @@ def run_pipeline(
     cost_completion = (completion_tokens / 1_000_000) * completion_per_1m
     cost_total = cost_hit + cost_miss + cost_completion
 
-    _sep("API 费用统计")
-    _log(f"  缓存命中:   {hit_tokens:>10,} tokens × {hit_per_1m}元/百万 = ¥{cost_hit:.4f}")
-    _log(f"  缓存未命中: {miss_tokens:>10,} tokens × {miss_per_1m}元/百万 = ¥{cost_miss:.4f}")
-    _log(f"  输出tokens:  {completion_tokens:>10,} tokens × {completion_per_1m}元/百万 = ¥{cost_completion:.4f}")
+    total_tok = hit_tokens + miss_tokens + completion_tokens
+    hit_rate = (hit_tokens / (hit_tokens + miss_tokens) * 100) if (hit_tokens + miss_tokens) > 0 else 0
+    _sep("📊 API 用量 & 费用统计")
+    _log(f"  📊 总Token: {total_tok:,}")
+    _log(f"  🟢 缓存命中:   {hit_tokens:>10,} tokens ({hit_rate:.1f}%) × ¥{hit_per_1m}/百万 = ¥{cost_hit:.4f}")
+    _log(f"  🔵 缓存未命中: {miss_tokens:>10,} tokens × ¥{miss_per_1m}/百万 = ¥{cost_miss:.4f}")
+    _log(f"  🟣 输出Token:  {completion_tokens:>10,} tokens × ¥{completion_per_1m}/百万 = ¥{cost_completion:.4f}")
     _log(f"  {'─'*50}")
-    _log(f"  总费用:                               ¥{cost_total:.4f}")
+    _log(f"  💰 本次费用: ¥{cost_total:.4f}")
     _sep()
+    _log()
+
+    # ── 查询 DeepSeek 账户余额 ──
+    _fetch_balance(ctx)
+
     _log()
     _log("文件说明:")
     _log("  .lrc/.srt/.vtt       = 当前使用的中文字幕")

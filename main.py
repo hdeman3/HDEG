@@ -25,41 +25,50 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # ==================== 日志文件 ====================
 # 将 stdout 同时写入文件（与 main.exe/main.py 同级 translate_logs/ 目录）
-SCRIPT_DIR = Path(__file__).parent.resolve()
-LOG_DIR = SCRIPT_DIR / 'translate_logs'
-LOG_DIR.mkdir(exist_ok=True)
+# 初始化失败时静默回退（不影响正常翻译流程）
+try:
+    _script_dir = Path(__file__).parent.resolve()
+    _log_dir = _script_dir / 'translate_logs'
+    _log_dir.mkdir(exist_ok=True)
 
-from datetime import datetime as _dt
-LOG_FILE = LOG_DIR / f'run_{_dt.now().strftime("%Y-%m-%d_%H-%M-%S")}.log'
+    from datetime import datetime as _dt
+    _log_file = _log_dir / f'run_{_dt.now().strftime("%Y-%m-%d_%H-%M-%S")}.log'
 
-class _TeeWriter:
-    """同时写入原始 stdout 和日志文件"""
-    def __init__(self, original, log_path):
-        self.original = original
-        self.log = open(log_path, 'w', encoding='utf-8', buffering=1)  # 行缓冲
-    def write(self, data):
-        self.original.write(data)
-        self.log.write(data)
-    def flush(self):
-        self.original.flush()
-        self.log.flush()
-    def readable(self): return False
-    def writable(self): return True
-    def seekable(self): return False
-    def fileno(self):
-        if hasattr(self.original, 'fileno'):
-            return self.original.fileno()
-        raise OSError('fileno not available')
-    def close(self):
-        self.log.flush()
-        self.log.close()
+    class _TeeWriter:
+        """同时写入原始 stdout 和日志文件"""
+        def __init__(self, original, log_path):
+            self.original = original
+            self.log = open(log_path, 'w', encoding='utf-8', buffering=1)  # 行缓冲
+        def write(self, data):
+            self.original.write(data)
+            self.log.write(data)
+        def flush(self):
+            self.original.flush()
+            self.log.flush()
+        def readable(self): return False
+        def writable(self): return True
+        def seekable(self): return False
+        def fileno(self):
+            if hasattr(self.original, 'fileno'):
+                return self.original.fileno()
+            raise OSError('fileno not available')
+        def close(self):
+            self.log.flush()
+            self.log.close()
 
-_tee = _TeeWriter(sys.stdout.buffer, LOG_FILE)
-sys.stdout = io.TextIOWrapper(_tee, encoding='utf-8')
-# stderr 也重定向到同一日志文件
-sys.stderr = io.TextIOWrapper(_tee, encoding='utf-8')
+    _tee = _TeeWriter(sys.stdout.buffer, _log_file)
+    sys.stdout = io.TextIOWrapper(_tee, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(_tee, encoding='utf-8')
 
-print(f"[日志] 输出文件: {LOG_FILE}")
+    print(f"[日志] 输出文件: {_log_file}")
+except Exception:
+    import traceback
+    # 日志初始化失败，用原始 stderr 输出错误，然后继续
+    _err_msg = traceback.format_exc()
+    try:
+        sys.stderr.buffer.write(f"[日志] 初始化失败，继续运行（无日志文件）:\n{_err_msg}\n".encode('utf-8'))
+    except Exception:
+        pass  # 连 stderr 都不可用，放弃
 
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent))

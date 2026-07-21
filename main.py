@@ -23,20 +23,51 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
+# ==================== 日志文件 ====================
+# 将 stdout 同时写入文件（与 main.exe/main.py 同级 translate_logs/ 目录）
+SCRIPT_DIR = Path(__file__).parent.resolve()
+LOG_DIR = SCRIPT_DIR / 'translate_logs'
+LOG_DIR.mkdir(exist_ok=True)
+
+from datetime import datetime as _dt
+LOG_FILE = LOG_DIR / f'run_{_dt.now().strftime("%Y-%m-%d_%H-%M-%S")}.log'
+
+class _TeeWriter:
+    """同时写入原始 stdout 和日志文件"""
+    def __init__(self, original, log_path):
+        self.original = original
+        self.log = open(log_path, 'w', encoding='utf-8', buffering=1)  # 行缓冲
+    def write(self, data):
+        self.original.write(data)
+        self.log.write(data)
+    def flush(self):
+        self.original.flush()
+        self.log.flush()
+    def readable(self): return False
+    def writable(self): return True
+    def seekable(self): return False
+    def fileno(self):
+        if hasattr(self.original, 'fileno'):
+            return self.original.fileno()
+        raise OSError('fileno not available')
+    def close(self):
+        self.log.flush()
+        self.log.close()
+
+_tee = _TeeWriter(sys.stdout.buffer, LOG_FILE)
+sys.stdout = io.TextIOWrapper(_tee, encoding='utf-8')
+# stderr 也重定向到同一日志文件
+sys.stderr = io.TextIOWrapper(_tee, encoding='utf-8')
+
+print(f"[日志] 输出文件: {LOG_FILE}")
+
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
 
-# 清理网络代理（避免代理干扰 API 直连）
-try:
-    _cfg_path = Path(__file__).parent / 'config.json'
-    if _cfg_path.exists():
-        import json as _json_proxy
-        _cfg = _json_proxy.loads(_cfg_path.read_text(encoding='utf-8'))
-        if _cfg.get('network', {}).get('clear_proxy_on_startup'):
-            for _key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
-                os.environ.pop(_key, None)
-except Exception:
-    pass
+# 清理网络代理（无条件清除，避免代理干扰 API 直连）
+for _key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+    os.environ.pop(_key, None)
+os.environ['NO_PROXY'] = '*'
 
 # ==================== unidic_lite 字典配置（与 translate.py 兼容） ====================
 # 此部分保留在 main.py 因为它需要在任何 import 之前设置环境变量
@@ -101,25 +132,6 @@ if hasattr(sys, '_MEIPASS'):
 # ==================== 主入口 ====================
 
 if __name__ == '__main__':
-    from pipeline.orchestrator import run_pipeline
-
-    # --- 确定工作目录 ---
-    # 优先级：input_path.txt（由 .bat 写入） > 命令行参数 > 当前目录
-    SCRIPT_DIR = Path(__file__).parent.resolve()
-    root = SCRIPT_DIR  # 默认
-    
-    # 1. 尝试读取 input_path.txt（由翻译_debug.bat 写入）
-    input_path_file = SCRIPT_DIR / 'input_path.txt'
-    if input_path_file.exists():
-        try:
-            content = input_path_file.read_text(encoding='utf-8').strip()
-            if content:
-                root = Path(content)
-                print(f"[入口] 从 input_path.txt 读取工作目录: {root}")
-        except Exception:
-            pass
-
-    # 2. 命令行参数可以覆盖（但 input_path.txt 优先）
     import argparse
     parser = argparse.ArgumentParser(
         description='翻译工具 - 日文字幕翻译',
@@ -129,22 +141,63 @@ if __name__ == '__main__':
     python main.py                           # 处理当前目录/input_path.txt指定目录
     python main.py 本編/                     # 处理指定目录
     python main.py 本編/ --config config.json # 指定配置
+    python main.py --run-script my_script.py  # 执行内联 Python 脚本（打包模式用）
         """,
     )
     parser.add_argument('root', nargs='?', default=None, help='作品根目录（默认由 input_path.txt 或当前目录决定）')
     parser.add_argument('--config', help='配置文件路径（默认 config.json）')
     parser.add_argument('--gpu', action='store_true', help='启用 GPU 加速（已废弃，由 config.json 控制）')
+    parser.add_argument('--run-script', nargs=argparse.REMAINDER, help='执行指定的 Python 脚本（打包模式下 Electron 调用）')
 
     args = parser.parse_args()
 
-    # 命令行参数在无 input_path.txt 时生效
-    if args.root is not None and not input_path_file.exists():
-        root = Path(args.root)
+    # --run-script 子命令：执行外部 Python 脚本（用于 review 等辅助功能）
+    if args.run_script:
+        script_path = args.run_script[0]
+        # 添加项目根目录和脚本目录到 sys.path
+        SCRIPT_DIR = Path(__file__).parent.resolve()
+        sys.path.insert(0, str(SCRIPT_DIR))
+        script_file = Path(script_path)
+        if script_file.exists():
+            sys.path.insert(0, str(script_file.parent))
+            with open(script_file, 'r', encoding='utf-8') as f:
+                exec(compile(f.read(), script_path, 'exec'))
+        else:
+            print(f'[错误] 脚本不存在: {script_path}', file=sys.stderr)
+            sys.exit(1)
+    else:
+        # 正常翻译流程
+        from pipeline.orchestrator import run_pipeline
 
-    config_path = Path(args.config) if args.config else None
+        # --- 确定工作目录 ---
+        # 优先级：
+        #   kikoeru 后台模式（同时指定 --config 和 root）→ 命令行参数最优先
+        #   input_path.txt（bat 拖放模式）
+        #   当前目录（默认）
+        SCRIPT_DIR = Path(__file__).parent.resolve()
+        root = SCRIPT_DIR  # 默认
 
-    run_pipeline(
-        root,
-        config_path=config_path,
-        use_gpu=args.gpu,
-    )
+        # 1. kikoeru 后台模式：--config 和 root 同时指定时，命令行参数优先
+        input_path_file = SCRIPT_DIR / 'input_path.txt'
+        if args.config is not None and args.root is not None:
+            root = Path(args.root)
+            print(f"[入口] 从命令行参数读取工作目录: {root}")
+        elif input_path_file.exists():
+            # 2. 传统 bat 拖放模式：input_path.txt 优先
+            try:
+                content = input_path_file.read_text(encoding='utf-8').strip()
+                if content:
+                    root = Path(content)
+                    print(f"[入口] 从 input_path.txt 读取工作目录: {root}")
+            except Exception:
+                pass
+        elif args.root is not None:
+            root = Path(args.root)
+
+        config_path = Path(args.config) if args.config else None
+
+        run_pipeline(
+            root,
+            config_path=config_path,
+            use_gpu=args.gpu,
+        )

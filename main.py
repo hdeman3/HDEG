@@ -38,7 +38,7 @@ try:
         """同时写入原始 stdout 和日志文件"""
         def __init__(self, original, log_path):
             self.original = original
-            self.log = open(log_path, 'w', encoding='utf-8', buffering=1)  # 行缓冲
+            self.log = open(log_path, 'wb', buffering=0)  # 二进制模式，无缓冲
         def write(self, data):
             self.original.write(data)
             self.log.write(data)
@@ -48,6 +48,8 @@ try:
         def readable(self): return False
         def writable(self): return True
         def seekable(self): return False
+        @property
+        def closed(self): return self.log.closed
         def fileno(self):
             if hasattr(self.original, 'fileno'):
                 return self.original.fileno()

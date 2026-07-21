@@ -23,59 +23,6 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# ==================== 日志文件 ====================
-# 将 stdout 同时写入文件（与 main.exe/main.py 同级 translate_logs/ 目录）
-# 初始化失败时静默回退（不影响正常翻译流程）
-try:
-    _script_dir = Path(__file__).parent.resolve()
-    _log_dir = _script_dir / 'translate_logs'
-    _log_dir.mkdir(exist_ok=True)
-
-    from datetime import datetime as _dt
-    _log_file = _log_dir / f'run_{_dt.now().strftime("%Y-%m-%d_%H-%M-%S")}.log'
-
-    # 打开日志文件句柄，atexit 确保退出时关闭
-    _log_fh = open(_log_file, 'wb', buffering=0)
-
-    class _TeeWriter:
-        """同时写入原始 stdout 和日志文件（二进制层）"""
-        def __init__(self, original, log_fh):
-            self.original = original
-            self.log = log_fh
-        def write(self, data):
-            try: self.original.write(data)
-            except: pass
-            try: self.log.write(data)
-            except: pass
-        def flush(self):
-            try: self.original.flush()
-            except: pass
-            try: self.log.flush()
-            except: pass
-        def readable(self): return False
-        def writable(self): return True
-        def seekable(self): return False
-        @property
-        def closed(self): return getattr(self.original, 'closed', False)
-        def fileno(self):
-            if hasattr(self.original, 'fileno'):
-                return self.original.fileno()
-            raise OSError('fileno not available')
-
-    _tee = _TeeWriter(sys.stdout.buffer, _log_fh)
-    sys.stdout = io.TextIOWrapper(_tee, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(_tee, encoding='utf-8')
-
-    print(f"[日志] 输出文件: {_log_file}")
-except Exception:
-    import traceback
-    # 日志初始化失败，用原始 stderr 输出错误，然后继续
-    _err_msg = traceback.format_exc()
-    try:
-        sys.stderr.buffer.write(f"[日志] 初始化失败，继续运行（无日志文件）:\n{_err_msg}\n".encode('utf-8'))
-    except Exception:
-        pass  # 连 stderr 都不可用，放弃
-
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
 

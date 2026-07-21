@@ -69,6 +69,35 @@ def find_scriptbooks_in_dir(
     return _sort_scriptbook_files(candidates)
 
 
+def collect_all_scriptbook_candidates(work_dir: Path) -> list[Path]:
+    """收集工作目录中所有 .txt 和 .pdf 文件作为台本备选
+
+    不做任何关键词/正则过滤，仅排除程序自身输出文件。
+    筛选工作交由 LLM 完成。
+
+    返回: 按相对路径排序的备选文件列表
+    """
+    excluded_stems = {'_cleaned', '_processed', '_export', '_scriptbook_export'}
+    candidates: list[Path] = []
+
+    for ext in ('.txt', '.pdf'):
+        for f in sorted(work_dir.rglob(f'*{ext}')):
+            stem = f.stem
+            # 排除程序输出文件
+            if any(ex in stem for ex in excluded_stems):
+                continue
+            candidates.append(f)
+
+    # 按相对路径排序（保持可读性）
+    def _sort_key(p: Path) -> str:
+        try:
+            return str(p.relative_to(work_dir))
+        except ValueError:
+            return str(p)
+
+    return sorted(candidates, key=_sort_key)
+
+
 def _sort_scriptbook_files(files: list[Path]) -> list[Path]:
     """按文件名中的数字编号排序台本文件"""
     import os

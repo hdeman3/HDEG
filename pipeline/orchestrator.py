@@ -196,8 +196,152 @@ def scan_lrc_files(work_dir: Path) -> tuple[list[Path], list[Path], int]:
 
 # ==================== 台本加载 ====================
 
+def _llm_identify_scriptbook_files(
+    candidates: list[Path],
+    work_dir: Path,
+    ctx: PipelineContext,
+) -> list[Path]:
+    """使用 LLM 从候选 txt/pdf 文件中识别台本
+
+    将所有备选文件的相对路径一次性发送给 LLM，
+    由 LLM 判断哪些是真正的台本文件。
+
+    参数:
+        candidates: 所有 .txt/.pdf 备选文件
+        work_dir: 作品根目录
+        ctx: 管道上下文
+
+    返回:
+        确认为台本的文件路径列表
+    """
+    if not candidates:
+        return []
+
+    _log(f"\n[台本·LLM] 开始识别台本文件（共 {len(candidates)} 个备选）")
+
+    # 构建文件列表（相对路径 + 文件名）
+    file_list_parts: list[str] = []
+    for i, f in enumerate(candidates, 1):
+        try:
+            rel = f.relative_to(work_dir)
+        except ValueError:
+            rel = f
+        file_list_parts.append(f"{i}. {rel}")
+    file_list_text = '\n'.join(file_list_parts)
+
+    # 提取作品名（work_dir 最后一级目录名）
+    work_name = work_dir.name
+
+    system_prompt = (
+        "你是一位日语ASMR音声作品台本识别专家。"
+        "只返回JSON格式结果，不要解释，不要添加任何额外文本。"
+    )
+
+    user_prompt = f"""请从以下文件列表中识别台本（剧本/台词/シナリオ）文件。
+
+音声作品: {work_name}
+
+【台本文件典型特征】
+- 文件名或所在目录包含: 台本、だいほん、シナリオ、script、セリフ、本編、台詞
+- 按音轨编号命名: 01, 02, トラック1, track1, Tr.1, １, ２ 等
+- PDF格式的剧本/台词文档
+- 内容以角色对话（台词）为主
+
+【非台本文件典型特征】
+- readme / 説明 / 注意事項 / 必ず読んで 等说明文档
+- クレジット / credit / cast / 声優 等演职员信息
+- 特典 / bonus / おまけ 等赠品说明
+- フィニッシュタイム / 射精メモ / 射精箇所 等特殊标注
+- あとがき / 感想 / 紹介 等后记感想
+- キャスト / 購入特典 等非台本内容
+
+【文件列表】（共 {len(candidates)} 个）
+{file_list_text}
+
+请返回JSON（仅JSON，无其他文本）：
+{{"scriptbook_indices": [1, 2, 3], "reasoning": "简短判断依据"}}
+
+其中 scriptbook_indices 是确认为台本的文件编号列表。如果没有台本文件，返回空列表: {{"scriptbook_indices": [], "reasoning": "无"}}"""
+
+    try:
+        import json as _json
+        from openai import OpenAI
+
+        api_cfg = ctx.api_cfg
+        api_key = api_cfg.get('key') or api_cfg.get('api_key', '')
+        base_url = api_cfg.get('base_url', 'https://api.deepseek.com')
+        model = api_cfg.get('model', 'deepseek-v4-flash')
+        timeout = api_cfg.get('timeout', 60)
+
+        if not api_key:
+            _log("  [台本·LLM] 未配置 API Key，回退到正则识别")
+            return []
+
+        _log(f"  [台本·LLM] 发送 {len(candidates)} 个备选文件给 LLM 识别 (model={model})")
+
+        # 清理代理环境变量（避免 httpx 走代理导致连接失败）
+        import os as _os
+        for _k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+            _os.environ.pop(_k, None)
+        _os.environ['NO_PROXY'] = '*'
+
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=500,
+        )
+
+        content = response.choices[0].message.content or ''
+        _log(f"  [台本·LLM] 响应: {content[:200]}")
+
+        # 提取 JSON
+        result_text = content.strip()
+        if '```json' in result_text:
+            result_text = result_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in result_text:
+            result_text = result_text.split('```')[1].split('```')[0].strip()
+
+        result = _json.loads(result_text)
+        indices = result.get('scriptbook_indices', [])
+        reasoning = result.get('reasoning', '')
+
+        _log(f"  [台本·LLM] 识别结果: {len(indices)} 个台本 — {reasoning}")
+
+        # 映射回文件路径
+        confirmed: list[Path] = []
+        for idx in indices:
+            if 1 <= idx <= len(candidates):
+                confirmed.append(candidates[idx - 1])
+            else:
+                _log(f"  [台本·LLM] 警告: 编号 {idx} 超出范围 {len(candidates)}")
+
+        if confirmed:
+            for f in confirmed:
+                try:
+                    _log(f"    ✓ {f.relative_to(work_dir)}")
+                except ValueError:
+                    _log(f"    ✓ {f}")
+        return confirmed
+
+    except Exception as e:
+        _log(f"  [台本·LLM] 识别失败: {e}，回退到正则识别")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
 def _load_scriptbook(work_dir: Path, ctx: PipelineContext) -> list[str] | None:
     """加载台本参考（原文-译文对照）
+
+    流程:
+    1. 收集所有 .txt/.pdf 备选 → LLM 识别台本
+    2. LLM 失败时回退到正则关键词识别
+    3. 合并 → 清洗 → 导出
 
     支持 scriptbook_mode 配置:
     - "keyword": 仅发送关键台词
@@ -208,13 +352,37 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext) -> list[str] | None:
     """
     from core.scriptbook_parser import (
         find_scriptbooks_in_dir,
+        collect_all_scriptbook_candidates,
         load_scriptbook_content,
         build_raw_scriptbook_map,
         is_key_dialogue_line,
     )
 
-    # 优先使用台本解析器查找
-    scriptbook_files = find_scriptbooks_in_dir(work_dir)
+    scriptbook_files: list[Path] = []
+
+    # ── 阶段一: 收集所有备选 + LLM 识别 ──
+    all_candidates = collect_all_scriptbook_candidates(work_dir)
+    if all_candidates:
+        _log(f"\n[台本] 收集到 {len(all_candidates)} 个 txt/pdf 备选文件")
+        for f in all_candidates[:10]:
+            try:
+                _log(f"  → {f.relative_to(work_dir)}")
+            except ValueError:
+                _log(f"  → {f}")
+        if len(all_candidates) > 10:
+            _log(f"  → ... 还有 {len(all_candidates) - 10} 个")
+
+        # LLM 识别（限 100 个以内，超量时截断）
+        llm_candidates = all_candidates[:100]
+        if len(all_candidates) > 100:
+            _log(f"  [台本] 备选文件过多，仅取前 100 个送 LLM 识别")
+        scriptbook_files = _llm_identify_scriptbook_files(llm_candidates, work_dir, ctx)
+
+    # ── 阶段二: LLM 失败或无结果时回退到正则 ──
+    if not scriptbook_files:
+        if all_candidates:
+            _log(f"\n[台本] LLM 未识别到台本，回退到正则关键词识别")
+        scriptbook_files = find_scriptbooks_in_dir(work_dir)
     if scriptbook_files:
         _log(f"\n[台本] 发现台本目录/文件: {len(scriptbook_files)} 个")
         for f in scriptbook_files[:5]:

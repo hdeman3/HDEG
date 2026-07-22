@@ -1185,6 +1185,25 @@ def run_pipeline(
         _log(f"❌ 错误: 工作目录不存在 - {root_abs}")
         sys.exit(1)
 
+    # ──── 检查 API Key ────
+    api_key = api_cfg.get('key') or api_cfg.get('api_key', '')
+    if not api_key:
+        _log("⚠ API Key 为空，仅执行本地模型（转录/翻译），跳过 LLM 翻译")
+        _log()
+
+        # 仅运行转录（infer.exe），然后直接返回
+        _run_transcription_if_needed(root, ctx)
+
+        # 扫描生成的字幕文件，报告结果
+        lrc_files, ja_files, archived, file_groups = scan_subtitle_files(root)
+        ctx.stats['archived'] = archived
+        _log(f"\n[完成] 本地模型处理完毕，共生成 {len(lrc_files)} 个字幕文件")
+        for ext in ('.lrc', '.srt', '.vtt'):
+            count = sum(1 for f in lrc_files if f.suffix == ext)
+            if count:
+                _log(f"  {ext}: {count} 个")
+        return ctx.stats
+
     # ──── 第 0 步: 语音转录（infer.exe）──
     _run_transcription_if_needed(root, ctx)
     _log()

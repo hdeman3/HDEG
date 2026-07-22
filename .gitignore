@@ -1,10 +1,9 @@
 # ==================== 项目文件 ====================
-# 核心脚本（保留）
-# translate.py
-# scriptbook_utils.py
-# record_scriptbooks.py
-# infer.exe
-# modal_infer.exe
+# 重构前旧版代码（git 忽略，本地保留）
+translate.py
+scriptbook_utils.py
+model_config.py
+test_polish.py
 
 # ==================== 排除文件 ====================
 

@@ -17,7 +17,7 @@
     "device": "cuda",
     "compute_type": "int8_float16",
     "audio_suffixes": "mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv",
-    "sub_formats": "lrc"
+    "sub_formats": "lrc,srt,vtt"
   },
   "app": {
     "lrc_max_lines_per_request": 100,

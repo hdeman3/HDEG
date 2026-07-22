@@ -194,6 +194,45 @@ def scan_lrc_files(work_dir: Path) -> tuple[list[Path], list[Path], int]:
     return all_files, ja_files, restored
 
 
+def sync_lrc_to_srt_vtt(lrc_path: Path, translated_texts: list[str]) -> int:
+    """翻译完成后将中文文本同步到同目录的 SRT/VTT 文件
+
+    从原始 SRT/VTT 读取时间戳结构，填充中文文本后写回。
+    翻译只改文本内容，时间戳完全保留。
+
+    返回: 同步成功的文件数
+    """
+    stem = lrc_path.stem
+    parent = lrc_path.parent
+    synced = 0
+
+    for ext in ('.srt', '.vtt'):
+        other_path = parent / f"{stem}{ext}"
+        if not other_path.exists():
+            _log(f"  [同步] {ext} 文件不存在，跳过: {other_path.name}")
+            continue
+        try:
+            sub_file = parse_subtitle_file(other_path)
+            if sub_file is None:
+                _log(f"  [同步] {ext} 解析失败: {other_path.name}")
+                continue
+
+            # SRT/VTT 不含 LRC 的空行占位，过滤空文本后匹配
+            orig_texts = sub_file.original_lyrics
+            trans_filtered = [t for t in translated_texts if t]  # 去掉空行（LRC 占位符）
+            if len(orig_texts) != len(trans_filtered):
+                _log(f"  [同步] {ext} 行数不匹配 (原文{len(orig_texts)}, 译文{len(trans_filtered)}), 跳过: {other_path.name}")
+                continue
+
+            write_subtitle_file(sub_file, trans_filtered, other_path)
+            _log(f"  [同步] {ext} 写回中文: {other_path.name}")
+            synced += 1
+        except Exception as e:
+            _log(f"  [同步] {ext} 失败: {e}")
+
+    return synced
+
+
 # ==================== 台本加载 ====================
 
 def _llm_identify_scriptbook_files(
@@ -846,6 +885,10 @@ def translate_one_lrc(
     _log(f"\n[写入] -> {abs_path}")
     _log(f"  -> 翻译完成: {len(translated_texts)} 行中文")
     ctx.stats['translated'] += 1
+
+    # 同步中文到同目录的 SRT/VTT
+    sync_lrc_to_srt_vtt(lrc_path, translated_texts)
+
     return True
 
 
@@ -1150,10 +1193,19 @@ def run_pipeline(
     _sep("第 1 步: 扫描字幕文件")
     lrc_files, ja_lrc_files, archived, file_groups = scan_subtitle_files(root)
     ctx.stats['archived'] = archived
+
+    # 翻译仅处理 LRC 文件，SRT/VTT 在翻译完成后从 LRC 结果同步
+    srt_vtt_files = [f for f in lrc_files if f.suffix in ('.srt', '.vtt')]
+    lrc_files = [f for f in lrc_files if f.suffix == '.lrc']
+
+    if srt_vtt_files:
+        _log(f"\n[字幕] 发现 {len(srt_vtt_files)} 个 SRT/VTT 文件（不参与翻译，翻译完成后同步）")
     _log()
 
     if not lrc_files:
-        _log("未发现字幕文件，无需翻译")
+        _log("未发现 LRC 字幕文件，无需翻译")
+        if ja_lrc_files:
+            _log(f"  (有 {len(ja_lrc_files)} 个 .ja.lrc 留档文件，但无对应 .lrc)")
         return ctx.stats
 
     # ──── 第 2 步: 加载台本（按 RJ 目录，避免跨作品污染）──
@@ -1340,6 +1392,9 @@ def run_pipeline(
                     ctx.stats['translated'] += 1
                     ctx.stats['total_lines'] += len(translated)
                     _log(f"  [写入] {fpath.name}: {len(translated)} 行")
+                    # 同步中文到同目录的 SRT/VTT
+                    if fpath.suffix == '.lrc':
+                        sync_lrc_to_srt_vtt(fpath, translated)
 
     else:
         # 跟踪当前 RJ 作品目录（而非 LRC 文件的直接父目录）

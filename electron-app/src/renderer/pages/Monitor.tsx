@@ -8,6 +8,7 @@ import {
   ReloadOutlined,
 } from '@ant-design/icons';
 import { useAppStore } from '../stores/useAppStore';
+import { reconnectSSE } from '../browser-api';
 import type { LogEntry } from '../types';
 
 const Monitor: React.FC = () => {
@@ -18,7 +19,59 @@ const Monitor: React.FC = () => {
   const logIdRef = useRef(0);
   const terminalRef = useRef<HTMLDivElement>(null);
 
+  // ── 页面加载时：连 SSE + 查状态（浏览器重连恢复）──
   useEffect(() => {
+    // 强制重连 SSE，确保能收到实时事件
+    try { reconnectSSE(); } catch {}
+    (async () => {
+      try {
+        if ((window as any).electronAPI?.translate?.getStatus) {
+          var status = await (window as any).electronAPI.translate.getStatus();
+        } else {
+          var resp = await fetch('/api/translate/status');
+          var status = await resp.json();
+        }
+        if (status?.running) {
+          setTranslating(true);
+          const store = useAppStore.getState();
+          if (status.workDir && !store.workDir) {
+            store.setWorkDir(status.workDir);
+          }
+          if (status.logs?.length) {
+            setLogs(status.logs.map((l: any, i: number) => ({
+              id: 90000 + i,
+              level: l.level || 'info',
+              message: l.message || '',
+              time: l.time || '',
+            })));
+          }
+        } else {
+          // 翻译已结束（用户离开时翻译完成了），重置状态
+          setTranslating(false);
+          setFinished(true);
+        }
+      } catch {}
+    })();
+  }, []);
+
+  useEffect(() => {
+    const handleInit = (msg: Record<string, unknown>) => {
+      if (msg?.running) {
+        setTranslating(true);
+      } else {
+        setTranslating(false);
+        setFinished(true);
+      }
+      if (msg?.logs?.length) {
+        setLogs((msg.logs as any[]).map((l: any, i: number) => ({
+          id: 80000 + i,
+          level: l.level || 'info',
+          message: l.message || '',
+          time: l.time || '',
+        })));
+      }
+    };
+
     const handleMessage = (msg: Record<string, unknown>) => {
       if (msg?.type === 'progress') setTranslating(true);
     };
@@ -63,12 +116,19 @@ const Monitor: React.FC = () => {
     window.electronAPI.on('python:log', handleLog as never);
     window.electronAPI.on('python:done', handleDone as never);
     window.electronAPI.on('python:error', handleError as never);
+    // 浏览器模式下监听 init 事件（SSE 重连恢复）
+    if ((window as any).electronAPI?.on) {
+      (window as any).electronAPI.on('python:init', handleInit as never);
+    }
 
     return () => {
       window.electronAPI.off('python:message', handleMessage as never);
       window.electronAPI.off('python:log', handleLog as never);
       window.electronAPI.off('python:done', handleDone as never);
       window.electronAPI.off('python:error', handleError as never);
+      if ((window as any).electronAPI?.off) {
+        (window as any).electronAPI.off('python:init', handleInit as never);
+      }
     };
   }, []);
 
@@ -96,15 +156,8 @@ const Monitor: React.FC = () => {
     return <Tag style={{ margin: 0 }}>等待开始</Tag>;
   };
 
-  if (!workDir) {
-    return (
-      <div className="workspace-empty animate-fade-in">
-        <div className="workspace-empty-icon"><PlayCircleOutlined /></div>
-        <div className="workspace-empty-title">未选择工作目录</div>
-        <div className="workspace-empty-desc">请先在「工作区」选择工作目录，并在「翻译配置」中启动翻译。</div>
-      </div>
-    );
-  }
+  // 即使 workDir 为空也显示监控界面，支持浏览器重连恢复
+  const hasWorkDir = workDir || false;
 
   return (
     <div className="animate-fade-in">

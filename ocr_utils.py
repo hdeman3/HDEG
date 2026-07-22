@@ -13,9 +13,10 @@ from pathlib import Path
 
 
 def _get_resource_dir() -> Path:
-    """获取资源目录路径（开发环境为脚本目录，打包后为exe目录）"""
+    """获取资源目录路径（开发环境为脚本目录，打包后为 PyInstaller 解压目录）"""
     if getattr(sys, 'frozen', False):
-        return Path(sys.executable).parent
+        # PyInstaller 打包后，资源文件解压到 sys._MEIPASS
+        return Path(sys._MEIPASS)
     else:
         return Path(__file__).parent
 

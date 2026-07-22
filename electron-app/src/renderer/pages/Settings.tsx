@@ -1,7 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { Button, Form, Input, InputNumber, Select, Switch, Spin, message } from 'antd';
-import { SaveOutlined, PlayCircleOutlined, ApiOutlined, SettingOutlined, ScanOutlined, DollarOutlined, GlobalOutlined, FileTextOutlined } from '@ant-design/icons';
+import { Button, Form, Input, InputNumber, Select, Switch, Spin, Modal, message } from 'antd';
+import { SaveOutlined, PlayCircleOutlined, ApiOutlined, SettingOutlined, ScanOutlined, DollarOutlined, GlobalOutlined, FileTextOutlined, SoundOutlined, PlusOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
 import { useAppStore } from '../stores/useAppStore';
+
+// 合法的配置段名称，保存时只处理这些，防止 JSON 里的垃圾数据通过 flatten/unflatten 写回
+const CONFIG_SECTIONS = ['api', 'app', 'ocr', 'pricing', 'network', 'prompts', 'transcription'];
 
 // ---- 递归 flatten / unflatten 用于处理嵌套配置（如 api.generation_params.temperature） ----
 
@@ -39,32 +42,113 @@ const Settings: React.FC = () => {
   const [form] = Form.useForm();
   const [saving, setSaving] = useState(false);
   const [loadingConfig, setLoadingConfig] = useState(true);
+  const [presets, setPresets] = useState<string[]>([]);
+  const [activePreset, setActivePreset] = useState<string>('default');
+  const [newPresetName, setNewPresetName] = useState('');
+
+  const loadConfig = async () => {
+    setLoadingConfig(true);
+    try {
+      const config = await (window as any).electronAPI.config.getAll();
+      const flat = flatten(config as Record<string, unknown>);
+      form.setFieldsValue(flat);
+    } catch (e) {
+      message.error('无法加载配置');
+    } finally {
+      setLoadingConfig(false);
+    }
+  };
+
+  const loadPresets = async () => {
+    try {
+      const res = await (window as any).electronAPI.config.listPresets();
+      setPresets(res.presets || ['default']);
+      setActivePreset(res.active || 'default');
+    } catch {}
+  };
 
   useEffect(() => {
     (async () => {
-      try {
-        setLoadingConfig(true);
-        const config = await (window as any).electronAPI.config.getAll();
-        const flat = flatten(config as Record<string, unknown>);
-        form.setFieldsValue(flat);
-      } catch (e) {
-        message.error('无法加载配置，请确认后端服务已启动');
-      } finally {
-        setLoadingConfig(false);
-      }
+      await loadPresets();
+      await loadConfig();
     })();
   }, []);
+
+  const handleSwitchPreset = async (name: string) => {
+    const res = await (window as any).electronAPI.config.setActivePreset(name);
+    if (res.success) {
+      setActivePreset(name);
+      await loadConfig();
+      message.success('已切换到预设: ' + name);
+    } else {
+      message.error('预设不存在');
+    }
+  };
+
+  const handleSavePreset = async () => {
+    const name = newPresetName.trim();
+    if (!name) { message.warning('请输入预设名称'); return; }
+    // 先保存当前表单到 config
+    const values = form.getFieldsValue();
+    const nested = unflatten(values);
+    for (const section of CONFIG_SECTIONS) {
+      const data = nested[section];
+      if (typeof data === 'object' && data !== null) {
+        // 清除 undefined 值，避免未触摸的复选框缺失字段覆盖已有配置
+        const clean: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
+          if (v !== undefined) clean[k] = v;
+        }
+        await (window as any).electronAPI.config.setSection(section, clean);
+      }
+    }
+    const res = await (window as any).electronAPI.config.savePreset(name);
+    if (res.success) {
+      setNewPresetName('');
+      await loadPresets();
+      setActivePreset(name);
+      message.success('预设已保存: ' + name);
+    } else {
+      message.error('保存预设失败');
+    }
+  };
+
+  const handleDeletePreset = async (name: string) => {
+    if (name === 'default') { message.warning('不能删除默认预设'); return; }
+    Modal.confirm({
+      title: '删除预设',
+      content: `确定要删除预设「${name}」吗？配置数据不会丢失，切回 default 即可恢复。`,
+      okText: '删除',
+      okType: 'danger',
+      cancelText: '取消',
+      onOk: async () => {
+        const res = await (window as any).electronAPI.config.deletePreset(name);
+        if (res.success) {
+          await loadPresets();
+          setActivePreset('default');
+          await loadConfig();
+          message.success('已删除预设: ' + name);
+        }
+      },
+    });
+  };
 
   const handleSave = async () => {
     setSaving(true);
     try {
       const values = form.getFieldsValue();
       const nested = unflatten(values);
-  for (const [section, data] of Object.entries(nested)) {
-    if (typeof data === 'object' && data !== null) {
-      await (window as any).electronAPI.config.setSection(section, data as Record<string, unknown>);
-    }
-  }
+      for (const section of CONFIG_SECTIONS) {
+        const data = nested[section];
+        if (typeof data === 'object' && data !== null) {
+          // 清除 undefined 值，避免未触摸的复选框缺失字段覆盖已有配置
+          const clean: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
+            if (v !== undefined) clean[k] = v;
+          }
+          await (window as any).electronAPI.config.setSection(section, clean);
+        }
+      }
       message.success('配置已保存到 config.json');
     } catch {
       message.error('保存失败');
@@ -99,6 +183,57 @@ const Settings: React.FC = () => {
           <div className="page-title">翻译配置</div>
           <div className="page-subtitle">配置 API、OCR 及生成参数</div>
         </div>
+      </div>
+
+      {/* ── 预设管理栏 ── */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20,
+        padding: '12px 16px', background: 'var(--color-surface-2)',
+        border: '1px solid var(--color-hairline)', borderRadius: 'var(--radius-md)',
+      }}>
+        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>
+          翻译预设
+        </span>
+        <Select
+          value={activePreset}
+          onChange={handleSwitchPreset}
+          size="small"
+          style={{ minWidth: 160 }}
+          options={presets.map(p => ({ value: p, label: p === 'default' ? '📋 默认配置' : '💾 ' + p }))}
+        />
+        <div style={{ display: 'flex', gap: 6 }}>
+          <Input
+            placeholder="新预设名称"
+            value={newPresetName}
+            onChange={e => setNewPresetName(e.target.value)}
+            size="small"
+            style={{ width: 140 }}
+            onPressEnter={handleSavePreset}
+          />
+          <Button
+            type="dashed"
+            icon={<PlusOutlined />}
+            onClick={handleSavePreset}
+            size="small"
+            disabled={!newPresetName.trim()}
+          >
+            保存为预设
+          </Button>
+          {activePreset !== 'default' && (
+            <Button
+              danger
+              icon={<DeleteOutlined />}
+              onClick={() => handleDeletePreset(activePreset)}
+              size="small"
+            >
+              删除此预设
+            </Button>
+          )}
+        </div>
+        <div style={{ flex: 1 }} />
+        <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
+          预设可保存 API 密钥、模型、生成参数等全部配置，一键切换
+        </span>
       </div>
 
       <Form form={form} layout="vertical" style={{ maxWidth: 900 }}>
@@ -141,7 +276,7 @@ const Settings: React.FC = () => {
             </div>
             <div className="settings-form-row">
               <Form.Item name="api.generation_params.max_tokens" label="最大 Token">
-                <InputNumber min={100} max={4096} step={100} size="small" style={{ width: '100%' }} />
+                <InputNumber min={1024} max={262144} step={1024} size="small" style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item name="api.generation_params.reasoning_effort" label="推理力度">
                 <Select size="small" options={[
@@ -181,8 +316,8 @@ const Settings: React.FC = () => {
             <div className="settings-form-row">
               <Form.Item name="app.scriptbook_mode" label="台本模式">
                 <Select size="small" options={[
-                  { value: 'full', label: '完整' },
-                  { value: 'per_chapter', label: '按章节' },
+                  { value: 'full', label: '完整台本（推荐）' },
+                  { value: 'keyword', label: '仅关键台词' },
                 ]} />
               </Form.Item>
               <Form.Item name="app.debug" label="调试模式" valuePropName="checked">
@@ -260,6 +395,38 @@ const Settings: React.FC = () => {
               </Form.Item>
               <Form.Item name="pricing.completion_per_1m" label="生成 ($/1M)">
                 <InputNumber min={0} step={0.01} size="small" style={{ width: '100%' }} />
+              </Form.Item>
+            </div>
+          </div>
+
+          {/* ---- Transcription ---- */}
+          <div className="settings-section">
+            <div className="settings-section-header">
+              <span className="settings-section-icon"><SoundOutlined /></span>
+              <span className="settings-section-title">转录模型</span>
+            </div>
+            <Form.Item name="transcription.infer_exe" label="infer.exe 路径"
+              extra="Whisper 转录引擎，留空则不启用转录功能">
+              <Input placeholder="例: E:\转录模型\infer.exe" size="small" />
+            </Form.Item>
+            <Form.Item name="transcription.model_dir" label="模型目录"
+              extra="转录模型和 PaddleOCR 模型所在目录">
+              <Input placeholder="例: E:\转录模型\models" size="small" />
+            </Form.Item>
+            <div className="settings-form-row">
+              <Form.Item name="transcription.device" label="推理设备">
+                <Select size="small" options={[
+                  { value: 'cuda', label: 'GPU (CUDA)' },
+                  { value: 'cpu', label: 'CPU' },
+                ]} />
+              </Form.Item>
+              <Form.Item name="transcription.compute_type" label="计算精度">
+                <Select size="small" options={[
+                  { value: 'int8_float16', label: 'int8_float16 (推荐)' },
+                  { value: 'float16', label: 'float16' },
+                  { value: 'float32', label: 'float32' },
+                  { value: 'int8', label: 'int8' },
+                ]} />
               </Form.Item>
             </div>
           </div>

@@ -465,3 +465,97 @@ def write_subtitle_file(sub_file: SubtitleFile, translated_lyrics: list[str], ta
     target_path.parent.mkdir(parents=True, exist_ok=True)
     with open(target_path, 'w', encoding='utf-8') as f:
         f.writelines(final_lines)
+
+
+# ==================== 语言检测 ====================
+
+def extract_subtitle_texts(content: str, ext: str) -> list[str]:
+    """从字幕内容中提取纯文本行（去掉时间戳）"""
+    lines = content.split('\n')
+    lyric_texts = []
+
+    if ext == '.lrc':
+        tag_pattern = re.compile(r'^(\[.*?\])\s*(.*)')
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            match = tag_pattern.match(line)
+            if match:
+                tags = match.group(1)
+                text_after = match.group(2)
+                if re.search(r'\[\d+:\d{2}\.\d{2,3}\]', tags):
+                    lyric_texts.append(text_after)
+
+    elif ext == '.srt':
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.isdigit():
+                i += 1
+                if i < len(lines) and '-->' in lines[i]:
+                    i += 1
+                    while i < len(lines) and lines[i].strip():
+                        lyric_texts.append(lines[i].strip())
+                        i += 1
+            i += 1
+
+    elif ext == '.vtt':
+        i = 0
+        while i < len(lines) and not lines[i].strip().startswith('00:'):
+            i += 1
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line or line.startswith('NOTE'):
+                i += 1
+                continue
+            if '-->' in line:
+                i += 1
+                while i < len(lines):
+                    next_line = lines[i].strip()
+                    if not next_line or '-->' in next_line:
+                        break
+                    lyric_texts.append(next_line)
+                    i += 1
+            else:
+                i += 1
+
+    return lyric_texts
+
+
+def detect_lrc_language(file_path: Path) -> str:
+    """检测字幕文件的语言
+
+    返回:
+        "japanese" - 日文为主
+        "chinese"  - 中文为主
+        "empty"    - 无文本内容
+        "unknown"  - 无法识别
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except (UnicodeDecodeError, Exception):
+        return "unknown"
+
+    ext = file_path.suffix.lower()
+    lyric_texts = extract_subtitle_texts(content, ext)
+    if not lyric_texts:
+        return "empty"
+
+    all_text = '\n'.join(lyric_texts)
+    chinese_chars = len(re.findall(r'[一-鿿]', all_text))
+    japanese_chars = len(re.findall(r'[぀-ゟ゠-ヺヽ-ヿ]', all_text))
+
+    if japanese_chars > 0:
+        if chinese_chars > 0:
+            if japanese_chars > chinese_chars * 0.1:
+                return "japanese"
+            else:
+                return "chinese"
+        else:
+            return "japanese"
+    elif chinese_chars > 0:
+        return "chinese"
+    else:
+        return "unknown"

@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Button, Input, Table, Tag, Typography, message } from 'antd';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Button, Table, Tag, Typography, message } from 'antd';
 import {
   FolderOpenOutlined,
   ReloadOutlined,
@@ -17,7 +17,6 @@ const { Text } = Typography;
 const Workspace: React.FC = () => {
   const { workDir, works, setWorkDir, setWorks, setActiveTab } = useAppStore();
   const [dragOver, setDragOver] = useState(false);
-  const [inputPath, setInputPath] = useState('');
   const scanWorks = useCallback(async (dir: string) => {
     try {
       var result = await window.electronAPI.folder.scanWorks(dir);
@@ -38,16 +37,8 @@ const Workspace: React.FC = () => {
     const dir = await window.electronAPI.dialog.selectFolder();
     if (dir) {
       setWorkDir(dir);
-      setInputPath(dir);
       await scanWorks(dir);
     }
-  };
-
-  const handleInputPath = async () => {
-    const dir = inputPath.trim();
-    if (!dir) return;
-    setWorkDir(dir);
-    await scanWorks(dir);
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -67,74 +58,78 @@ const Workspace: React.FC = () => {
     e.stopPropagation();
     setDragOver(false);
 
-    // ── 方案 1：通过 File.path 获取（Electron 原生支持）──
-    const files = e.dataTransfer.files;
-    var dirPath = '';
-    for (var i = 0; i < files.length; i++) {
-      var file = files[i] as File & { path?: string };
-      if (file.path) {
-        dirPath = file.path.replace(/[/\\][^/\\]*$/, '');
-        break;
+    try {
+      // ── 方案 1：通过 File.path 获取（Electron 原生支持）──
+      const files = e.dataTransfer.files;
+      var dirPath = '';
+      for (var i = 0; i < files.length; i++) {
+        var file = files[i] as File & { path?: string };
+        if (file.path) {
+          dirPath = file.path.replace(/[/\\][^/\\]*$/, '');
+          break;
+        }
       }
-    }
-    if (dirPath) {
-      setWorkDir(dirPath);
-      setInputPath(dirPath);
-      await scanWorks(dirPath);
-      return;
-    }
+      if (dirPath) {
+        setWorkDir(dirPath);
+        await scanWorks(dirPath);
+        return;
+      }
 
-    // ── 方案 2：浏览器模式 — 尝试通过 HTTP API 解析文件夹名 ──
-    const isElectron = window.electronAPI?.isElectron;
-    if (!isElectron) {
-      var items = e.dataTransfer.items;
-      if (items) {
-        for (var j = 0; j < items.length; j++) {
-          var entry = items[j].webkitGetAsEntry?.();
-          if (entry && entry.isDirectory) {
-            var folderName = entry.name;
-            try {
-              var basePath = localStorage.getItem('zhuanyi_basePath') || '';
-              // 仅浏览器模式使用 HTTP API 解析路径；加上超时防止卡死
-              var resolveRes = await Promise.race([
-                fetch('/api/resolve-path', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ folderName: folderName, basePath: basePath }),
-                }),
-                new Promise<Response>(function(_, reject) {
-                  setTimeout(function() { reject(new Error('timeout')); }, 3000);
-                }),
-              ]);
-              if (resolveRes.ok) {
-                var resolveData = await resolveRes.json();
-                if (resolveData.found && resolveData.path) {
-                  setWorkDir(resolveData.path);
-                  setInputPath(resolveData.path);
-                  localStorage.setItem('zhuanyi_basePath', resolveData.path);
-                  await scanWorks(resolveData.path);
-                  return;
+      // ── 方案 2：浏览器模式 — 尝试通过 HTTP API 解析文件夹名 ──
+      const isElectron = window.electronAPI?.isElectron;
+      if (!isElectron) {
+        var items = e.dataTransfer.items;
+        if (items) {
+          for (var j = 0; j < items.length; j++) {
+            var entry = items[j].webkitGetAsEntry?.();
+            if (entry && entry.isDirectory) {
+              var folderName = entry.name;
+              try {
+                var basePath = localStorage.getItem('zhuanyi_basePath') || '';
+                var resolveRes = await Promise.race([
+                  fetch('/api/resolve-path', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ folderName: folderName, basePath: basePath }),
+                  }),
+                  new Promise<Response>(function(_, reject) {
+                    setTimeout(function() { reject(new Error('timeout')); }, 3000);
+                  }),
+                ]);
+                if (resolveRes.ok) {
+                  var resolveData = await resolveRes.json();
+                  if (resolveData.found && resolveData.path) {
+                    setWorkDir(resolveData.path);
+                    localStorage.setItem('zhuanyi_basePath', resolveData.path);
+                    await scanWorks(resolveData.path);
+                    return;
+                  }
                 }
-              }
-            } catch(_e) { /* 浏览器模式不可用时安静失败 */ }
+              } catch(_e) { /* 浏览器模式不可用时安静失败 */ }
 
-            setInputPath(folderName);
-            message.info('已捕获「' + folderName + '」，请补充完整路径后按 Enter');
-            return;
+              message.info('已捕获「' + folderName + '」，点击「选择工作目录」按钮打开该文件夹');
+              return;
+            }
           }
         }
       }
-    }
 
-    message.info('无法获取文件夹路径。请粘贴路径到输入框或点击选择。');
+      message.info('无法获取文件夹路径。请粘贴路径到输入框或点击选择。');
+    } catch (err: any) {
+      console.error('[Workspace] 拖放处理失败:', err);
+      message.error('拖放处理失败: ' + (err?.message || err));
+    }
   };
 
+  var initialScanDone = useRef(false);
+
   useEffect(() => {
-    if (workDir) {
-      setInputPath(workDir);
+    // 只在首次加载时自动扫描，后续切换回来不重复扫
+    if (workDir && !initialScanDone.current) {
+      initialScanDone.current = true;
       scanWorks(workDir);
     }
-  }, []);
+  }, [workDir]);
 
   function getLrcStatus(rec: LrcFileInWork) {
     if (rec.hasCnLrc) return { label: '翻译', color: 'purple' as const };
@@ -182,16 +177,8 @@ const Workspace: React.FC = () => {
   const totalAudioCount = works.reduce((sum, w) => sum + w.audioFiles.length, 0);
 
   var folderInputRef = React.useRef<HTMLInputElement>(null);
-  var handleFolderInputChange = function(e: React.ChangeEvent<HTMLInputElement>) {
-    var files = e.target.files;
-    if (files && files.length > 0) {
-      var relPath = (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath || '';
-      var folderName = relPath.split('/')[0] || '';
-      if (folderName) {
-        setInputPath(function(prev) { return prev ? prev.replace(/[/\\]?$/, '/') + folderName : folderName; });
-        message.info('已选择文件夹「' + folderName + '」，请补充完整路径后按 Enter');
-      }
-    }
+  var handleFolderInputChange = function(_e: React.ChangeEvent<HTMLInputElement>) {
+    message.info('请点击下方「选择工作目录」按钮来选择文件夹');
     if (folderInputRef.current) folderInputRef.current.value = '';
   };
 
@@ -237,25 +224,14 @@ const Workspace: React.FC = () => {
         onChange={handleFolderInputChange}
       />
 
-      <div
-        className="path-input-row"
-        style={{ maxWidth: 500, margin: '0 auto', display: 'flex', gap: 8 }}
-        onClick={function(e) { e.stopPropagation(); }}
-      >
-        <Input
-          placeholder="输入工作目录路径，如 E:\奥术\精翻"
-          value={inputPath}
-          onChange={function(e) { setInputPath(e.target.value); }}
-          onPressEnter={handleInputPath}
-          size="middle"
-          style={{ flex: 1 }}
-        />
-        <Button onClick={handleInputPath} disabled={!inputPath.trim()}>
-          扫描
-        </Button>
-        <Button icon={<FolderOpenOutlined />}
-          onClick={function(e) { e.stopPropagation(); handleSelectFolder(); }}>
-          浏览
+      <div style={{ textAlign: 'center', marginTop: 16 }}>
+        <Button
+          type="primary"
+          size="large"
+          icon={<FolderOpenOutlined />}
+          onClick={function(e) { e.stopPropagation(); handleSelectFolder(); }}
+        >
+          选择工作目录
         </Button>
       </div>
     </div>

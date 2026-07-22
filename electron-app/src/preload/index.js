@@ -6,6 +6,10 @@ const api = {
         getAll: () => ipcRenderer.invoke('config:getAll'),
         getSection: (section) => ipcRenderer.invoke('config:getSection', section),
         setSection: (section, data) => ipcRenderer.invoke('config:setSection', section, data),
+        listPresets: () => ipcRenderer.invoke('config:listPresets'),
+        setActivePreset: (name) => ipcRenderer.invoke('config:setActivePreset', name),
+        savePreset: (name) => ipcRenderer.invoke('config:savePreset', name),
+        deletePreset: (name) => ipcRenderer.invoke('config:deletePreset', name),
     },
     dialog: {
         selectFolder: () => ipcRenderer.invoke('dialog:selectFolder'),
@@ -24,6 +28,7 @@ const api = {
     review: {
         fetchResults: (workDir) => ipcRenderer.invoke('review:fetchResults', workDir),
         saveEdit: (workDir, filename, index, newTranslation) => ipcRenderer.invoke('review:saveEdit', workDir, filename, index, newTranslation),
+        consistencyCheck: (workDir) => ipcRenderer.invoke('review:consistencyCheck', workDir),
     },
     utils: {
         openFolder: (dirPath) => ipcRenderer.invoke('utils:openFolder', dirPath),

@@ -288,24 +288,15 @@ def get_worldview_prompt_hint(analysis: dict) -> str:
 
 # ==================== 从目录加载世界观 ====================
 
-def load_worldview_from_dir(work_dir: "Path") -> dict | None:
+def load_worldview_from_dir(work_dir: "Path") -> tuple[dict | None, list]:
     """从工作目录中加载世界观/角色/场景设定
 
-    搜索以下文件（按优先级）：
-    1. worldview.json / world_setting.json / world.json
-    2. characters.json / char.json
-    3. scene.json / setting.json
-
     返回:
-        {
-            "worldview": str,       # 世界观描述
-            "characters": dict,      # {角色名: 描述}
-            "scene": str,            # 场景描述
-        }
-        未找到任何有效设定时返回 None
+        (worldview_dict, source_files)
+        worldview_dict: {worldview, characters, scene} 或 None
+        source_files: 找到的文件绝对路径列表
     """
     import json as _json
-    from pathlib import Path as _Path
 
     worldview: dict = {
         "worldview": "",
@@ -313,6 +304,12 @@ def load_worldview_from_dir(work_dir: "Path") -> dict | None:
         "scene": "",
     }
     has_any = False
+    sources: list = []  # 收集所有找到的文件
+
+    def _add_source(fpath):
+        p = fpath.absolute()
+        if p not in sources:
+            sources.append(p)
 
     # 搜索世界观文件
     wv_candidates = ['worldview.json', 'world_setting.json', 'world.json',
@@ -331,6 +328,7 @@ def load_worldview_from_dir(work_dir: "Path") -> dict | None:
                     else:
                         worldview['worldview'] = content
                     has_any = True
+                    _add_source(fpath)
                     print(f"  [世界观] 加载文件: {fpath.absolute()} ({len(worldview['worldview'])} 字符)")
             except Exception as e:
                 print(f"  [世界观] 读取 {fpath.absolute()} 失败: {e}")
@@ -346,7 +344,6 @@ def load_worldview_from_dir(work_dir: "Path") -> dict | None:
                     if isinstance(data, dict):
                         worldview['characters'].update(data)
                 else:
-                    # 纯文本，按行解析 "角色名: 描述"
                     for line in content.split('\n'):
                         line = line.strip()
                         if ':' in line or '：' in line:
@@ -354,6 +351,7 @@ def load_worldview_from_dir(work_dir: "Path") -> dict | None:
                             name, desc = line.split(sep, 1)
                             worldview['characters'][name.strip()] = desc.strip()
                 has_any = True
+                _add_source(fpath)
                 print(f"  [世界观] 加载角色: {fpath.absolute()} ({len(worldview['characters'])} 个角色)")
             except Exception as e:
                 print(f"  [世界观] 读取角色 {fpath.absolute()} 失败: {e}")
@@ -373,6 +371,7 @@ def load_worldview_from_dir(work_dir: "Path") -> dict | None:
                 else:
                     worldview['scene'] = content
                 has_any = True
+                _add_source(fpath)
                 print(f"  [世界观] 加载场景: {fpath.absolute()} ({len(worldview['scene'])} 字符)")
             except Exception as e:
                 print(f"  [世界观] 读取场景 {fpath.absolute()} 失败: {e}")
@@ -386,7 +385,6 @@ def load_worldview_from_dir(work_dir: "Path") -> dict | None:
                 if isinstance(data, dict):
                     if not worldview['worldview']:
                         worldview['worldview'] = data.get('worldview', '')
-                    # 支持 characters 数组格式 [{name, role, personality}]
                     chars = data.get('characters', [])
                     if isinstance(chars, list):
                         for char in chars:
@@ -402,11 +400,12 @@ def load_worldview_from_dir(work_dir: "Path") -> dict | None:
                     if not worldview['scene']:
                         worldview['scene'] = data.get('scene', '')
                 has_any = True
+                _add_source(fpath)
                 print(f"  [世界观] 加载文件: {fpath.absolute()}")
         except Exception as e:
             print(f"  [世界观] 读取 {fpath.absolute()} 失败: {e}")
 
-    return worldview if has_any else None
+    return (worldview if has_any else None, sources)
 
 
 # ==================== 世界观文件路径 ====================

@@ -137,13 +137,17 @@ class OpenAICompatEngine:
         if self._client is not None:
             return
         from openai import OpenAI
+        import os as _os
+        # 先清理代理环境变量，再创建客户端（避免 httpx 读取代理配置）
+        for _k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+            _os.environ.pop(_k, None)
+        _os.environ['NO_PROXY'] = '*'
         # 兼容 config.json 的 "key" 和旧版 "api_key" 字段名
         api_key = self.config.get('key') or self.config.get('api_key', 'sk-no-key')
         base_url = self.config.get('base_url', 'http://localhost:8000/v1')
         timeout = self.config.get('timeout', 120)
         if self.verbose:
             print(f"  [API初始化] base_url={base_url}, timeout={timeout}s, key={api_key[:12]}...")
-        import os as _os
         self._client = OpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -151,9 +155,6 @@ class OpenAICompatEngine:
             # 禁用代理，避免系统代理干扰 API 直连
             http_client=None,
         )
-        # 确保无代理环境变量
-        for _k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
-            _os.environ.pop(_k, None)
 
     # ---------- Prompt 构建 ----------
 
@@ -203,6 +204,14 @@ class OpenAICompatEngine:
             "- R18部分采用中文成人音声/同人作品常见且自然的表达方式；\n"
             "- 使用符合中文口语习惯、流畅自然的译文；\n"
             "- 保留角色原有的语气特点（如害羞、撒娇、挑逗、发情、宠溺、冷淡等）。\n\n"
+            "Step 4：译文回检（内部执行，不输出修正过程）\n"
+            "- 逐行重读你的中文译文，检查是否存在以下任何一种情况：\n"
+            "  ① 某个中文词在当下语境中完全说不通、不构成有效含义；\n"
+            "  ② 某个词明显是日文汉字的照搬，而非中文里自然存在的表达；\n"
+            "  ③ 某个词孤立地看没问题，但与上下文的语义完全矛盾。\n"
+            "- 如果发现以上情况：回到对应的日文ASR行，根据发音和上下文推断原词后重新翻译该处，"
+            "不要不加思考地把日文汉字直接抄成中文。\n"
+            "- 如果ASR乱码确实无法推断原词，将该处中文标记为 [ASR不明] ，不要保留无意义的假词。\n\n"
             "【翻译原则补充】\n"
             "- 本任务仅为对用户提供文本进行ASR纠错与跨语言翻译，不对文本题材进行评价；\n"
             "- 对原文涉及的亲密关系、成人情节、特殊设定及虚构世界观，均应视为待翻译内容，保持中立、客观和忠实；\n"
@@ -353,17 +362,22 @@ class OpenAICompatEngine:
         gen_params = self.config.get('generation_params', {})
         last_error = None
 
-        # DEBUG: 打印实际待翻译内容（尾部，跳过头部的格式说明）
+        # DEBUG: 只打印待翻译的日文原文（跳过格式说明和台本参考）
         if self.verbose:
             lines = user_prompt.split('\n')
-            # 找 "【待翻译输入" 之后的内容
+            # 找到 <asr> 标签中的实际待翻译内容
             content_start = 0
             for i, l in enumerate(lines):
-                if '【待翻译输入' in l:
-                    content_start = i
+                if '<asr>' in l or '<!-- 请翻译以下内容 -->' in l:
+                    content_start = i + 1
                     break
-            actual = '\n'.join(lines[content_start:content_start + 15])
-            print(f"  [DEBUG] 待翻译内容(前15行):\n{actual}", flush=True)
+            if content_start > 0:
+                actual = '\n'.join(lines[content_start:content_start + 15])
+                print(f"  [DEBUG] 待翻译日文(前15行):\n{actual}", flush=True)
+            else:
+                # 回退：只打印后15行（跳过格式说明部分）
+                actual = '\n'.join(lines[-15:])
+                print(f"  [DEBUG] 待翻译内容(后15行):\n{actual}", flush=True)
 
         for attempt in range(max_retries):
             try:
@@ -371,9 +385,14 @@ class OpenAICompatEngine:
                 _allowed = ('temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty',
                            'stop', 'logit_bias', 'user', 'reasoning_effort')
                 _filtered = {k: v for k, v in gen_params.items() if k in _allowed}
-                # 翻译使用大 max_tokens（与旧代码一致：131072），避免输出截断
-                _filtered['max_tokens'] = gen_params.get('max_tokens_translate',
-                                            gen_params.get('max_tokens', 131072))
+                # 翻译使用大 max_tokens，避免输出截断
+                # 优先读 max_tokens_translate（专用），其次 max_tokens（通用），再 fallback 131072
+                _tok = gen_params.get('max_tokens_translate',
+                       gen_params.get('max_tokens', 131072))
+                # 兜底：翻译至少需要 16384 token（140 行 JSON 约需 6000-12000 token）
+                if _tok < 16384:
+                    _tok = 131072
+                _filtered['max_tokens'] = _tok
 
                 # 心跳线程：长请求时打印等待进度
                 import threading
@@ -405,10 +424,17 @@ class OpenAICompatEngine:
 
                 content = response.choices[0].message.content or ''
 
-                # DEBUG: 打印返回内容前10行
+                # DEBUG: 尝试提取翻译结果供预览
                 if self.verbose:
-                    resp_preview = '\n'.join(content.split('\n')[:10])
-                    print(f"  [DEBUG] 返回内容前10行:\n{resp_preview}", flush=True)
+                    parsed = self._extract_json_array(content)
+                    if parsed:
+                        preview = []
+                        for i, t in enumerate(parsed[:10]):
+                            preview.append(f"  [{i+1}] {t}")
+                        print(f"  [DEBUG] 译文预览(前10行):\n" + '\n'.join(preview), flush=True)
+                    else:
+                        resp_preview = '\n'.join(content.split('\n')[:5])
+                        print(f"  [DEBUG] 返回内容(前5行):\n{resp_preview}", flush=True)
 
                 # 提取 token 统计
                 usage = response.usage

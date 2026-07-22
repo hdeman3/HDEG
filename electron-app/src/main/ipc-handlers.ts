@@ -1,4 +1,4 @@
-import { BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent } from 'electron';
 import { PythonBridge } from './python-bridge';
 import { ConfigStore } from './config-store';
 import path from 'path';
@@ -38,6 +38,7 @@ export function registerIpcHandlers(
   // ==================== 文件扫描（工作目录 → RJ 作品列表） ====================
 
   ipcMain.handle('folder:scanWorks', async (_event, dirPath: string) => {
+    const fsPromises = fs.promises;
     const audioExts = ['.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.wma', '.mp4', '.mkv', '.avi', '.mov', '.webm'];
     const lrcExts = ['.lrc', '.srt', '.vtt'];
     const resultWorks: Array<{
@@ -49,10 +50,9 @@ export function registerIpcHandlers(
     }> = [];
 
     try {
-      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      const entries = await fsPromises.readdir(dirPath, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
-        // 匹配 RJ 开头的文件夹
         if (!entry.name.startsWith('RJ')) continue;
         const workPath = path.join(dirPath, entry.name);
         const workId = entry.name;
@@ -60,30 +60,39 @@ export function registerIpcHandlers(
         const lrcFiles: Array<{ name: string; path: string; hasJaLrc: boolean; hasCnLrc: boolean; size: number }> = [];
         const audioFiles: string[] = [];
 
-        // 递归扫描该作品文件夹
-        function scanWorkDir(currentPath: string) {
+        // 异步递归扫描
+        async function scanWorkDir(currentPath: string): Promise<void> {
           try {
-            const subEntries = fs.readdirSync(currentPath, { withFileTypes: true });
+            const subEntries = await fsPromises.readdir(currentPath, { withFileTypes: true });
             for (const sub of subEntries) {
               const fullPath = path.join(currentPath, sub.name);
               if (sub.isDirectory()) {
-                scanWorkDir(fullPath);
+                await scanWorkDir(fullPath);
               } else {
                 const ext = path.extname(sub.name).toLowerCase();
                 if (lrcExts.includes(ext)) {
-                  // 跳过带语言标记的文件（.ja.lrc / .cn.lrc）
                   if (/\.([a-z]{2})\.(lrc|srt|vtt)$/i.test(sub.name)) continue;
 
                   const baseName = sub.name.replace(new RegExp(ext + '$'), '');
                   const jaLrcPath = path.join(currentPath, `${baseName}.ja.lrc`);
-                  const hasJaLrc = fs.existsSync(jaLrcPath);
-                  const lrcSize = fs.statSync(fullPath).size;
+                  let hasJaLrc = false;
+                  let lrcSize = 0;
+                  try {
+                    const stat = await fsPromises.stat(fullPath);
+                    lrcSize = stat.size;
+                    await fsPromises.access(jaLrcPath);
+                    hasJaLrc = true;
+                  } catch {}
 
-                  // 后端判断：读 LRC 内容检测中文/翻译分隔符
+                  // 检测中文/翻译分隔符（只读前 4KB）
                   let hasTranslation = false;
                   if (lrcSize > 10) {
                     try {
-                      const sample = fs.readFileSync(fullPath, 'utf-8').slice(0, 4096);
+                      const fh = await fsPromises.open(fullPath, 'r');
+                      const buf = Buffer.alloc(4096);
+                      await fh.read(buf, 0, 4096, 0);
+                      await fh.close();
+                      const sample = buf.toString('utf-8');
                       hasTranslation = /[一-鿿㐀-䶿]|[／]/.test(sample);
                     } catch {}
                   }
@@ -103,13 +112,13 @@ export function registerIpcHandlers(
           } catch { /* skip inaccessible directories */ }
         }
 
-        scanWorkDir(workPath);
+        await scanWorkDir(workPath);
 
-        // 检测台本文件 (.txt / .pdf)，使用正则匹配常见台本命名
+        // 台本检测（异步）
         let hasScriptbook = false;
         const scriptbookPattern = /(台本|シナリオ|script|台詞|セリフ|せりふ|原作|テキスト|筋書き|脚本|戯曲)/i;
         try {
-          const allFiles = fs.readdirSync(workPath, { recursive: true }) as string[];
+          const allFiles = await fsPromises.readdir(workPath, { recursive: true }) as string[];
           hasScriptbook = allFiles.some((f: string) => {
             const ext = path.extname(f).toLowerCase();
             if (ext !== '.txt' && ext !== '.pdf') return false;
@@ -148,6 +157,10 @@ export function registerIpcHandlers(
   ipcMain.handle('translate:cancel', async () => {
     pythonBridge.kill();
     return { success: true };
+  });
+
+  ipcMain.handle('translate:status', async () => {
+    return pythonBridge.getStatus();
   });
 
   // ==================== 辅助翻译文件 (terms / worldview) ====================
@@ -192,6 +205,35 @@ export function registerIpcHandlers(
     }
   });
 
+  // ==================== 预设管理 ====================
+
+  ipcMain.handle('config:listPresets', async () => {
+    return { presets: configStore.listPresets(), active: configStore.getActivePreset() };
+  });
+
+  ipcMain.handle('config:setActivePreset', async (_event, name: string) => {
+    return configStore.setActivePreset(name);
+  });
+
+  ipcMain.handle('config:savePreset', async (_event, name: string) => {
+    return configStore.savePreset(name);
+  });
+
+  ipcMain.handle('config:deletePreset', async (_event, name: string) => {
+    return configStore.deletePreset(name);
+  });
+
+  // ==================== 一致性检查 ====================
+
+  ipcMain.handle('review:consistencyCheck', async (_event, workDir: string) => {
+    try {
+      const report = await pythonBridge.runConsistencyCheck(workDir);
+      return { success: true, data: report };
+    } catch (e: unknown) {
+      return { success: false, error: (e as Error).message };
+    }
+  });
+
   // ==================== 工具函数 ====================
 
   ipcMain.handle('utils:openFolder', async (_event, dirPath: string) => {
@@ -201,6 +243,10 @@ export function registerIpcHandlers(
   });
 
   ipcMain.handle('utils:getProjectRoot', async () => {
+    // 打包模式下 Python 后端在 resources/python-backend/
+    if (app.isPackaged) {
+      return path.join(process.resourcesPath, 'python-backend');
+    }
     return path.join(__dirname, '../../../');
   });
 }

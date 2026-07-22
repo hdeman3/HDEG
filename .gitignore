@@ -147,3 +147,5 @@ pdf台本/.worldview.json
 文本台本/.alias.json
 文本台本/.terms.json
 文本台本/.worldview.json
+electron-app/node_modules/
+转录模型/

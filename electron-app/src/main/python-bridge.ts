@@ -36,12 +36,32 @@ export class PythonBridge extends EventEmitter {
   private process: ChildProcess | null = null;
   private projectRoot: string;
   private webContents: WebContents;
+  private isPackaged: boolean;
   private buffer: string = '';
 
-  constructor(projectRoot: string, webContents: WebContents) {
+  constructor(projectRoot: string, webContents: WebContents, isPackaged: boolean) {
     super();
     this.projectRoot = projectRoot;
     this.webContents = webContents;
+    this.isPackaged = isPackaged;
+  }
+
+  /**
+   * 构建干净的环境变量——移除系统代理变量，确保 Python API 直连
+   */
+  private buildCleanEnv(): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = {};
+    for (const [key, val] of Object.entries(process.env)) {
+      if (val === undefined) continue;
+      env[key] = val;
+    }
+    // 移除所有代理相关变量
+    for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']) {
+      delete env[k];
+    }
+    env.NO_PROXY = '*';
+    env.PYTHONUNBUFFERED = '1';
+    return env;
   }
 
   /**
@@ -50,20 +70,36 @@ export class PythonBridge extends EventEmitter {
   runTranslate(workDir: string, config: Record<string, unknown>, workId?: string): void {
     this.kill();
 
-    // 写入工作目录到 input_path.txt
     const fs = require('fs');
-    const inputPathFile = path.join(this.projectRoot, 'input_path.txt');
-    fs.writeFileSync(inputPathFile, workDir, 'utf-8');
+    const env = this.buildCleanEnv();
 
-    // 启动 Python 子进程
-    const pythonPath = 'python';
-    const scriptPath = path.join(this.projectRoot, 'translate.py');
+    if (this.isPackaged) {
+      // 打包模式：直接运行 PyInstaller 打包的 main.exe
+      // 把 config 写入临时文件传给 main.exe（API key 等配置）
+      const os = require('os');
+      const tmpConfigPath = path.join(os.tmpdir(), 'zhuan-yi-config.json');
+      fs.writeFileSync(tmpConfigPath, JSON.stringify(config, null, 2), 'utf-8');
+      const exePath = path.join(this.projectRoot, 'main.exe');
+      console.log(`[python-bridge] 打包模式: ${exePath} --config ${tmpConfigPath} ${workDir}`);
+      this.process = spawn(exePath, ['--config', tmpConfigPath, workDir], {
+        cwd: this.projectRoot,
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } else {
+      // 开发模式：python translate.py
+      const inputPathFile = path.join(this.projectRoot, 'input_path.txt');
+      fs.writeFileSync(inputPathFile, workDir, 'utf-8');
 
-    this.process = spawn(pythonPath, ['-u', scriptPath], {
-      cwd: this.projectRoot,
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+      const pythonPath = 'python';
+      const scriptPath = path.join(this.projectRoot, 'main.py');
+
+      this.process = spawn(pythonPath, ['-u', scriptPath], {
+        cwd: this.projectRoot,
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    }
 
     this.emit('started');
 
@@ -92,14 +128,26 @@ export class PythonBridge extends EventEmitter {
 
   /**
    * 直接运行 Python 脚本并返回结果
+   * 打包模式下用 main.exe 执行内联脚本（通过 --run-script 子命令）
    */
   runPython(args: string[]): Promise<string> {
     return new Promise((resolve, reject) => {
-      const pythonPath = 'python';
-      const proc = spawn(pythonPath, ['-u', ...args], {
-        cwd: this.projectRoot,
-        env: { ...process.env, PYTHONUNBUFFERED: '1' },
-      });
+      let proc: ChildProcess;
+
+      if (this.isPackaged) {
+        // 打包模式：main.exe --run-script <tmpfile>
+        const exePath = path.join(this.projectRoot, 'main.exe');
+        proc = spawn(exePath, ['--run-script', ...args], {
+          cwd: this.projectRoot,
+          env: this.buildCleanEnv(),
+        });
+      } else {
+        const pythonPath = 'python';
+        proc = spawn(pythonPath, ['-u', ...args], {
+          cwd: this.projectRoot,
+          env: this.buildCleanEnv(),
+        });
+      }
 
       let stdout = '';
       let stderr = '';
@@ -163,26 +211,48 @@ export class PythonBridge extends EventEmitter {
   private findAndReadAidFile(workDir: string, name: string): { data: unknown; foundPath: string } | null {
     const fs = require('fs');
 
-    // 构建搜索目录列表: workDir + 所有一级子目录
-    const searchDirs = [workDir];
+    // 递归收集所有子目录（最多 3 层，避免性能问题）
+    const searchDirs: string[] = [workDir];
     try {
-      const entries = fs.readdirSync(workDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          searchDirs.push(path.join(workDir, entry.name));
-        }
-      }
+      const collectDirs = (dir: string, depth: number) => {
+        if (depth > 3) return;
+        try {
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.isDirectory()) {
+              const fullPath = path.join(dir, entry.name);
+              searchDirs.push(fullPath);
+              collectDirs(fullPath, depth + 1);
+            }
+          }
+        } catch {}
+      };
+      collectDirs(workDir, 1);
     } catch {}
+
+    // 反转搜索顺序：从最深子目录开始搜索，优先找到离字幕文件最近的数据
+    // 避免父目录的空 {} 文件抢先匹配而遮盖子目录中的真实数据
+    searchDirs.reverse();
 
     const candidates = [`.${name}.json`, `${name}.json`];
 
+    // 从最深子目录搜索，跳过空数据（{} 或 []），取第一个有效文件
     for (const dir of searchDirs) {
       for (const filename of candidates) {
         const filePath = path.join(dir, filename);
         try {
           if (fs.existsSync(filePath)) {
             const raw = fs.readFileSync(filePath, 'utf-8');
-            return { data: JSON.parse(raw), foundPath: dir };
+            const data = JSON.parse(raw);
+            // 跳过空数据：空对象 {} 或空数组 []
+            const isEmpty = (Array.isArray(data) && data.length === 0) ||
+              (!Array.isArray(data) && typeof data === 'object' && data !== null && Object.keys(data).length === 0);
+            if (isEmpty) {
+              console.log(`[python-bridge] 跳过空的 ${name} 文件: ${filePath}`);
+              continue;
+            }
+            console.log(`[python-bridge] 找到 ${name} 文件: ${filePath}, keys=${Object.keys(data).join(',')}`);
+            return { data, foundPath: dir };
           }
         } catch (e) {
           console.error(`读取 ${filePath} 失败:`, e);
@@ -190,6 +260,7 @@ export class PythonBridge extends EventEmitter {
       }
     }
 
+    console.log(`[python-bridge] 未找到 ${name} 文件, 搜索了 ${searchDirs.length} 个目录`);
     return null;
   }
 
@@ -327,10 +398,40 @@ print('ok')
     }
   }
 
+  /**
+   * 运行一致性检查——跨文件对比翻译术语一致性
+   */
+  async runConsistencyCheck(workDir: string): Promise<Record<string, unknown>> {
+    const script = `
+import sys
+sys.path.insert(0, r'${this.projectRoot.replace(/\\/g, '\\\\')}')
+from pathlib import Path
+from core.consistency_checker import check_consistency
+import json
+report = check_consistency(Path(r'${workDir.replace(/\\/g, '\\\\')}'))
+print(json.dumps(report, ensure_ascii=False))
+`.trim();
+
+    const fs = require('fs');
+    const tmpScript = path.join(this.projectRoot, '_consistency_check_tmp.py');
+    fs.writeFileSync(tmpScript, script, 'utf-8');
+
+    try {
+      const output = await this.runPython([tmpScript]);
+      return JSON.parse(output);
+    } finally {
+      try { fs.unlinkSync(tmpScript); } catch {}
+    }
+  }
+
   kill(): void {
     if (this.process) {
       this.process.kill();
       this.process = null;
     }
+  }
+
+  getStatus(): { running: boolean } {
+    return { running: this.process !== null };
   }
 }

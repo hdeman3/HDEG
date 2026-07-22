@@ -558,10 +558,10 @@ def load_config():
 CONFIG = load_config()
 
 # ==================== 网络代理 ====================
-if CONFIG["network"]["clear_proxy_on_startup"]:
-    for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'):
-        os.environ.pop(key, None)
-    os.environ['NO_PROXY'] = '*'
+# 无条件清除系统代理环境变量，避免代理干扰 API 直连
+for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+    os.environ.pop(key, None)
+os.environ['NO_PROXY'] = '*'
 
 # ==================== API 初始化 ====================
 _api_cfg = CONFIG["api"]
@@ -569,7 +569,12 @@ if not _api_cfg.get("key"):
     print("错误: 请在 config.json 中配置 api.key")
     sys.exit(1)
 
-client = OpenAI(api_key=_api_cfg["key"], base_url=_api_cfg["base_url"])
+# http_client=None 配合上方环境变量清理，确保不走系统代理
+client = OpenAI(
+    api_key=_api_cfg["key"],
+    base_url=_api_cfg["base_url"],
+    http_client=None,
+)
 
 # ==================== 路径与工作目录 ====================
 _app_cfg = CONFIG["app"]
@@ -706,7 +711,8 @@ def print_summary_report():
     print(f"总翻译文件数: {total_files}")
     print(f"使用台本的作品数: {total_scriptbook_used}")
     print(f"总用时: {total_time:.1f} 秒 ({total_time/60:.1f} 分钟)")
-    print(f"总Token用量: 命中 {total_hit:,} | 未命中 {total_miss:,} | 输出 {total_completion:,}")
+    hit_rate = (total_hit / (total_hit + total_miss) * 100) if (total_hit + total_miss) > 0 else 0
+    print(f"📊 总Token: {total_hit + total_miss + total_completion:,}  🟢命中{total_hit:,}({hit_rate:.0f}%)  🔵未命中{total_miss:,}  🟣输出{total_completion:,}")
     print(f"总费用: {total_cost:.4f} 元")
     
     # API 配置信息
@@ -748,10 +754,12 @@ def print_summary_report():
         if report.get('scriptbook_used'):
             print(f"  台本音轨数: {_scriptbook_tracks}")
             print(f"  台本行数: {_scriptbook_lines}")
-        print(f"  Token: 命中 {report.get('hit_tokens', 0):,} | "
-              f"未命中 {report.get('miss_tokens', 0):,} | "
-              f"输出 {report.get('completion_tokens', 0):,}")
-        print(f"  费用: {report.get('cost', 0):.4f} 元")
+        _h = report.get('hit_tokens', 0)
+        _m = report.get('miss_tokens', 0)
+        _c = report.get('completion_tokens', 0)
+        _hr = (_h / (_h + _m) * 100) if (_h + _m) > 0 else 0
+        print(f"  📊 Token: 总计{_h+_m+_c:,}  🟢命中{_h:,}({_hr:.0f}%)  🔵未命中{_m:,}  🟣输出{_c:,}")
+        print(f"  💰 费用: ¥{report.get('cost', 0):.4f}")
         print(f"  用时: {report.get('elapsed_time', 0):.1f} 秒")
     
     print("\n" + "=" * 60)
@@ -6208,9 +6216,9 @@ def translate_lrc_file(source_path: Path, target_path: Path, terms: dict[str, st
     cost_miss = (total_miss_tokens / 1_000_000) * PRICE_MISS_PER_1M
     cost_completion = (total_completion_tokens / 1_000_000) * PRICE_COMPLETION_PER_1M
     cost_total = cost_hit + cost_miss + cost_completion
-    print(f" ✓ 完成 -> {target_path.name}")
-    print(f" 💰 累计费用: 命中{cost_hit:.4f}元 + 未命中{cost_miss:.4f}元 + 输出{cost_completion:.4f}元 = {cost_total:.4f}元")
-    print(f"    (命中{total_hit_tokens}tokens / 未命中{total_miss_tokens}tokens / 输出{total_completion_tokens}tokens)")
+    print(f" ✅ 完成 -> {target_path.name}")
+    print(f" 💰 累计费用: ¥{cost_total:.4f}  (🟢命中¥{cost_hit:.4f} + 🔵未命中¥{cost_miss:.4f} + 🟣输出¥{cost_completion:.4f})")
+    print(f"    (🟢命中{total_hit_tokens:,}tokens / 🔵未命中{total_miss_tokens:,}tokens / 🟣输出{total_completion_tokens:,}tokens)")
 
     # 返回原始歌词和翻译结果，用于动态术语更新
     return True, original_lyrics, translated_lyrics
@@ -6891,14 +6899,31 @@ def analyze_work_terms(work_dir: Path) -> tuple[dict[str, str], list[dict], dict
     alias_path = get_alias_path(work_dir)
     worldview_path = get_worldview_path(work_dir)
 
-    # 如果已存在术语表、alias表和世界观，直接加载
-    if terms_path.exists() and alias_path.exists() and worldview_path.exists():
+    # 分别加载已缓存的结果，避免缺一个就全部重建
+    terms: dict = {}
+    alias_list: list = []
+    worldview: dict = {}
+    all_cached = True
+
+    if terms_path.exists():
         terms = load_terms(work_dir)
-        alias_list = load_alias(work_dir)
-        worldview = load_worldview(work_dir)
         print(f"  加载已有术语表: {len(terms)} 个")
+    else:
+        all_cached = False
+
+    if alias_path.exists():
+        alias_list = load_alias(work_dir)
         print(f"  加载已有 alias 表: {len(alias_list)} 个")
+    else:
+        all_cached = False
+
+    if worldview_path.exists():
+        worldview = load_worldview(work_dir)
         print(f"  加载已有世界观: {worldview.get('worldview', '')[:50]}...")
+    else:
+        all_cached = False
+
+    if all_cached:
         return terms, alias_list, worldview
 
     # 检测是否为 freetalk 或热门CV
@@ -6911,40 +6936,64 @@ def analyze_work_terms(work_dir: Path) -> tuple[dict[str, str], list[dict], dict
         # FreeTalk 模式：返回空术语表，不构建世界观
         return {}, [], {}
 
+    need_worldview = not worldview
+    need_terms = not terms or not alias_list
+
+    if not need_worldview and not need_terms:
+        print("  所有分析结果已缓存，跳过")
+        return terms, alias_list, worldview
+
     if not _FUGASHI_AVAILABLE:
         print("  ⚠ fugashi 未安装，跳过术语分析")
-        return {}, [], {}
+        return terms, alias_list, worldview
 
     print("  正在分析作品...", flush=True)
+    needs_samples = need_worldview or need_terms
 
-    # 先从文件名提取角色名候选（高置信度）
-    print("    [文件名] 正在提取角色名候选...", flush=True)
-    filename_names = extract_names_from_filenames(work_dir)
-    if filename_names:
-        print(f"    [文件名] 发现角色名候选: {', '.join(list(filename_names)[:5])}", flush=True)
+    if needs_samples:
+        # 先从文件名提取角色名候选（高置信度）
+        print("    [文件名] 正在提取角色名候选...", flush=True)
+        filename_names = extract_names_from_filenames(work_dir)
+        if filename_names:
+            print(f"    [文件名] 发现角色名候选: {', '.join(list(filename_names)[:5])}", flush=True)
 
-    # 使用新的抽样函数：抽取所有 .ja.lrc 文件
-    print("    [1/5] 抽样所有 .ja.lrc 文件...", flush=True)
-    samples, cores = sample_all_lrc_files(work_dir, lines_per_file=40)
-    print(f"    [1/5] 抽样完成: {len(samples)} 个文件样本, {len(cores)} 个 core")
+        # 抽样所有 .ja.lrc 文件
+        print("    [1/5] 抽样所有 .ja.lrc 文件...", flush=True)
+        samples, cores = sample_all_lrc_files(work_dir, lines_per_file=40)
+        print(f"    [1/5] 抽样完成: {len(samples)} 个文件样本, {len(cores)} 个 core")
+    else:
+        samples, cores = [], []
+        filename_names = set()
 
-    # 2. 世界观分析（新增步骤）
-    print("    [2/5] 调用 LLM 分析世界观...")
-    worldview = analyze_worldview_with_llm(samples)
-    if worldview:
-        save_worldview(work_dir, worldview)
-        print(f"    [2/5] 世界观已保存")
+    # 2. 世界观分析（仅缺失时执行）
+    if need_worldview:
+        print("    [2/5] 调用 LLM 分析世界观...")
+        worldview = analyze_worldview_with_llm(samples)
+        if worldview:
+            save_worldview(work_dir, worldview)
+            print(f"    [2/5] 世界观已保存")
+    else:
+        print("    [2/5] 世界观已缓存，跳过")
 
-    # 3. 生成读音相似簇
-    print("    [3/5] 正在比对读音相似性...")
-    clusters = find_similar_reading_clusters(cores)
-    print(f"    [3/5] 读音相似候选簇: {len(clusters)} 个")
-    for i, c in enumerate(clusters[:5], 1):
-        print(f"      簇{i}: {' / '.join(c)}")
+    # 3-5. 术语和 alias（仅缺失时执行）
+    if need_terms:
+        # 3. 生成读音相似簇
+        print("    [3/5] 正在比对读音相似性...")
+        clusters = find_similar_reading_clusters(cores)
+        print(f"    [3/5] 读音相似候选簇: {len(clusters)} 个")
+        for i, c in enumerate(clusters[:5], 1):
+            print(f"      簇{i}: {' / '.join(c)}")
 
-    # 4. 调用 LLM 分析术语
-    print("    [4/5] 调用 LLM 分析角色和术语...")
-    terms, alias_list = analyze_characters_with_llm(cores, clusters, filename_names)
+        # 4. 调用 LLM 分析术语
+        print("    [4/5] 调用 LLM 分析角色和术语...")
+        new_terms, new_alias = analyze_characters_with_llm(cores, clusters, filename_names)
+        if new_terms:
+            terms = new_terms
+        if new_alias:
+            alias_list = new_alias
+    else:
+        print("    [3/5] 术语表已缓存，跳过")
+        print("    [4/5] alias 表已缓存，跳过")
 
     # 5. 保存
     print("    [5/5] 保存分析结果...")
@@ -7853,9 +7902,9 @@ def translate_scriptbook_file(source_path: Path, target_path: Path, terms: dict[
     cost_miss = (total_miss_tokens / 1_000_000) * PRICE_MISS_PER_1M
     cost_completion = (total_completion_tokens / 1_000_000) * PRICE_COMPLETION_PER_1M
     cost_total = cost_hit + cost_miss + cost_completion
-    print(f" ✓ 完成 -> {target_path.name}")
-    print(f" 💰 累计费用: 命中{cost_hit:.4f}元 + 未命中{cost_miss:.4f}元 + 输出{cost_completion:.4f}元 = {cost_total:.4f}元")
-    
+    print(f" ✅ 完成 -> {target_path.name}")
+    print(f" 💰 累计费用: ¥{cost_total:.4f}  (🟢命中¥{cost_hit:.4f} + 🔵未命中¥{cost_miss:.4f} + 🟣输出¥{cost_completion:.4f})")
+
     return True, original_texts, translated_texts
 
 
@@ -8460,14 +8509,18 @@ def main():
     cost_miss = (total_miss_tokens / 1_000_000) * PRICE_MISS_PER_1M
     cost_completion = (total_completion_tokens / 1_000_000) * PRICE_COMPLETION_PER_1M
     cost_total = cost_hit + cost_miss + cost_completion
-    print("=" * 50)
-    print("API 费用统计")
-    print("=" * 50)
-    print(f"  缓存命中: {total_hit_tokens:,} tokens × {PRICE_HIT_PER_1M}元/百万 = {cost_hit:.4f} 元")
-    print(f"  缓存未命中: {total_miss_tokens:,} tokens × {PRICE_MISS_PER_1M}元/百万 = {cost_miss:.4f} 元")
-    print(f"  输出tokens: {total_completion_tokens:,} tokens × {PRICE_COMPLETION_PER_1M}元/百万 = {cost_completion:.4f} 元")
-    print(f"  总费用: {cost_total:.4f} 元")
-    print("=" * 50)
+    total_tok = total_hit_tokens + total_miss_tokens + total_completion_tokens
+    hit_rate = (total_hit_tokens / (total_hit_tokens + total_miss_tokens) * 100) if (total_hit_tokens + total_miss_tokens) > 0 else 0
+    print("=" * 55)
+    print("  📊 API 用量 & 费用统计")
+    print("=" * 55)
+    print(f"  📊 总Token: {total_tok:,}")
+    print(f"  🟢 缓存命中: {total_hit_tokens:,} tokens ({hit_rate:.1f}%) × ¥{PRICE_HIT_PER_1M}/百万 = ¥{cost_hit:.4f}")
+    print(f"  🔵 缓存未命中: {total_miss_tokens:,} tokens × ¥{PRICE_MISS_PER_1M}/百万 = ¥{cost_miss:.4f}")
+    print(f"  🟣 输出Token: {total_completion_tokens:,} tokens × ¥{PRICE_COMPLETION_PER_1M}/百万 = ¥{cost_completion:.4f}")
+    print(f"  {'─' * 50}")
+    print(f"  💰 总费用: ¥{cost_total:.4f}")
+    print("=" * 55)
     print()
     print("文件说明:")
     print("  .lrc / .srt / .vtt     = 当前使用的中文字幕（播放器读取）")

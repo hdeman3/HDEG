@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Button, Input, Typography, message, Select } from 'antd';
-import { ReloadOutlined, SaveOutlined, EditOutlined, SwapOutlined, SoundOutlined } from '@ant-design/icons';
+import { Button, Input, Typography, message, Select, Tabs } from 'antd';
+import { ReloadOutlined, SaveOutlined, EditOutlined, SwapOutlined, SoundOutlined, CheckCircleOutlined } from '@ant-design/icons';
 import { useAppStore } from '../stores/useAppStore';
 import type { TranslationRow } from '../types';
+import ConsistencyCheck from '../components/ConsistencyCheck';
 
 const { Text } = Typography;
 const { TextArea } = Input;
@@ -16,6 +17,7 @@ const Review: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [editValues, setEditValues] = useState<Record<number, string>>({});
   const [modifiedSet, setModifiedSet] = useState<Set<number>>(new Set());
+  const [reviewTab, setReviewTab] = useState<string>('review');
 
   var selectedWork = works.find(function(w) { return w.id === selectedWorkId; });
   var selectedWorkPath = selectedWork ? selectedWork.path : null;
@@ -179,43 +181,70 @@ const Review: React.FC = () => {
       {/* Content */}
       {!selectedWorkId ? (
         <div className="workspace-empty" style={{ padding: 40 }}><div className="workspace-empty-icon"><EditOutlined /></div><div className="workspace-empty-title">请先选择作品</div></div>
-      ) : !selectedTrack ? (
-        <div className="workspace-empty" style={{ padding: 40 }}><div className="workspace-empty-icon"><SoundOutlined /></div><div className="workspace-empty-title">请选择音轨</div><div className="workspace-empty-desc">{tracks.length > 0 ? tracks.length + ' 个字幕文件可选' : '暂无翻译结果'}</div></div>
-      ) : rows.length === 0 && !loading ? (
-        <div className="workspace-empty" style={{ padding: 40 }}><div className="workspace-empty-title">无内容</div></div>
+      ) : !selectedWorkPath ? (
+        <div className="workspace-empty" style={{ padding: 40 }}><div className="workspace-empty-icon"><SoundOutlined /></div><div className="workspace-empty-title">作品路径无效</div></div>
       ) : (
-        <div className="review-table-wrapper">
-          <div style={{ display: 'grid', gridTemplateColumns: '40px 80px 1fr 1.2fr', gap: 0, borderBottom: '1px solid var(--color-hairline)', background: 'var(--color-surface-1)' }}>
-            {['#', '时间戳', '原文', '译文'].map(function(h) {
-              return <div key={h} style={{ padding: '8px 12px', fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{h}</div>;
-            })}
-          </div>
-
-          <div style={{ maxHeight: 'calc(100vh - 240px)', overflowY: 'auto' }}>
-            {rows.filter(function(r) { return (r.original || '').trim() || (r.translation || '').trim(); }).map(function(record) {
-              var value = editValues[record.index] ?? record.translation;
-              var isModified = modifiedSet.has(record.index);
-              return (
-                <div key={record.filename + '-' + record.index}
-                  style={{ display: 'grid', gridTemplateColumns: '40px 80px 1fr 1.2fr', gap: 0, borderBottom: '1px solid var(--color-border-subtle)', transition: 'background 0.15s', minHeight: 36, alignItems: 'start' }}
-                  onMouseEnter={function(e) { (e.currentTarget as HTMLElement).style.background = 'var(--color-surface-hover)'; }}
-                  onMouseLeave={function(e) { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}>
-                  <div style={{ padding: '6px 8px', fontSize: 11, color: 'var(--color-text-muted)', lineHeight: '24px', textAlign: 'center' }}>{record.index}</div>
-                  <div style={{ padding: '6px 8px' }}><span className="review-timestamp">{record.timestamp}</span></div>
-                  <div style={{ padding: '6px 10px' }}>
-                    <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--color-text-secondary)', wordBreak: 'break-all', whiteSpace: 'pre-wrap' }}>{record.original}</div>
+        <Tabs
+          activeKey={reviewTab}
+          onChange={setReviewTab}
+          items={[
+            {
+              key: 'review',
+              label: '音轨审核',
+              children: !selectedTrack ? (
+                <div className="workspace-empty" style={{ padding: 40 }}>
+                  <div className="workspace-empty-icon"><SoundOutlined /></div>
+                  <div className="workspace-empty-title">请选择音轨</div>
+                  <div className="workspace-empty-desc">{tracks.length > 0 ? tracks.length + ' 个字幕文件可选' : '暂无翻译结果'}</div>
+                </div>
+              ) : rows.length === 0 && !loading ? (
+                <div className="workspace-empty" style={{ padding: 40 }}><div className="workspace-empty-title">无内容</div></div>
+              ) : (
+                <div className="review-table-wrapper">
+                  <div style={{ display: 'grid', gridTemplateColumns: '40px 80px 1fr 1.2fr', gap: 0, borderBottom: '1px solid var(--color-hairline)', background: 'var(--color-surface-1)' }}>
+                    {['#', '时间戳', '原文', '译文'].map(function(h) {
+                      return <div key={h} style={{ padding: '8px 12px', fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{h}</div>;
+                    })}
                   </div>
-                  <div style={{ padding: '4px 10px' }}>
-                    <TextArea className="review-edit-textarea" value={value}
-                      onChange={function(e) { handleEdit(record.index, e.target.value); }}
-                      autoSize={{ minRows: 1, maxRows: 4 }}
-                      style={{ fontSize: 12, lineHeight: 1.5, background: isModified ? 'var(--color-accent-soft)' : undefined, borderColor: isModified ? 'var(--color-accent)' : undefined, resize: 'none' }} />
+                  <div style={{ maxHeight: 'calc(100vh - 300px)', overflowY: 'auto' }}>
+                    {rows.filter(function(r) { return (r.original || '').trim() || (r.translation || '').trim(); }).map(function(record) {
+                      var value = editValues[record.index] ?? record.translation;
+                      var isModified = modifiedSet.has(record.index);
+                      return (
+                        <div key={record.filename + '-' + record.index}
+                          style={{ display: 'grid', gridTemplateColumns: '40px 80px 1fr 1.2fr', gap: 0, borderBottom: '1px solid var(--color-border-subtle)', transition: 'background 0.15s', minHeight: 36, alignItems: 'start' }}
+                          onMouseEnter={function(e) { (e.currentTarget as HTMLElement).style.background = 'var(--color-surface-hover)'; }}
+                          onMouseLeave={function(e) { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}>
+                          <div style={{ padding: '6px 8px', fontSize: 11, color: 'var(--color-text-muted)', lineHeight: '24px', textAlign: 'center' }}>{record.index}</div>
+                          <div style={{ padding: '6px 8px' }}><span className="review-timestamp">{record.timestamp}</span></div>
+                          <div style={{ padding: '6px 10px' }}>
+                            <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--color-text-secondary)', wordBreak: 'break-all', whiteSpace: 'pre-wrap' }}>{record.original}</div>
+                          </div>
+                          <div style={{ padding: '4px 10px' }}>
+                            <TextArea className="review-edit-textarea" value={value}
+                              onChange={function(e) { handleEdit(record.index, e.target.value); }}
+                              autoSize={{ minRows: 1, maxRows: 4 }}
+                              style={{ fontSize: 12, lineHeight: 1.5, background: isModified ? 'var(--color-accent-soft)' : undefined, borderColor: isModified ? 'var(--color-accent)' : undefined, resize: 'none' }} />
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
-              );
-            })}
-          </div>
-        </div>
+              ),
+            },
+            {
+              key: 'consistency',
+              label: (
+                <span>
+                  <CheckCircleOutlined style={{ marginRight: 4 }} />
+                  一致性检查
+                </span>
+              ),
+              children: <ConsistencyCheck workPath={selectedWorkPath} />,
+            },
+          ]}
+        />
       )}
     </div>
   );

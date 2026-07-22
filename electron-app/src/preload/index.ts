@@ -9,6 +9,10 @@ export interface ElectronAPI {
     getAll: () => Promise<Record<string, unknown>>;
     getSection: (section: string) => Promise<Record<string, unknown>>;
     setSection: (section: string, data: Record<string, unknown>) => Promise<{ success: boolean }>;
+    listPresets: () => Promise<{ presets: string[]; active: string }>;
+    setActivePreset: (name: string) => Promise<{ success: boolean; config?: Record<string, unknown> }>;
+    savePreset: (name: string) => Promise<{ success: boolean }>;
+    deletePreset: (name: string) => Promise<{ success: boolean }>;
   };
 
   // 对话框
@@ -33,6 +37,7 @@ export interface ElectronAPI {
   translate: {
     start: (workDir: string, workId?: string) => Promise<{ success: boolean; error?: string }>;
     cancel: () => Promise<{ success: boolean }>;
+    getStatus: () => Promise<{ running: boolean; workDir: string | null; logs?: Array<{ level: string; message: string; time: string }> }>;
   };
 
   // 辅助翻译 (terms / alias / worldview)
@@ -62,6 +67,11 @@ export interface ElectronAPI {
       success: boolean;
       error?: string;
     }>;
+    consistencyCheck: (workDir: string) => Promise<{
+      success: boolean;
+      data?: Record<string, unknown>;
+      error?: string;
+    }>;
   };
 
   // 工具
@@ -83,6 +93,10 @@ const api: ElectronAPI = {
     getAll: () => ipcRenderer.invoke('config:getAll'),
     getSection: (section) => ipcRenderer.invoke('config:getSection', section),
     setSection: (section, data) => ipcRenderer.invoke('config:setSection', section, data),
+    listPresets: () => ipcRenderer.invoke('config:listPresets'),
+    setActivePreset: (name) => ipcRenderer.invoke('config:setActivePreset', name),
+    savePreset: (name) => ipcRenderer.invoke('config:savePreset', name),
+    deletePreset: (name) => ipcRenderer.invoke('config:deletePreset', name),
   },
 
   dialog: {
@@ -96,6 +110,7 @@ const api: ElectronAPI = {
   translate: {
     start: (workDir, workId) => ipcRenderer.invoke('translate:start', workDir, workId),
     cancel: () => ipcRenderer.invoke('translate:cancel'),
+    getStatus: () => ipcRenderer.invoke('translate:status'),
   },
 
   aid: {
@@ -107,6 +122,7 @@ const api: ElectronAPI = {
     fetchResults: (workDir) => ipcRenderer.invoke('review:fetchResults', workDir),
     saveEdit: (workDir, filename, index, newTranslation) =>
       ipcRenderer.invoke('review:saveEdit', workDir, filename, index, newTranslation),
+    consistencyCheck: (workDir) => ipcRenderer.invoke('review:consistencyCheck', workDir),
   },
 
   utils: {
@@ -115,7 +131,7 @@ const api: ElectronAPI = {
   },
 
   on: (channel: string, callback: (...args: unknown[]) => void) => {
-    const validChannels = ['python:message', 'python:log', 'python:done', 'python:error'];
+    const validChannels = ['python:message', 'python:log', 'python:done', 'python:error', 'python:init'];
     if (validChannels.includes(channel)) {
       const subscription = (_event: Electron.IpcRendererEvent, ...args: unknown[]) => callback(...args);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -126,7 +142,7 @@ const api: ElectronAPI = {
   },
 
   off: (channel: string, _callback: (...args: unknown[]) => void) => {
-    const validChannels = ['python:message', 'python:log', 'python:done', 'python:error'];
+    const validChannels = ['python:message', 'python:log', 'python:done', 'python:error', 'python:init'];
     if (validChannels.includes(channel)) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const subscription = (ipcRenderer as any).__subscriptions?.[channel] as (...args: unknown[]) => void;

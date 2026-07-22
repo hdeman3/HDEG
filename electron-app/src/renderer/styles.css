@@ -571,6 +571,19 @@ body {
   flex-direction: column;
   height: 100vh;
   background: transparent;
+  position: relative;
+  overflow: hidden;
+}
+
+/* ---- Background Layer ---- */
+.app-bg-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  pointer-events: none;
 }
 
 /* ---- Top Bar ---- */
@@ -578,7 +591,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 52px;
+  height: 80px;
   padding: 0 var(--space-20);
   background: var(--color-surface-glass);
   backdrop-filter: blur(12px);
@@ -588,7 +601,7 @@ body {
   user-select: none;
   flex-shrink: 0;
   position: relative;
-  z-index: 100;
+  z-index: 10;
 }
 
 .app-topbar::after {
@@ -608,33 +621,24 @@ body {
   gap: var(--space-16);
 }
 
-.app-brand {
-  font-size: 16px;
-  font-weight: 800;
-  color: var(--color-text-primary);
-  letter-spacing: -0.02em;
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.app-brand-accent {
-  background: var(--gradient-accent);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  font-weight: 800;
+.app-brand-icon {
+  height: 64px;
+  width: auto;
+  display: block;
+  border-radius: 8px;
+  -webkit-user-drag: none;
+  user-select: none;
 }
 
 .app-workdir {
-  font-size: 11px;
+  font-size: 13px;
   color: var(--color-text-muted);
-  max-width: 360px;
+  max-width: 520px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-mono);
-  padding: 4px 10px;
+  padding: 6px 14px;
   background: var(--color-surface-2);
   border-radius: var(--radius-sm);
   border: 1px solid var(--color-hairline);
@@ -645,6 +649,8 @@ body {
   display: flex;
   flex: 1;
   overflow: hidden;
+  position: relative;
+  z-index: 1;
 }
 
 /* ---- Sidebar ---- */
@@ -736,6 +742,13 @@ body {
   height: 20px;
   background: var(--gradient-accent);
   border-radius: 0 2px 2px 0;
+}
+
+/* Sidebar Footer */
+.app-sidebar-footer {
+  margin-top: auto;
+  padding: var(--space-12) var(--space-12) var(--space-16);
+  border-top: 1px solid var(--color-hairline);
 }
 
 /* Content Inner */

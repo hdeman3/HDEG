@@ -62,3 +62,37 @@ export interface LogEntry {
   message: string;
   time: string;
 }
+
+// ── 一致性检查 ──
+
+export interface ConflictItem {
+  source: string;
+  translations: string[];
+  files: string[];
+  count: number;
+  severity: 'high' | 'medium' | 'low';
+}
+
+export interface TermCoverageItem {
+  source: string;
+  expected: string;
+  actual: string | null;
+  found: boolean;
+  match: boolean;
+}
+
+export interface ConsistencyReport {
+  work_dir: string;
+  total_files: number;
+  total_lines: number;
+  conflicts: ConflictItem[];
+  uncovered_terms: TermCoverageItem[];
+  summary: {
+    conflict_count: number;
+    high_conflicts: number;
+    medium_conflicts: number;
+    unmatched_terms: number;
+    unused_terms: number;
+    total_terms_defined: number;
+  };
+}

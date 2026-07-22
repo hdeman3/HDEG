@@ -12,28 +12,20 @@ def get_resource_dir() -> Path:
     """获取资源目录路径
 
     优先级：
-    1. 环境变量 MODEL_DIR（手动指定，如 E:\转录模型\）
-    2. config.json 中的 transcription.model_dir
-    3. 打包后环境：exe 同级目录
-    4. 开发环境：当前脚本所在目录
+    1. config.json 中的 transcription.model_dir
+    2. 打包后环境：exe 同级目录
+    3. 开发环境：当前脚本所在目录
     """
-    # 1. 环境变量最高优先级
-    env_dir = os.environ.get('MODEL_DIR', '')
-    if env_dir:
-        p = Path(env_dir.strip('"').strip("'"))
-        if p.is_dir():
-            return p
-
-    # 2. 从 config.json 读取 transcription.model_dir
+    # 1. 从 config.json 读取 transcription.model_dir
     json_model_dir = _read_model_dir_from_config()
     if json_model_dir:
         return json_model_dir
 
     if getattr(sys, 'frozen', False):
-        # 3. 打包后环境
+        # 2. 打包后环境（main.exe 同级目录）
         return Path(sys.executable).parent
     else:
-        # 4. 开发环境
+        # 3. 开发环境
         return Path(__file__).parent
 
 

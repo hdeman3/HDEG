@@ -54,24 +54,38 @@ const TranslationAids: React.FC = () => {
 
   // ---- Load all aids when work changes ----
   useEffect(function() {
+    // 先清空旧数据，防止切换作品时残留上一作品的内容
+    setTerms({});
+    setAliasList([]);
+    setWorldviewText('');
+    setCharacters({});
+    setCharArray([]);
+    setSceneText('');
+    setThemes([]);
+    setSpecialTerms({});
+
+    // 🔍 排查：打印当前所有作品的 id→path 映射
+    console.log('[TranslationAids] 📋 当前作品列表:', works.map(function(w) { return w.id + ' → ' + w.path; }));
+
     if (!selectedWorkPath) {
-      setTerms({});
-      setAliasList([]);
-      setWorldviewText('');
-      setCharacters({});
-      setSceneText('');
+      console.log('[TranslationAids] ⚠ selectedWorkPath 为空, selectedWorkId=' + selectedWorkId + ', selectedWork=' + JSON.stringify(selectedWork));
       return;
     }
+
+    var currentWorkId = selectedWorkId; // 捕获本次请求的作品 ID
     (async function() {
       try {
-        console.log('[TranslationAids] 读取辅助翻译, workDir:', selectedWorkPath);
-        console.log('[TranslationAids] window.electronAPI:', typeof window.electronAPI, Object.keys(window.electronAPI || {}));
+        console.log('[TranslationAids] 📖 读取 workDir=' + selectedWorkPath + '  workId=' + currentWorkId);
         const data = await (window as any).electronAPI.aid.read(selectedWorkPath);
-        console.log('[TranslationAids] 读取结果:', {
-          termsCount: Object.keys(data.terms || {}).length,
-          aliasCount: (data.alias || []).length,
-          worldviewKeys: Object.keys(data.worldview || {}),
-        });
+        // 防止快速切换时旧请求覆盖新数据
+        if (currentWorkId !== selectedWorkId) {
+          console.log('[TranslationAids] 作品已切换，丢弃旧数据:', currentWorkId);
+          return;
+        }
+        console.log('[TranslationAids] ✅ 读取结果 workId=' + currentWorkId +
+          ' terms=' + Object.keys(data.terms || {}).length +
+          ' alias=' + (data.alias || []).length +
+          ' worldview=' + Object.keys(data.worldview || {}).join(','));
         setTerms(data.terms || {});
         setAliasList(data.alias || []);
         const wv = data.worldview || {};
@@ -82,7 +96,6 @@ const TranslationAids: React.FC = () => {
         const chars = wv.characters;
         if (Array.isArray(chars)) {
           setCharArray(chars as WorldviewCharacter[]);
-          // 也转换为简单格式用于编辑
           var simpleChars: Record<string, string> = {};
           (chars as WorldviewCharacter[]).forEach(function(c) {
             if (c.name) {
@@ -99,23 +112,15 @@ const TranslationAids: React.FC = () => {
           setCharArray([]);
         }
 
-        // 扩展字段: themes, special_terms
         setThemes(Array.isArray(wv.themes) ? wv.themes as string[] : []);
         setSpecialTerms(wv.special_terms && typeof wv.special_terms === 'object' ? wv.special_terms as Record<string, string> : {});
       } catch(e) {
+        if (currentWorkId !== selectedWorkId) return; // 已切换，忽略错误
         console.error('[TranslationAids] 读取失败:', e);
         message.error('读取辅助翻译数据失败: ' + (e instanceof Error ? e.message : String(e)));
-        setTerms({});
-        setAliasList([]);
-        setWorldviewText('');
-        setCharacters({});
-        setCharArray([]);
-        setSceneText('');
-        setThemes([]);
-        setSpecialTerms({});
       }
     })();
-  }, [selectedWorkPath]);
+  }, [selectedWorkId, selectedWorkPath]);
 
   // ============ Terms helpers ============
   const handleAddTerm = function() {
@@ -723,8 +728,9 @@ const TranslationAids: React.FC = () => {
         />
       </div>
 
-      {/* Tabs */}
+      {/* Tabs — key 确保切换作品时完全重建 */}
       <Tabs
+        key={selectedWorkId || 'no-work'}
         activeKey={activeTab}
         onChange={function(k) { setActiveTab(k); }}
         items={tabItems}

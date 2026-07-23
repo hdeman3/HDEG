@@ -121,16 +121,19 @@ class OpenAICompatEngine:
         self.verbose = verbose
         self._client = None
         self._system_prompt_file = system_prompt_file
-        # 预加载外部 prompt
+        # 预加载外部 prompt（优先指定的文件，其次内置融合版，最后回退到硬编码默认）
         self._external_system_prompt: str | None = None
-        if system_prompt_file:
-            try:
-                from pathlib import Path
+        try:
+            from pathlib import Path
+            if system_prompt_file:
                 sp_path = Path(system_prompt_file)
-                if sp_path.exists():
-                    self._external_system_prompt = sp_path.read_text(encoding='utf-8')
-            except Exception:
-                pass
+            else:
+                # 默认使用项目内置的融合版提示词
+                sp_path = Path(__file__).resolve().parent.parent / '提示词_融合版.txt'
+            if sp_path.exists():
+                self._external_system_prompt = sp_path.read_text(encoding='utf-8')
+        except Exception:
+            pass
 
     def _ensure_client(self):
         """延迟初始化 OpenAI 客户端"""

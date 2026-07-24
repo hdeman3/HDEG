@@ -240,21 +240,20 @@ def _llm_identify_scriptbook_files(
     candidates: list[Path],
     work_dir: Path,
     ctx: PipelineContext,
-) -> list[Path] | None:
-    """使用 LLM 从候选 txt/pdf 文件中识别台本
-
-    将所有备选文件的相对路径一次性发送给 LLM，
-    由 LLM 判断哪些是真正的台本文件。
+    track_names: list[str] = None,
+) -> tuple[list[Path], bool, dict] | list[Path] | None:
+    """使用 LLM 识别台本文件，判断是否预分割，并完成文件→音轨匹配。
 
     参数:
         candidates: 所有 .txt/.pdf 备选文件
         work_dir: 作品根目录
         ctx: 管道上下文
+        track_names: 音轨名列表
 
     返回:
-        - list[Path]: 确认为台本的文件路径列表（LLM 调用成功）
-        - None: LLM 成功返回空列表，确认无台本（不回退正则）
-        - [] (空列表): LLM 调用失败（API 错误/无 key），应回退到正则
+        - (list[Path], bool, dict): (台本文件, 是否预分割, {文件索引→音轨名})
+        - None: LLM 确认无台本（不回退正则）
+        - []: LLM 调用失败（回退正则）
     """
     if not candidates:
         return []  # 无候选，等同于失败，回退正则
@@ -274,14 +273,25 @@ def _llm_identify_scriptbook_files(
     # 提取作品名（work_dir 最后一级目录名）
     work_name = work_dir.name
 
+    # 音轨名列表（截断防止 prompt 过长）
+    track_names_hint = ""
+    if track_names:
+        shown = track_names[:20]
+        track_names_hint = "\n".join(f"  - {n}" for n in shown)
+        if len(track_names) > 20:
+            track_names_hint += f"\n  ... 还有 {len(track_names) - 20} 个"
+
     system_prompt = (
         "你是一位日语ASMR音声作品台本识别专家。"
         "只返回JSON格式结果，不要解释，不要添加任何额外文本。"
     )
 
-    user_prompt = f"""请从以下文件列表中识别台本（剧本/台词/シナリオ）文件。
+    user_prompt = f"""请从以下文件列表中识别台本（剧本/台词/シナリオ）文件，并判断是否已按音轨预分割。
 
 音声作品: {work_name}
+
+【音轨名称列表】（共 {len(track_names) if track_names else 0} 个）
+{track_names_hint if track_names_hint else '(未提供)'}
 
 【台本文件典型特征】
 - 文件名或所在目录包含: 台本、だいほん、シナリオ、script、セリフ、本編、台詞
@@ -297,13 +307,22 @@ def _llm_identify_scriptbook_files(
 - あとがき / 感想 / 紹介 等后记感想
 - キャスト / 購入特典 等非台本内容
 
+【预分割判断】（is_pre_split）
+- true: 台本已按音轨拆分为独立文件，每个文件对应一个音轨
+- false: 台本是整体文件（单个PDF或txt），需程序再分割
+
+【文件→音轨匹配】（仅 is_pre_split=true 时需要 file_track_mapping）
+将台本文件编号匹配到音轨名。文件名和音轨名通常共享编号前缀（01, 02...），
+以此为线索匹配。如果编号无法确定对应关系，跳过该文件。
+示例: {{"1": "01_プロローグ／再開", "2": "02_久しぶりの..."}}
+
 【文件列表】（共 {len(candidates)} 个）
 {file_list_text}
 
-请返回JSON（仅JSON，无其他文本）：
-{{"scriptbook_indices": [1, 2, 3], "reasoning": "简短判断依据"}}
+请返回JSON（仅JSON）：
+{{"scriptbook_indices": [1, 2], "is_pre_split": true, "file_track_mapping": {{"1": "01_音轨名", "2": "02_音轨名"}}, "reasoning": "简短依据"}}
 
-其中 scriptbook_indices 是确认为台本的文件编号列表。如果没有台本文件，返回空列表: {{"scriptbook_indices": [], "reasoning": "无"}}"""
+无台本时: {{"scriptbook_indices": [], "is_pre_split": false, "file_track_mapping": {{}}, "reasoning": "无"}}"""
 
     try:
         import json as _json
@@ -350,9 +369,13 @@ def _llm_identify_scriptbook_files(
 
         result = _json.loads(result_text)
         indices = result.get('scriptbook_indices', [])
+        is_pre_split = result.get('is_pre_split', False)
+        file_track_mapping = result.get('file_track_mapping', {})
         reasoning = result.get('reasoning', '')
 
-        _log(f"  [台本·LLM] 识别结果: {len(indices)} 个台本 — {reasoning}")
+        _log(f"  [台本·LLM] 识别结果: {len(indices)} 个台本, "
+             f"预分割={'是' if is_pre_split else '否'}, "
+             f"匹配{len(file_track_mapping)}个音轨 — {reasoning}")
 
         # LLM 明确返回空列表 → 确认无台本（与 API 失败区分）
         if not indices:
@@ -373,7 +396,7 @@ def _llm_identify_scriptbook_files(
                     _log(f"    ✓ {f.relative_to(work_dir)}")
                 except ValueError:
                     _log(f"    ✓ {f}")
-        return confirmed
+        return (confirmed, is_pre_split, file_track_mapping)
 
     except Exception as e:
         _log(f"  [台本·LLM] 识别失败: {e}，回退到正则识别")
@@ -386,11 +409,12 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     """加载台本参考，按音轨分割+清洗后返回 {音轨名: [清洁台词]}
 
     流程:
-    1. 收集所有 .txt/.pdf 备选 → LLM 识别台本
+    1. 收集所有 .txt/.pdf 备选 → LLM 识别台本 + 判断是否已预分割
     2. LLM 确认无台本 → 直接返回 None（不回退正则）
     3. LLM 调用失败 → 回退到正则关键词识别
-    4. Flash 分割+清洗 → 按音轨名匹配
-    5. Flash 失败时回退到正则分割
+    4. 预分割台本 → 按文件编号匹配音轨，仅本地清洗（节省 Flash token）
+    5. 非预分割台本 → Flash 分割+清洗 → 按音轨名匹配
+    6. Flash 失败时回退到正则分割
 
     返回:
         {track_name: [clean_lines]} 映射，或 None 表示无台本
@@ -403,6 +427,8 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     )
 
     scriptbook_files: list[Path] = []
+    is_pre_split: bool = False          # LLM 判断台本是否已按音轨预分割
+    file_track_mapping: dict = {}       # LLM 返回的 {文件索引字符串: 音轨名}
 
     # ── 阶段一: 收集所有备选 + LLM 识别 ──
     all_candidates = collect_all_scriptbook_candidates(work_dir)
@@ -419,12 +445,17 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
         llm_candidates = all_candidates[:100]
         if len(all_candidates) > 100:
             _log(f"  [台本] 备选文件过多，仅取前 100 个送 LLM 识别")
-        llm_result = _llm_identify_scriptbook_files(llm_candidates, work_dir, ctx)
+        llm_result = _llm_identify_scriptbook_files(llm_candidates, work_dir, ctx, track_names)
         if llm_result is None:
             # LLM 明确返回空 → 确认无台本，不回退正则
             _log(f"\n[台本] LLM 确认无台本文件，跳过台本加载")
             return None
-        scriptbook_files = llm_result  # [] (API 失败) 或 [Path, ...] (成功)
+        if isinstance(llm_result, tuple):
+            # 成功: (files, is_pre_split, file_track_mapping)
+            scriptbook_files, is_pre_split, file_track_mapping = llm_result
+        else:
+            # 失败: [] (空列表)
+            scriptbook_files = llm_result
 
     # ── 阶段二: LLM 失败时回退到正则 ──
     if not scriptbook_files:
@@ -465,7 +496,69 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     if len(scriptbook_files) > 5:
         _log(f"  → ... 还有 {len(scriptbook_files) - 5} 个")
 
-    # ── 阶段三: 拼接全文 → Flash 分割+清洗 ──
+    # ── 导出 ──
+    export_scriptbook = ctx.config.get('app', {}).get('export_scriptbook_content', False)
+
+    # ═══════════════════════════════════════════════════════════
+    # 预分割路径: 台本已按音轨拆分为独立文件，跳过 Flash 分割清洗
+    # 匹配关系由 LLM 在识别阶段提供（file_track_mapping），不用正则
+    # ═══════════════════════════════════════════════════════════
+    if is_pre_split and file_track_mapping:
+        _log(f"  [台本] LLM 确认台本已预分割，匹配 {len(file_track_mapping)} 个音轨，跳过 Flash")
+
+        from engines.scriptbook_cleaner import _conservative_pre_clean
+
+        # 按 LLM 给的映射加载文件内容（file_track_mapping: {文件索引: 音轨名}）
+        track_map: dict[str, list[str]] = {}
+        if track_names:
+            for name in track_names:
+                track_map[name] = []
+
+        for idx_str, track_name in file_track_mapping.items():
+            try:
+                idx = int(idx_str) - 1  # LLM 返回 1-based，转 0-based
+            except (ValueError, TypeError):
+                continue
+            if 0 <= idx < len(scriptbook_files):
+                f = scriptbook_files[idx]
+                content = load_scriptbook_content(f)
+                if content:
+                    cleaned = _conservative_pre_clean(content)
+                    lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
+                    track_map[track_name] = lines
+                    _log(f"  [预分割] {track_name} ← {f.name} ({len(lines)} 行)")
+                else:
+                    _log(f"  [预分割] {track_name} ← {f.name} (加载失败)")
+
+        # 确保所有 track_names 都有条目
+        if track_names:
+            for name in track_names:
+                if name not in track_map:
+                    track_map[name] = []
+
+        total_clean = sum(len(v) for v in track_map.values())
+        _log(f"  → 预分割匹配完成: {len(track_map)} 个音轨, 共 {total_clean} 行台词")
+
+        # 导出
+        if export_scriptbook and track_map:
+            import json as _json
+            export_dir = scriptbook_files[0].parent
+            (export_dir / '_scriptbook_clean.json').write_text(
+                _json.dumps(track_map, ensure_ascii=False, indent=2), encoding='utf-8')
+            split_dir = export_dir / '_split_tracks'
+            split_dir.mkdir(exist_ok=True)
+            for name, lines in track_map.items():
+                if lines:
+                    safe_name = name.replace('/', '_').replace('\\', '_')
+                    (split_dir / f'{safe_name}.txt').write_text('\n'.join(lines), encoding='utf-8')
+            _log(f"  → 导出: {export_dir / '_scriptbook_clean.json'}")
+            _log(f"  → 导出: {split_dir.absolute()} ({total_clean} 行)")
+
+        return track_map
+
+    # ═══════════════════════════════════════════════════════════
+    # 非预分割路径: 拼接全文 → Flash 分割+清洗
+    # ═══════════════════════════════════════════════════════════
     raw_map = build_raw_scriptbook_map(scriptbook_files)
     all_lines: list[str] = []
     for track_num in sorted(raw_map.keys()):
@@ -478,9 +571,6 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     from engines.scriptbook_cleaner import _conservative_pre_clean
     pre_cleaned = _conservative_pre_clean(raw_text)
     _log(f"  → 保守预清洗后: {len(pre_cleaned)} 字符 (原始 {len(raw_text)} 字符)")
-
-    # ── 导出 ──
-    export_scriptbook = ctx.config.get('app', {}).get('export_scriptbook_content', False)
 
     # 如果没有提供 track_names，用正则分割兜底
     if not track_names:

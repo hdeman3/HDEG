@@ -213,7 +213,7 @@ def load_scriptbook_content(file_path: Path) -> Optional[str]:
     """加载台本文件内容
 
     支持 .txt 和 .pdf 格式。
-    PDF 使用 PyMuPDF 或 PaddleOCR 提取。
+    PDF 使用 pypdfium2 逐字符提取 + 竖排列重排。
     TXT 尝试多种编码（UTF-8, Shift-JIS, CP932, EUC-JP）。
 
     返回: 文本内容，失败返回 None
@@ -235,11 +235,10 @@ def load_scriptbook_content(file_path: Path) -> Optional[str]:
 def _load_pdf_scriptbook(file_path: Path) -> Optional[str]:
     """从 PDF 加载台本内容
 
-    仅使用 PyMuPDF 直接提取文本。OCR 回退已禁用——
-    当进入 OCR 层面时，视为无台本内容返回 None。
+    使用 pypdfium2 逐字符提取 + 竖排列重排。
+    OCR 回退已禁用。
     """
-    # PyMuPDF 直接提取
-    text = _extract_with_pymupdf(file_path)
+    text = _extract_pdf_text(file_path)
     if text and len(text) > 100:
         import re
         japanese_chars = len(re.findall(r'[぀-ゟ゠-ヺ一-鿿]', text))
@@ -249,22 +248,78 @@ def _load_pdf_scriptbook(file_path: Path) -> Optional[str]:
         if total_chars > 500:
             return text
 
-    # OCR 回退已禁用（进入 OCR 层面当无台本处理）
-    # try:
-    #     from engines.ocr import extract_with_ocr
-    #     ocr_text = extract_with_ocr(file_path, clean_for_translation=True)
-    #     if ocr_text:
-    #         return ocr_text
-    # except Exception:
-    #     pass
-
+    # OCR 回退已禁用
     return None
 
 
-def _extract_with_pymupdf(file_path: Path) -> Optional[str]:
-    """使用 PyMuPDF 提取 PDF 文本"""
-    import unicodedata
+# ==================== PDF 提取（参照 vertical_sort.py） ====================
 
+def _extract_pdf_text(file_path: Path) -> Optional[str]:
+    """从 PDF 逐字符提取 + 竖排列重排
+
+    与 vertical_sort.py 完全一致的实现：
+    1. pypdfium2 逐字符获取 (text, x, y, w, h)
+    2. 按页分组，每页 X 聚类成列（右→左），列内 Y 升序
+    3. 后处理：去除 CJK 字符间空格、清理残留数字行
+    失败时回退到 PyMuPDF 简单文本提取。
+    """
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return _extract_pdf_text_fitz_fallback(file_path)
+
+    from collections import defaultdict
+
+    try:
+        pdf = pdfium.PdfDocument(str(file_path))
+        all_chars: list[dict] = []
+
+        for pg_idx in range(len(pdf)):
+            page = pdf[pg_idx]
+            tp = page.get_textpage()
+            n = tp.count_chars()
+            page_h = page.get_height()
+            page_w = page.get_width()
+
+            for ci in range(n):
+                try:
+                    box = tp.get_charbox(ci)  # (x1, y1, x2, y2) bottom-left origin
+                    c = tp.get_text_range(index=ci, count=1)
+                    x, y1, w_box, y2 = box[0], box[1], box[2] - box[0], box[3] - box[1]
+                    h = abs(y2)
+                    y = page_h - max(y1, y2)  # flip to top-left
+                    all_chars.append({
+                        "text": c,
+                        "x": round(x, 1),
+                        "y": round(y, 1),
+                        "w": round(w_box, 1),
+                        "h": round(h, 1),
+                        "page": pg_idx + 1,
+                        "page_w": round(page_w, 1),
+                        "page_h": round(page_h, 1),
+                    })
+                except Exception:
+                    pass
+
+        pdf.close()
+
+        if not all_chars:
+            return None
+
+        result = _reorder_vertical_pages(all_chars, col_gap=12.0)
+        result = _remove_cjk_spaces(result)
+        result = _clean_number_lines(result)
+
+        from utils.text_filter import _filter_page_numbers
+        return _filter_page_numbers(result)
+
+    except Exception as e:
+        print(f"  pypdfium2 提取失败: {e}，尝试 PyMuPDF 回退...")
+        return _extract_pdf_text_fitz_fallback(file_path)
+
+
+def _extract_pdf_text_fitz_fallback(file_path: Path) -> Optional[str]:
+    """PyMuPDF 简单文本提取（pypdfium2 不可用时的回退）"""
     try:
         import fitz
     except ImportError:
@@ -272,192 +327,98 @@ def _extract_with_pymupdf(file_path: Path) -> Optional[str]:
 
     try:
         text_blocks: list[str] = []
-        garbled_pages = 0
-        total_pages = 0
-
         with fitz.open(file_path) as doc:
-            total_pages = len(doc)
-            for page_num, page in enumerate(doc, 1):
-                # 先用 plain text 获取正确阅读顺序的文本
-                plain_text = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE)
-                if not plain_text or not plain_text.strip():
-                    continue
+            for page in doc:
+                text = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+                if text and text.strip():
+                    text_blocks.append(text.strip())
 
-                # 乱码检测：用 dict 模式取少量 spans 做采样
-                blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE).get("blocks", [])
-                sample_spans: list[str] = []
-                for block in blocks:
-                    if block.get('type') != 0:
-                        continue
-                    for line in block.get('lines', []):
-                        for span in line.get('spans', []):
-                            t = span.get('text', '')
-                            if t.strip():
-                                sample_spans.append(t)
-                            if len(sample_spans) >= 50:
-                                break
-                        if len(sample_spans) >= 50:
-                            break
-                    if len(sample_spans) >= 50:
-                        break
-
-                if sample_spans and _is_garbled_text(''.join(sample_spans)):
-                    garbled_pages += 1
-                    continue
-
-                text_blocks.append(plain_text.strip())
-
-        if total_pages > 0 and garbled_pages / total_pages > 0.5:
+        if not text_blocks:
             return None
 
-        result = '\n\n'.join(text_blocks)
-        # 检测并修复"逐字分行"的竖排PDF：每行只有一个有效字符时自动拼接
-        result = _fix_single_char_lines(result)
+        result = "\n\n".join(text_blocks)
         from utils.text_filter import _filter_page_numbers
         return _filter_page_numbers(result)
 
     except Exception as e:
-        print(f"  PyMuPDF 提取失败: {e}")
+        print(f"  PyMuPDF 回退提取失败: {e}")
         return None
 
 
-def _sort_horizontal_spans(
-    spans: list[tuple[float, float, str, float, float]],
-    tolerance: float,
-) -> str:
-    """横排布局排序"""
-    spans.sort(key=lambda s: (round(s[1] / tolerance), s[0]))
-    lines: list[str] = []
-    current_y_group = -10000
-    current_line: list[tuple] = []
+# ── 竖排列重排（与 vertical_sort.py 完全一致）──
 
-    for cx, cy, text, x0, y0 in spans:
-        y_group = round(cy / tolerance)
-        if y_group != current_y_group:
-            if current_line:
-                current_line.sort(key=lambda s: s[0])
-                lines.append(''.join(s[2] for s in current_line))
-            current_y_group = y_group
-            current_line = [(cx, cy, text, x0, y0)]
-        else:
-            current_line.append((cx, cy, text, x0, y0))
+def _reorder_vertical_pages(chars: list[dict], col_gap: float = 12.0) -> str:
+    """按页分组，每页 X 聚类成列（右→左），列内 Y 升序（上→下）"""
+    from collections import defaultdict
 
-    if current_line:
-        current_line.sort(key=lambda s: s[0])
-        lines.append(''.join(s[2] for s in current_line))
+    if not chars:
+        return ""
 
-    return '\n'.join(lines)
+    pages = defaultdict(list)
+    for ch in chars:
+        pages[ch["page"]].append(ch)
 
+    output_lines: list[str] = []
 
-def _sort_vertical_spans(
-    spans: list[tuple[float, float, str, float, float]],
-    tolerance: float,
-) -> str:
-    """竖排布局排序"""
-    spans.sort(key=lambda s: (round(s[0] / tolerance), s[1]))
-    columns: list[tuple[int, str]] = []
-    current_x_group = -10000
-    current_col: list[tuple] = []
+    for pg in sorted(pages.keys()):
+        page_chars = pages[pg]
+        if not page_chars:
+            continue
 
-    for cx, cy, text, x0, y0 in spans:
-        x_group = round(cx / tolerance)
-        if x_group != current_x_group:
-            if current_col:
-                current_col.sort(key=lambda s: s[1])
-                columns.append((current_x_group, ''.join(s[2] for s in current_col)))
-            current_x_group = x_group
-            current_col = [(cx, cy, text, x0, y0)]
-        else:
-            current_col.append((cx, cy, text, x0, y0))
+        columns = defaultdict(list)
+        for ch in page_chars:
+            col_key = round(ch["x"] / col_gap) * col_gap
+            columns[col_key].append(ch)
 
-    if current_col:
-        current_col.sort(key=lambda s: s[1])
-        columns.append((current_x_group, ''.join(s[2] for s in current_col)))
+        sorted_cols = sorted(columns.items(), key=lambda kv: -kv[0])
 
-    columns.sort(key=lambda c: -c[0])
-    return '\n'.join(c[1] for c in columns)
+        page_lines: list[str] = []
+        for _col_x, col_chars in sorted_cols:
+            col_chars.sort(key=lambda ch: ch["y"])
+            line = "".join(ch["text"] for ch in col_chars
+                          if not ch["text"].strip().isdigit())
+            stripped = line.strip()
+            if stripped and not stripped.isdigit():
+                page_lines.append(stripped)
+
+        output_lines.append(f"<!-- page {pg} -->")
+        output_lines.extend(page_lines)
+        output_lines.append("")
+
+    return "\n".join(output_lines)
 
 
-def _fix_single_char_lines(text: str) -> str:
-    """修复竖排 PDF 的逐字分行问题。
+# ── 后处理 ──
 
-    PyMuPDF 提取竖排日文 PDF 时，每个字符可能独占一行。
-    检测并拼接这种模式：如果大部分非空行只有一个 CJK 字符，
-    则将所有单字符行按顺序拼接，用空行保留段落边界。
-    """
+def _remove_cjk_spaces(text: str) -> str:
+    """去除 CJK 字符间的空格"""
     import re
-    lines = text.split('\n')
-    if len(lines) < 20:
-        return text
+    return re.sub(
+        r"(?<=[⺀-⻿　-〿぀-ゟ゠-ヿ"
+        r"㈀-㋿㐀-䶿一-鿿豈-﫿"
+        r"＀-￯])\s+(?=[⺀-⻿　-〿"
+        r"぀-ゟ゠-ヿ㈀-㋿"
+        r"㐀-䶿一-鿿豈-﫿＀-￯])",
+        "",
+        text,
+    )
 
-    # 统计单 CJK 字符行的比例
-    cjk_single = 0
-    empty = 0
-    multi = 0
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            empty += 1
-        elif re.fullmatch(r'[　-〿぀-ヿ一-鿿㐀-䶿豈-﫿＀-￯ -⁯ -/:-@[-`{-~　-〃〈-】〔-〟・！-／：-＠［-｀｛-～\w]', stripped):
-            cjk_single += 1
+
+def _clean_number_lines(text: str) -> str:
+    """清理残留的独立数字行和行首数字标记"""
+    import re
+    clean_lines: list[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("<!--") or s.isdigit():
+            clean_lines.append(ln)
+            continue
+        s2 = re.sub(r'^\d{1,3}(?=[^\d\s])', '', s)
+        if s2 and not s2.isdigit():
+            clean_lines.append(s2)
         else:
-            multi += 1
-
-    total = cjk_single + multi
-    if total == 0 or cjk_single / total < 0.6:
-        return text  # 不是逐字分行模式
-
-    # 拼接：连续的单字符行合并，空行保留为段落分隔
-    result: list[str] = []
-    buf: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if buf:
-                result.append(''.join(buf))
-                buf = []
-            if result and result[-1] != '':
-                result.append('')
-        elif re.fullmatch(r'[　-〿぀-ヿ一-鿿㐀-䶿豈-﫿＀-￯ -⁯ -/:-@[-`{-~　-〃〈-】〔-〟・！-／：-＠［-｀｛-～\w]', stripped):
-            buf.append(stripped)
-        else:
-            if buf:
-                result.append(''.join(buf))
-                buf = []
-            result.append(stripped)
-    if buf:
-        result.append(''.join(buf))
-
-    return '\n'.join(result)
-
-
-def _is_garbled_text(text: str) -> bool:
-    """检测文本是否为乱码"""
-    if not text or len(text.strip()) == 0:
-        return False
-
-    total_chars = len(text.replace('\n', '').replace(' ', ''))
-    if total_chars == 0:
-        return False
-
-    # 替换字符占比
-    replacement_chars = text.count('\ufffd')
-    if replacement_chars / total_chars > 0.05:
-        return True
-
-    # 日文字符比例
-    japanese_chars = len(re.findall(
-        r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', text
-    ))
-    if total_chars > 100 and japanese_chars / total_chars < 0.05:
-        return True
-
-    # Latin Extended (U+1E00-U+1EFF)：PDF 字体 CMap 损坏，假名被映射为越南文字符
-    latin_ext = sum(1 for c in text if 'Ḁ' <= c <= 'ỿ')
-    if latin_ext / max(total_chars, 1) > 0.005:
-        return True
-
-    return False
+            clean_lines.append("")
+    return "\n".join(clean_lines)
 
 
 # ==================== 台本解析 ====================

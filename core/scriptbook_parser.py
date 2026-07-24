@@ -77,7 +77,9 @@ def collect_all_scriptbook_candidates(work_dir: Path) -> list[Path]:
 
     返回: 按相对路径排序的备选文件列表
     """
-    excluded_stems = {'_cleaned', '_processed', '_export', '_scriptbook_export'}
+    excluded_stems = {'_cleaned', '_processed', '_export', '_scriptbook_export',
+                      '.cleaned_scriptbook'}  # 程序输出的清洗后台本
+    excluded_dirs = {'_split_tracks'}  # 程序输出的分割音轨目录
     candidates: list[Path] = []
 
     for ext in ('.txt', '.pdf'):
@@ -85,6 +87,9 @@ def collect_all_scriptbook_candidates(work_dir: Path) -> list[Path]:
             stem = f.stem
             # 排除程序输出文件
             if any(ex in stem for ex in excluded_stems):
+                continue
+            # 排除程序输出目录中的文件
+            if any(d in f.parts for d in excluded_dirs):
                 continue
             candidates.append(f)
 
@@ -230,9 +235,10 @@ def load_scriptbook_content(file_path: Path) -> Optional[str]:
 def _load_pdf_scriptbook(file_path: Path) -> Optional[str]:
     """从 PDF 加载台本内容
 
-    优先使用 PyMuPDF 直接提取，失败后使用 PaddleOCR。
+    仅使用 PyMuPDF 直接提取文本。OCR 回退已禁用——
+    当进入 OCR 层面时，视为无台本内容返回 None。
     """
-    # 策略1：PyMuPDF 直接提取
+    # PyMuPDF 直接提取
     text = _extract_with_pymupdf(file_path)
     if text and len(text) > 100:
         import re
@@ -243,14 +249,14 @@ def _load_pdf_scriptbook(file_path: Path) -> Optional[str]:
         if total_chars > 500:
             return text
 
-    # 策略2：PaddleOCR 回退
-    try:
-        from ocr_utils import extract_with_ocr
-        ocr_text = extract_with_ocr(file_path, clean_for_translation=True)
-        if ocr_text:
-            return ocr_text
-    except Exception:
-        pass
+    # OCR 回退已禁用（进入 OCR 层面当无台本处理）
+    # try:
+    #     from engines.ocr import extract_with_ocr
+    #     ocr_text = extract_with_ocr(file_path, clean_for_translation=True)
+    #     if ocr_text:
+    #         return ocr_text
+    # except Exception:
+    #     pass
 
     return None
 
@@ -444,6 +450,11 @@ def _is_garbled_text(text: str) -> bool:
         r'[\u3040-\u309f\u30a0-\u30fa\u4e00-\u9fff]', text
     ))
     if total_chars > 100 and japanese_chars / total_chars < 0.05:
+        return True
+
+    # Latin Extended (U+1E00-U+1EFF)：PDF 字体 CMap 损坏，假名被映射为越南文字符
+    latin_ext = sum(1 for c in text if 'Ḁ' <= c <= 'ỿ')
+    if latin_ext / max(total_chars, 1) > 0.005:
         return True
 
     return False

@@ -7,7 +7,7 @@
 4. 收集以 Hde鸡 开头的所有 .bat 文件
 5. 提取 _DEFAULT_SYSTEM_PROMPT 写入 提示词.txt
 6. 复制 config.json 并抹去 key 信息，关闭 debug，设置台本翻译模式
-7. 【新增】自动从转录模型目录复制 PaddleOCR 模型到发布文件夹
+（OCR 打包已禁用 —— 进入 OCR 层面当无台本处理）
 """
 
 import os
@@ -118,9 +118,9 @@ def run_pyinstaller():
         "--collect-all", "fugashi",
         "--collect-data", "unidic_lite",
         "--collect-all", "pyopenjtalk",
-        # 收集 OCR 相关包（延迟导入需要显式收集）
-        "--collect-all", "paddleocr",
-        "--collect-data", "paddlepaddle",
+        # OCR 打包已禁用 —— 进入 OCR 层面当无台本处理
+        # "--collect-all", "paddleocr",
+        # "--collect-data", "paddlepaddle",
         # 收集 PDF 处理相关包（延迟导入需要显式收集）
         "--collect-data", "fitz",  # PyMuPDF
         "--collect-data", "pdfplumber",
@@ -148,24 +148,24 @@ def run_pyinstaller():
     if pyopenjtalk_dic_path:
         cmd.extend(["--add-data", f"{pyopenjtalk_dic_path};pyopenjtalk/{pyopenjtalk_dic_path.name}"])
     
-    # 【新增】添加 PaddleOCR 模型目录（优先从本地 models/paddleocr 加载）
-    models_dir = SCRIPT_DIR / "models" / "paddleocr"
-    if models_dir.exists():
-        print(f"  PaddleOCR 模型目录(本地): {models_dir}")
-        total_size = sum(f.stat().st_size for f in models_dir.rglob('*') if f.is_file())
-        print(f"  模型总大小: {total_size / 1024 / 1024:.1f} MB")
-        cmd.extend(["--add-data", f"{models_dir};models/paddleocr"])
-    else:
-        print("  ⚠ 未找到本地 PaddleOCR 模型目录，将尝试从转录模型目录复制...")
-        # 尝试从 config.json 中读取转录模型目录
-        copied_models = copy_paddleocr_from_transcription_dir()
-        if copied_models:
-            print(f"  已从转录模型目录复制 PaddleOCR 模型到: {copied_models}")
-            total_size = sum(f.stat().st_size for f in copied_models.rglob('*') if f.is_file())
-            print(f"  模型总大小: {total_size / 1024 / 1024:.1f} MB")
-            cmd.extend(["--add-data", f"{copied_models};models/paddleocr"])
-        else:
-            print("  ⚠ 未找到 PaddleOCR 模型目录，OCR 功能将需要联网下载模型")
+    # OCR 打包已禁用 —— PaddleOCR 模型目录不再打包
+    # models_dir = SCRIPT_DIR / "models" / "paddleocr"
+    # if models_dir.exists():
+    #     print(f"  PaddleOCR 模型目录(本地): {models_dir}")
+    #     total_size = sum(f.stat().st_size for f in models_dir.rglob('*') if f.is_file())
+    #     print(f"  模型总大小: {total_size / 1024 / 1024:.1f} MB")
+    #     cmd.extend(["--add-data", f"{models_dir};models/paddleocr"])
+    # else:
+    #     print("  ⚠ 未找到本地 PaddleOCR 模型目录，将尝试从转录模型目录复制...")
+    #     # 尝试从 config.json 中读取转录模型目录
+    #     copied_models = copy_paddleocr_from_transcription_dir()
+    #     if copied_models:
+    #         print(f"  已从转录模型目录复制 PaddleOCR 模型到: {copied_models}")
+    #         total_size = sum(f.stat().st_size for f in copied_models.rglob('*') if f.is_file())
+    #         print(f"  模型总大小: {total_size / 1024 / 1024:.1f} MB")
+    #         cmd.extend(["--add-data", f"{copied_models};models/paddleocr"])
+    #     else:
+    #         print("  ⚠ 未找到 PaddleOCR 模型目录，OCR 功能将需要联网下载模型")
     
     cmd.append("main.py")
     
@@ -182,66 +182,66 @@ def run_pyinstaller():
     print()
 
 
-def copy_paddleocr_from_transcription_dir():
-    """从 config.json 中读取转录模型目录，复制 PaddleOCR 模型到本地"""
-    import json
-    
-    config_path = SCRIPT_DIR / "config.json"
-    if not config_path.exists():
-        print("  ⚠ config.json 不存在，无法读取转录模型目录")
-        return None
-    
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
-        
-        model_dir = config.get('transcription', {}).get('model_dir', '')
-        if not model_dir:
-            print("  ⚠ config.json 中未配置 transcription.model_dir")
-            return None
-        
-        model_path = Path(model_dir)
-        if not model_path.is_dir():
-            print(f"  ⚠ 转录模型目录不存在: {model_path}")
-            return None
-        
-        # 检查转录模型目录中是否有 PaddleOCR 模型
-        # 可能的路径: <model_dir>/models/paddleocr 或 <model_dir>/../models/paddleocr
-        paddleocr_sources = [
-            model_path / "models" / "paddleocr",
-            model_path / "paddleocr",
-            model_path.parent / "models" / "paddleocr",
-        ]
-        
-        src_dir = None
-        for src in paddleocr_sources:
-            if src.exists() and any(src.iterdir()):
-                src_dir = src
-                print(f"  找到源 PaddleOCR 模型: {src_dir}")
-                break
-        
-        if not src_dir:
-            print(f"  在转录模型目录中未找到 PaddleOCR 模型")
-            return None
-        
-        # 复制到本地
-        local_dir = SCRIPT_DIR / "models" / "paddleocr"
-        local_dir.parent.mkdir(parents=True, exist_ok=True)
-        
-        if local_dir.exists():
-            print(f"  本地已有 PaddleOCR 模型，跳过复制")
-            return local_dir
-        
-        print(f"  正在复制 PaddleOCR 模型: {src_dir} -> {local_dir}")
-        shutil.copytree(src_dir, local_dir)
-        print(f"  ✓ PaddleOCR 模型复制完成")
-        return local_dir
-        
-    except Exception as e:
-        print(f"  ⚠ 复制 PaddleOCR 模型失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+# OCR 打包已禁用
+# def copy_paddleocr_from_transcription_dir():
+#     """从 config.json 中读取转录模型目录，复制 PaddleOCR 模型到本地"""
+#     import json
+#
+#     config_path = SCRIPT_DIR / "config.json"
+#     if not config_path.exists():
+#         print("  ⚠ config.json 不存在，无法读取转录模型目录")
+#         return None
+#
+#     try:
+#         with open(config_path, 'r', encoding='utf-8') as f:
+#             config = json.load(f)
+#
+#         model_dir = config.get('transcription', {}).get('model_dir', '')
+#         if not model_dir:
+#             print("  ⚠ config.json 中未配置 transcription.model_dir")
+#             return None
+#
+#         model_path = Path(model_dir)
+#         if not model_path.is_dir():
+#             print(f"  ⚠ 转录模型目录不存在: {model_path}")
+#             return None
+#
+#         # 检查转录模型目录中是否有 PaddleOCR 模型
+#         paddleocr_sources = [
+#             model_path / "models" / "paddleocr",
+#             model_path / "paddleocr",
+#             model_path.parent / "models" / "paddleocr",
+#         ]
+#
+#         src_dir = None
+#         for src in paddleocr_sources:
+#             if src.exists() and any(src.iterdir()):
+#                 src_dir = src
+#                 print(f"  找到源 PaddleOCR 模型: {src_dir}")
+#                 break
+#
+#         if not src_dir:
+#             print(f"  在转录模型目录中未找到 PaddleOCR 模型")
+#             return None
+#
+#         # 复制到本地
+#         local_dir = SCRIPT_DIR / "models" / "paddleocr"
+#         local_dir.parent.mkdir(parents=True, exist_ok=True)
+#
+#         if local_dir.exists():
+#             print(f"  本地已有 PaddleOCR 模型，跳过复制")
+#             return local_dir
+#
+#         print(f"  正在复制 PaddleOCR 模型: {src_dir} -> {local_dir}")
+#         shutil.copytree(src_dir, local_dir)
+#         print(f"  ✓ PaddleOCR 模型复制完成")
+#         return local_dir
+#
+#     except Exception as e:
+#         print(f"  ⚠ 复制 PaddleOCR 模型失败: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         return None
 
 
 def create_release_dir():
@@ -437,11 +437,11 @@ def copy_config():
                 del config["app"][old_param]
                 print(f"  移除废弃参数: {old_param}")
     
-    # 设置 OCR 参数
-    if "ocr" in config:
-        # 默认关闭 GPU（CPU 模式）
-        config["ocr"]["use_gpu"] = False
-        print(f"  设置 OCR 为 CPU 模式: use_gpu = False")
+    # OCR 已禁用 —— 不再设置 OCR 参数
+    # if "ocr" in config:
+    #     # 默认关闭 GPU（CPU 模式）
+    #     config["ocr"]["use_gpu"] = False
+    #     print(f"  设置 OCR 为 CPU 模式: use_gpu = False")
     
     # 【新增】更新转录配置中的 infer.exe 路径为发布后的相对路径
     if "transcription" in config:
@@ -458,40 +458,41 @@ def copy_config():
     print()
 
 
-def copy_paddleocr_to_release():
-    """复制 PaddleOCR 模型到发布文件夹"""
-    print("=" * 50)
-    print("步骤 7: 复制 PaddleOCR 模型到发布目录")
-    print("=" * 50)
-    
-    # 优先使用本地的 PaddleOCR 模型
-    local_models = SCRIPT_DIR / "models" / "paddleocr"
-    
-    if local_models.exists() and any(local_models.iterdir()):
-        dst = RELEASE_DIR / "models" / "paddleocr"
-        if not dst.exists():
-            print(f"  复制本地 PaddleOCR 模型: {local_models} -> {dst}")
-            shutil.copytree(local_models, dst)
-            total_size = sum(f.stat().st_size for f in dst.rglob('*') if f.is_file())
-            print(f"  ✓ PaddleOCR 模型已复制到发布目录 ({total_size / 1024 / 1024:.1f} MB)")
-        else:
-            print(f"  发布目录中已有 PaddleOCR 模型")
-        print()
-        return
-    
-    # 如果本地没有，尝试从转录模型目录复制
-    models = copy_paddleocr_from_transcription_dir()
-    if models:
-        dst = RELEASE_DIR / "models" / "paddleocr"
-        if not dst.exists():
-            print(f"  复制 PaddleOCR 模型到发布目录: {models} -> {dst}")
-            shutil.copytree(models, dst)
-            total_size = sum(f.stat().st_size for f in dst.rglob('*') if f.is_file())
-            print(f"  ✓ PaddleOCR 模型已复制到发布目录 ({total_size / 1024 / 1024:.1f} MB)")
-    else:
-        print("  ⚠ 未找到 PaddleOCR 模型，发布后 OCR 功能将需要联网下载模型")
-    
-    print()
+# OCR 打包已禁用
+# def copy_paddleocr_to_release():
+#     """复制 PaddleOCR 模型到发布文件夹"""
+#     print("=" * 50)
+#     print("步骤 7: 复制 PaddleOCR 模型到发布目录")
+#     print("=" * 50)
+#
+#     # 优先使用本地的 PaddleOCR 模型
+#     local_models = SCRIPT_DIR / "models" / "paddleocr"
+#
+#     if local_models.exists() and any(local_models.iterdir()):
+#         dst = RELEASE_DIR / "models" / "paddleocr"
+#         if not dst.exists():
+#             print(f"  复制本地 PaddleOCR 模型: {local_models} -> {dst}")
+#             shutil.copytree(local_models, dst)
+#             total_size = sum(f.stat().st_size for f in dst.rglob('*') if f.is_file())
+#             print(f"  ✓ PaddleOCR 模型已复制到发布目录 ({total_size / 1024 / 1024:.1f} MB)")
+#         else:
+#             print(f"  发布目录中已有 PaddleOCR 模型")
+#         print()
+#         return
+#
+#     # 如果本地没有，尝试从转录模型目录复制
+#     models = copy_paddleocr_from_transcription_dir()
+#     if models:
+#         dst = RELEASE_DIR / "models" / "paddleocr"
+#         if not dst.exists():
+#             print(f"  复制 PaddleOCR 模型到发布目录: {models} -> {dst}")
+#             shutil.copytree(models, dst)
+#             total_size = sum(f.stat().st_size for f in dst.rglob('*') if f.is_file())
+#             print(f"  ✓ PaddleOCR 模型已复制到发布目录 ({total_size / 1024 / 1024:.1f} MB)")
+#     else:
+#         print("  ⚠ 未找到 PaddleOCR 模型，发布后 OCR 功能将需要联网下载模型")
+#
+#     print()
 
 
 def main():
@@ -519,8 +520,8 @@ def main():
     # 步骤 6: 处理 config.json
     copy_config()
     
-    # 步骤 7: 复制 PaddleOCR 模型
-    copy_paddleocr_to_release()
+    # 步骤 7: 复制 PaddleOCR 模型 —— OCR 打包已禁用
+    # copy_paddleocr_to_release()
     
     print("=" * 60)
     print("  打包发布完成！")

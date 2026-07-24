@@ -14,6 +14,7 @@
 """
 
 from __future__ import annotations
+import re
 import shutil
 import sys
 import time
@@ -239,7 +240,7 @@ def _llm_identify_scriptbook_files(
     candidates: list[Path],
     work_dir: Path,
     ctx: PipelineContext,
-) -> list[Path]:
+) -> list[Path] | None:
     """使用 LLM 从候选 txt/pdf 文件中识别台本
 
     将所有备选文件的相对路径一次性发送给 LLM，
@@ -251,10 +252,12 @@ def _llm_identify_scriptbook_files(
         ctx: 管道上下文
 
     返回:
-        确认为台本的文件路径列表
+        - list[Path]: 确认为台本的文件路径列表（LLM 调用成功）
+        - None: LLM 成功返回空列表，确认无台本（不回退正则）
+        - [] (空列表): LLM 调用失败（API 错误/无 key），应回退到正则
     """
     if not candidates:
-        return []
+        return []  # 无候选，等同于失败，回退正则
 
     _log(f"\n[台本·LLM] 开始识别台本文件（共 {len(candidates)} 个备选）")
 
@@ -314,7 +317,7 @@ def _llm_identify_scriptbook_files(
 
         if not api_key:
             _log("  [台本·LLM] 未配置 API Key，回退到正则识别")
-            return []
+            return []  # 失败 → 回退正则
 
         _log(f"  [台本·LLM] 发送 {len(candidates)} 个备选文件给 LLM 识别 (model={model})")
 
@@ -351,6 +354,11 @@ def _llm_identify_scriptbook_files(
 
         _log(f"  [台本·LLM] 识别结果: {len(indices)} 个台本 — {reasoning}")
 
+        # LLM 明确返回空列表 → 确认无台本（与 API 失败区分）
+        if not indices:
+            _log(f"  [台本·LLM] LLM 确认: 无台本文件，不回退正则")
+            return None
+
         # 映射回文件路径
         confirmed: list[Path] = []
         for idx in indices:
@@ -371,30 +379,27 @@ def _llm_identify_scriptbook_files(
         _log(f"  [台本·LLM] 识别失败: {e}，回退到正则识别")
         import traceback
         traceback.print_exc()
-        return []
+        return []  # API 失败 → 回退正则
 
 
-def _load_scriptbook(work_dir: Path, ctx: PipelineContext) -> list[str] | None:
-    """加载台本参考（原文-译文对照）
+def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str] = None) -> dict[str, list[str]] | None:
+    """加载台本参考，按音轨分割+清洗后返回 {音轨名: [清洁台词]}
 
     流程:
     1. 收集所有 .txt/.pdf 备选 → LLM 识别台本
-    2. LLM 失败时回退到正则关键词识别
-    3. 合并 → 清洗 → 导出
-
-    支持 scriptbook_mode 配置:
-    - "keyword": 仅发送关键台词
-    - "full": 发送全部台本内容（默认）
+    2. LLM 确认无台本 → 直接返回 None（不回退正则）
+    3. LLM 调用失败 → 回退到正则关键词识别
+    4. Flash 分割+清洗 → 按音轨名匹配
+    5. Flash 失败时回退到正则分割
 
     返回:
-        台本行列表，或 None 表示无台本
+        {track_name: [clean_lines]} 映射，或 None 表示无台本
     """
     from core.scriptbook_parser import (
         find_scriptbooks_in_dir,
         collect_all_scriptbook_candidates,
         load_scriptbook_content,
         build_raw_scriptbook_map,
-        is_key_dialogue_line,
     )
 
     scriptbook_files: list[Path] = []
@@ -411,102 +416,134 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext) -> list[str] | None:
         if len(all_candidates) > 10:
             _log(f"  → ... 还有 {len(all_candidates) - 10} 个")
 
-        # LLM 识别（限 100 个以内，超量时截断）
         llm_candidates = all_candidates[:100]
         if len(all_candidates) > 100:
             _log(f"  [台本] 备选文件过多，仅取前 100 个送 LLM 识别")
-        scriptbook_files = _llm_identify_scriptbook_files(llm_candidates, work_dir, ctx)
+        llm_result = _llm_identify_scriptbook_files(llm_candidates, work_dir, ctx)
+        if llm_result is None:
+            # LLM 明确返回空 → 确认无台本，不回退正则
+            _log(f"\n[台本] LLM 确认无台本文件，跳过台本加载")
+            return None
+        scriptbook_files = llm_result  # [] (API 失败) 或 [Path, ...] (成功)
 
-    # ── 阶段二: LLM 失败或无结果时回退到正则 ──
+    # ── 阶段二: LLM 失败时回退到正则 ──
     if not scriptbook_files:
         if all_candidates:
-            _log(f"\n[台本] LLM 未识别到台本，回退到正则关键词识别")
+            _log(f"\n[台本] LLM 识别失败，回退到正则关键词识别")
         scriptbook_files = find_scriptbooks_in_dir(work_dir)
-    if scriptbook_files:
-        _log(f"\n[台本] 发现台本目录/文件: {len(scriptbook_files)} 个")
-        for f in scriptbook_files[:5]:
-            _log(f"  → {f.absolute()}")
-        if len(scriptbook_files) > 5:
-            _log(f"  → ... 还有 {len(scriptbook_files) - 5} 个")
 
-        raw_map = build_raw_scriptbook_map(scriptbook_files)
-        all_lines: list[str] = []
-        for track_num in sorted(raw_map.keys()):
-            all_lines.extend(raw_map[track_num])
-
-        # 清洗台本（去掉场景描述、SE音效等非对话内容）
-        from utils.text_filter import clean_script_for_translation
-        scriptbook_text = "\n".join(all_lines)
-        cleaned_text = clean_script_for_translation(scriptbook_text)
-        cleaned_lines = [l for l in cleaned_text.split('\n') if l.strip()]
-        _log(f"  → 合并台本: {len(all_lines)} 行 → 清洗后: {len(cleaned_lines)} 行")
-
-        # 导出台本（与源台本同目录）
-        export_scriptbook = ctx.config.get('app', {}).get('export_scriptbook_content', False)
-        if export_scriptbook:
-            # 导出到第一个台本文件所在目录
-            export_dir = scriptbook_files[0].parent
-            export_path = export_dir / '_scriptbook_export.txt'
+    if not scriptbook_files:
+        # 回退：搜索根目录下带 | 分隔符的台本 txt 文件
+        candidates = list(work_dir.rglob('*.txt'))
+        scriptbook_path = None
+        for cand in candidates:
             try:
-                export_path.write_text(cleaned_text, encoding='utf-8')
-                _log(f"  → 导出清洗后台本: {export_path.absolute()}")
-            except Exception as e:
-                _log(f"  [警告] 导出台本失败: {e}")
-
-        # 应用 scriptbook_mode 过滤
-        scriptbook_mode = ctx.config.get('app', {}).get('scriptbook_mode', 'full')
-        if scriptbook_mode == 'keyword':
-            cleaned_lines = _apply_keyword_filter(cleaned_lines)
-        return cleaned_lines
-
-    # 回退：搜索根目录下带 | 分隔符的台本 txt 文件
-    candidates = list(work_dir.rglob('*.txt'))
-    scriptbook_path = None
-    for cand in candidates:
-        try:
-            # 尝试多种编码读取文件头部
-            content = None
-            for enc in ('utf-8', 'shift-jis', 'cp932'):
-                try:
-                    content = cand.read_text(encoding=enc)[:500]
+                content = None
+                for enc in ('utf-8', 'shift-jis', 'cp932'):
+                    try:
+                        content = cand.read_text(encoding=enc)[:500]
+                        break
+                    except Exception:
+                        continue
+                if content and '|' in content and any(
+                    k in content for k in ('日本語', '中文', 'セリフ', '台词', '原文', '译文')
+                ):
+                    scriptbook_path = cand
                     break
-                except Exception:
-                    continue
-            if content and '|' in content and any(
-                k in content for k in ('日本語', '中文', 'セリフ', '台词', '原文', '译文')
-            ):
-                scriptbook_path = cand
-                break
-        except Exception:
-            continue
+            except Exception:
+                continue
+        if scriptbook_path:
+            scriptbook_files = [scriptbook_path]
 
-    if not scriptbook_path:
+    if not scriptbook_files:
         _log(f"\n[台本] 未发现台本文件")
         return None
 
-    _log(f"\n[台本] 发现台本文件: {scriptbook_path.absolute()}")
-    try:
-        content = load_scriptbook_content(scriptbook_path)
-        if content:
-            lines = [line.strip() for line in content.split('\n') if line.strip()]
-            _log(f"  → 加载台本: {len(lines)} 行参考原文")
-            return lines
-    except Exception as e:
-        _log(f"  [警告] 台本加载失败: {e}")
+    _log(f"\n[台本] 发现台本目录/文件: {len(scriptbook_files)} 个")
+    for f in scriptbook_files[:5]:
+        _log(f"  → {f.absolute()}")
+    if len(scriptbook_files) > 5:
+        _log(f"  → ... 还有 {len(scriptbook_files) - 5} 个")
 
-    # 兜底：直接按行读取（load_scriptbook_content 已支持多编码，这里作为最后保险）
-    try:
-        text = load_scriptbook_content(scriptbook_path)
-        lines = [
-            line.strip()
-            for line in (text or '').split('\n')
-            if line.strip()
-        ]
-        _log(f"  → 兜底加载台本: {len(lines)} 行")
-        return lines
-    except Exception as e:
-        _log(f"  [警告] 台本兜底加载也失败: {e}")
-        return None
+    # ── 阶段三: 拼接全文 → Flash 分割+清洗 ──
+    raw_map = build_raw_scriptbook_map(scriptbook_files)
+    all_lines: list[str] = []
+    for track_num in sorted(raw_map.keys()):
+        all_lines.extend(raw_map[track_num])
+    raw_text = "\n".join(all_lines)
+    _log(f"  → 原始台本: {len(all_lines)} 行, {len(raw_text)} 字符")
+
+    # 保守预清洗（仅删 100% 确定的噪音：页码、SE 行、纯数字行）
+    # 不做深度正则清洗——效果差且易误伤，改为 Flash 完成清洗
+    from engines.scriptbook_cleaner import _conservative_pre_clean
+    pre_cleaned = _conservative_pre_clean(raw_text)
+    _log(f"  → 保守预清洗后: {len(pre_cleaned)} 字符 (原始 {len(raw_text)} 字符)")
+
+    # ── 导出 ──
+    export_scriptbook = ctx.config.get('app', {}).get('export_scriptbook_content', False)
+
+    # 如果没有提供 track_names，用正则分割兜底
+    if not track_names:
+        _log(f"  [台本] 无音轨名列表，使用正则分割")
+        from engines.scriptbook_cleaner import split_scriptbook_regex
+        track_map = split_scriptbook_regex(pre_cleaned, track_names or [])
+    else:
+        # Flash 分割+清洗（一次请求完成，不做本地深度清洗）
+        from engines.scriptbook_cleaner import ScriptbookSplitter, split_scriptbook_regex
+        api_config = ctx.api_cfg
+        try:
+            splitter = ScriptbookSplitter(api_config, verbose=True)
+            track_map = splitter.split_and_clean_all_in_one(track_names, raw_text)
+        except Exception as e:
+            _log(f"  [台本] Flash 分割失败: {e}，回退到正则分割")
+            track_map = {}
+
+        # Flash 失败或返回结果不足 → 回退到正则
+        if not track_map or len(track_map) < len(track_names) * 0.5:
+            _log(f"  [台本] Flash 分割结果不足 ({len(track_map)}/{len(track_names)})，回退到正则分割")
+            regex_map = split_scriptbook_regex(raw_text, track_names)
+            # 合并：Flash 已有的保留，缺失的用正则补
+            for name in track_names:
+                if name not in track_map or not track_map[name]:
+                    if name in regex_map and regex_map[name]:
+                        track_map[name] = regex_map[name]
+                if name not in track_map:
+                    track_map[name] = []
+
+        # 变体轨继承主轨台本（ルームver 等含（）修饰词的轨 → 去除修饰词后匹配主轨）
+        import re as _re_variant
+        for name in list(track_map.keys()):
+            if not track_map[name]:
+                base = _re_variant.sub(r'[（(][^）)]*[）)]', '', name)
+                if base != name and base in track_map and track_map[base]:
+                    track_map[name] = track_map[base]
+                    _log(f"  [台本] 变体轨 {name[:40]}... 继承主轨台本 ({len(track_map[base])} 行)")
+
+    total_clean = sum(len(v) for v in track_map.values())
+    _log(f"  → 分割清洗后: {len(track_map)} 个音轨, 共 {total_clean} 行台词")
+
+    # ── 导出（由 export_scriptbook_content 统一控制）──
+    if export_scriptbook and track_map:
+        import json as _json
+        export_dir = scriptbook_files[0].parent
+
+        # 原始台本
+        (export_dir / '_scriptbook_export.txt').write_text(raw_text, encoding='utf-8')
+        # Flash 清洗后的 JSON
+        (export_dir / '_scriptbook_clean.json').write_text(
+            _json.dumps(track_map, ensure_ascii=False, indent=2), encoding='utf-8')
+        # 分割结果（每轨一个 txt）
+        split_dir = export_dir / '_split_tracks'
+        split_dir.mkdir(exist_ok=True)
+        for name, lines in track_map.items():
+            if lines:
+                safe_name = name.replace('/', '_').replace('\\', '_')
+                (split_dir / f'{safe_name}.txt').write_text('\n'.join(lines), encoding='utf-8')
+        _log(f"  → 导出: {export_dir / '_scriptbook_export.txt'}")
+        _log(f"  → 导出: {export_dir / '_scriptbook_clean.json'}")
+        _log(f"  → 导出: {split_dir.absolute()} ({total_clean} 行)")
+
+    return track_map
 
 
 # ==================== 世界观加载 ====================
@@ -800,9 +837,20 @@ def translate_one_lrc(
     else:
         _log(f"\n[世界观] 未加载")
 
-    # 台本参考
+    # 台本参考 —— 打印实际内容预览，让用户看到指导翻译用了台本的哪个部分
     if scriptbook_lines:
-        _log(f"\n[台本] 参考行数: {len(scriptbook_lines)} 行")
+        preview_n = min(8, len(scriptbook_lines))
+        _log(f"\n[台本] 使用分割清洗后台本作为翻译参考 — 共 {len(scriptbook_lines)} 行")
+        _log(f"  ┌─ 前 {preview_n} 行预览 ─")
+        for i, line in enumerate(scriptbook_lines[:preview_n], 1):
+            # 截断过长的行（>120 字符）
+            display = line if len(line) <= 120 else line[:117] + '...'
+            _log(f"  │ {i:3d}: {display}")
+        if len(scriptbook_lines) > preview_n:
+            # 最后一行预览
+            _log(f"  │ ...")
+            _log(f"  │ {len(scriptbook_lines):3d}: {scriptbook_lines[-1][:120]}")
+        _log(f"  └─ 台本参考预览结束 ─")
     else:
         _log(f"\n[台本] 无台本参考")
 
@@ -1260,9 +1308,16 @@ def run_pipeline(
     from io_adapter.file_scanner import find_rj_work_root
     work_terms: dict = {}        # group_key -> {jp: zh}
     work_alias: dict = {}        # group_key -> [alias_items]
-    work_scriptbook: dict = {}   # group_key -> scriptbook_lines
+    work_scriptbook: dict = {}   # group_key -> {track_name: [clean_lines]}
     work_worldview: dict = {}    # group_key -> worldview_dict
     analyzed_dirs: set = set()
+
+    # 收集 LRC 文件名（仅 .lrc，不含 .ja.lrc 留档），用于台本分割匹配
+    # 直接使用 fpath.stem 全名；.ja.lrc 已被过滤不会重复
+    all_track_names: list[str] = []
+    for fpath in lrc_files:
+        if fpath.suffix == '.lrc' and not fpath.name.endswith('.ja.lrc'):
+            all_track_names.append(fpath.stem)
 
     for fpath in lrc_files:
         rj_root, rj_number = find_rj_work_root(fpath)
@@ -1275,10 +1330,20 @@ def run_pipeline(
         _dir_key = str(group_key)
 
         # 加载该目录的台本（只在该 RJ 目录内搜索，不跨作品）
-        dir_scriptbook = _load_scriptbook(group_key, ctx)
+        # 传入该目录的 LRC 音轨名列表，用于台本分割匹配
+        from io_adapter.file_scanner import find_rj_work_root as _find_rj
+        _dir_track_names = []
+        for _fp in lrc_files:
+            if _fp.suffix == '.lrc' and not _fp.name.endswith('.ja.lrc'):
+                _rj_root, _ = _find_rj(_fp)
+                _gk = _rj_root if _rj_root else _fp.parent
+                if str(_gk) == _dir_key:
+                    _dir_track_names.append(_fp.stem)
+        dir_scriptbook = _load_scriptbook(group_key, ctx, track_names=_dir_track_names)
         if dir_scriptbook:
             work_scriptbook[_dir_key] = dir_scriptbook
-            _log(f"  -> 台本: {len(dir_scriptbook)} 行")
+            _total_sb_lines = sum(len(v) for v in dir_scriptbook.values())
+            _log(f"  -> 台本: {len(dir_scriptbook)} 个音轨, 共 {_total_sb_lines} 行")
 
         # 分析/加载该目录的术语、alias 和世界观（只在该 RJ 目录内）
         dir_terms, dir_alias, dir_worldview = _analyze_work_terms(group_key, ctx)
@@ -1449,14 +1514,24 @@ def run_pipeline(
                 _dir_key = str(_effective_dir)
                 _dir_terms = work_terms.get(_dir_key, {})
                 _dir_alias = work_alias.get(_dir_key, [])
-                _dir_scriptbook = work_scriptbook.get(_dir_key, None)
+                _dir_scriptbook_map = work_scriptbook.get(_dir_key, None)
                 _dir_worldview = work_worldview.get(_dir_key, None)
+                # 按 LRC 文件名查找对应音轨的台本
+                _track_sb_lines = None
+                if _dir_scriptbook_map:
+                    _track_sb_lines = _dir_scriptbook_map.get(lrc_path.stem, None)
+                    # 精确匹配为空（None 或 []）→ 模糊匹配
+                    if not _track_sb_lines:
+                        for _sb_name, _sb_lines in _dir_scriptbook_map.items():
+                            if _sb_lines and (lrc_path.stem in _sb_name or _sb_name in lrc_path.stem):
+                                _track_sb_lines = _sb_lines
+                                break
                 success = translate_one_lrc(
                     lrc_path, ctx,
                     terms=_dir_terms,
                     alias_list=_dir_alias,
                     worldview=_dir_worldview,
-                    scriptbook_lines=_dir_scriptbook,
+                    scriptbook_lines=_track_sb_lines,
                 )
                 if success:
                     _log(f"\n✓ 文件 [{i+1}/{len(lrc_files)}] 翻译成功: {lrc_path.name}")

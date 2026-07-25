@@ -431,6 +431,90 @@ def _llm_identify_scriptbook_files(
         return []  # API 失败 → 回退正则
 
 
+def _try_load_cached_scriptbook(work_dir: Path, track_names: list[str]) -> dict[str, list[str]] | None:
+    """检查是否存在上次导出的台本缓存，有则直接加载
+
+    缓存位置：
+    - _scriptbook_clean.json: 预分割台本的导出结果
+    - _split_tracks/*.txt: 非预分割台本 Flash 分割+清洗后的导出结果
+
+    返回: track_map 或 None（无缓存）
+    """
+    import json as _json
+    from engines.scriptbook_cleaner import _conservative_pre_clean
+
+    # 1) 查找 _scriptbook_clean.json（预分割路径导出）
+    for cache_file in work_dir.rglob('_scriptbook_clean.json'):
+        # 排除 _split_tracks 目录下的副本
+        if '_split_tracks' in cache_file.parts:
+            continue
+        try:
+            cached = _json.loads(cache_file.read_text(encoding='utf-8'))
+            if isinstance(cached, dict) and len(cached) > 0:
+                # 验证：至少有一个 track_name 在 track_names 中（防止跨作品误匹配）
+                if track_names:
+                    matched = sum(1 for tn in track_names if tn in cached)
+                    if matched == 0:
+                        continue  # 可能是其他作品的缓存
+                # 加载成功，匹配到当前 track_names
+                result: dict[str, list[str]] = {}
+                for tn in track_names:
+                    result[tn] = cached.get(tn, [])
+                return result
+        except Exception:
+            continue
+
+    # 2) 查找 _split_tracks/*.txt（非预分割路径导出）
+    for split_dir in work_dir.rglob('_split_tracks'):
+        if not split_dir.is_dir():
+            continue
+        track_files = sorted(split_dir.glob('*.txt'))
+        if not track_files:
+            continue
+        # 只有当 track 文件数量 >= track_names 的一半时才信任缓存
+        if track_names and len(track_files) < len(track_names) * 0.5:
+            continue
+
+        result = {}
+        if track_names:
+            # 尝试按文件名匹配到 track_names
+            for tf in track_files:
+                stem = tf.stem
+                matched_name = None
+                for tn in track_names:
+                    if stem in tn or tn in stem:
+                        matched_name = tn
+                        break
+                if not matched_name:
+                    # 模糊匹配：比较前几个字符
+                    for tn in track_names:
+                        if stem[:4] == tn[:4]:
+                            matched_name = tn
+                            break
+                target = matched_name or stem
+                try:
+                    lines = [l.strip() for l in tf.read_text(encoding='utf-8').split('\n') if l.strip()]
+                    result[target] = lines
+                except Exception:
+                    result[target] = []
+            # 确保所有 track_names 都有条目（空的也行）
+            for tn in track_names:
+                if tn not in result:
+                    result[tn] = []
+        else:
+            for tf in track_files:
+                try:
+                    lines = [l.strip() for l in tf.read_text(encoding='utf-8').split('\n') if l.strip()]
+                    result[tf.stem] = lines
+                except Exception:
+                    result[tf.stem] = []
+
+        if result:
+            return result
+
+    return None
+
+
 def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str] = None) -> dict[str, list[str]] | None:
     """加载台本参考，按音轨分割+清洗后返回 {音轨名: [清洁台词]}
 
@@ -451,6 +535,13 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
         load_scriptbook_content,
         build_raw_scriptbook_map,
     )
+
+    # ── 阶段〇: 检查缓存（上次导出的结果，跳过重复 LLM 调用）──
+    cached_result = _try_load_cached_scriptbook(work_dir, track_names or [])
+    if cached_result is not None:
+        total_lines = sum(len(v) for v in cached_result.values())
+        _log(f"\n[台本] 检测到已缓存的台本结果 ({len(cached_result)} 个音轨, {total_lines} 行)，跳过 LLM 识别和 Flash 分割")
+        return cached_result
 
     scriptbook_files: list[Path] = []
     is_pre_split: bool = False          # LLM 判断台本是否已按音轨预分割

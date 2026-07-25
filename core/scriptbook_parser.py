@@ -33,14 +33,27 @@ def find_scriptbooks_in_dir(
     import os
     from utils.scriptbook_patterns import SCRIPTBOOK_EXTS
 
+    # 排除程序自身输出目录（防止上次运行的清洗结果被当做台本）
+    _EXCLUDED_DIRS = {'_split_tracks', '_cleaned', '_processed', '_export', '_scriptbook_export'}
+    _EXCLUDED_STEMS = {'_cleaned', '_processed', '_export', '_scriptbook_export',
+                       '.cleaned_scriptbook'}
+
+    def _in_excluded_dir(p: Path) -> bool:
+        return any(d in p.parts for d in _EXCLUDED_DIRS)
+
+    def _has_excluded_stem(p: Path) -> bool:
+        return any(ex in p.stem for ex in _EXCLUDED_STEMS)
+
     candidates: list[Path] = []
 
     # 优先检查「台本」子文件夹（精确匹配 + 包含匹配，如 05.台本）
     for scriptbook_dir_name in ('台本', 'だいほん', 'script', 'scripts', 'scenario', 'scenarios'):
         sb_dir = work_dir / scriptbook_dir_name
-        if sb_dir.is_dir():
+        if sb_dir.is_dir() and not _in_excluded_dir(sb_dir):
             for ext in SCRIPTBOOK_EXTS:
                 for f in sorted(sb_dir.glob(f'*{ext}')):
+                    if _has_excluded_stem(f) or _in_excluded_dir(f):
+                        continue
                     if _is_scriptbook_file(f):
                         candidates.append(f)
             if candidates:
@@ -50,9 +63,11 @@ def find_scriptbooks_in_dir(
     if not candidates:
         try:
             for entry in sorted(work_dir.iterdir()):
-                if entry.is_dir() and '台本' in entry.name:
+                if entry.is_dir() and '台本' in entry.name and not _in_excluded_dir(entry):
                     for ext in SCRIPTBOOK_EXTS:
                         for f in sorted(entry.glob(f'*{ext}')):
+                            if _has_excluded_stem(f) or _in_excluded_dir(f):
+                                continue
                             if _is_scriptbook_file(f):
                                 candidates.append(f)
                     if candidates:
@@ -63,6 +78,8 @@ def find_scriptbooks_in_dir(
     # 回退：递归扫描根目录
     for ext in SCRIPTBOOK_EXTS:
         for f in sorted(work_dir.rglob(f'*{ext}')):
+            if _has_excluded_stem(f) or _in_excluded_dir(f):
+                continue
             if _is_scriptbook_file(f):
                 candidates.append(f)
 
@@ -306,7 +323,13 @@ def _extract_pdf_text(file_path: Path) -> Optional[str]:
         if not all_chars:
             return None
 
-        result = _reorder_vertical_pages(all_chars, col_gap=12.0)
+        # 检测排向：横排走横排逻辑，竖排保持原有逻辑不变
+        is_horizontal = _detect_is_horizontal(all_chars)
+        if is_horizontal:
+            result = _reorder_horizontal_pages(all_chars)
+        else:
+            result = _reorder_vertical_pages(all_chars, col_gap=12.0)
+
         result = _remove_cjk_spaces(result)
         result = _clean_number_lines(result)
 
@@ -345,7 +368,7 @@ def _extract_pdf_text_fitz_fallback(file_path: Path) -> Optional[str]:
         return None
 
 
-# ── 竖排列重排（与 vertical_sort.py 完全一致）──
+# ── 竖排列重排（与 vertical_sort.py 完全一致，不改动）──
 
 def _reorder_vertical_pages(chars: list[dict], col_gap: float = 12.0) -> str:
     """按页分组，每页 X 聚类成列（右→左），列内 Y 升序（上→下）"""
@@ -386,6 +409,168 @@ def _reorder_vertical_pages(chars: list[dict], col_gap: float = 12.0) -> str:
         output_lines.append("")
 
     return "\n".join(output_lines)
+
+
+# ── 横排重排（新增，不影响竖排逻辑）──
+
+def _reorder_horizontal_pages(chars: list[dict], row_gap: float = 8.0) -> str:
+    """横排：按页分组，每页 Y 聚类成行（上→下），行内 X 升序（左→右）"""
+    from collections import defaultdict
+
+    if not chars:
+        return ""
+
+    pages = defaultdict(list)
+    for ch in chars:
+        pages[ch["page"]].append(ch)
+
+    output_lines: list[str] = []
+
+    for pg in sorted(pages.keys()):
+        page_chars = pages[pg]
+        if not page_chars:
+            continue
+
+        rows = defaultdict(list)
+        for ch in page_chars:
+            row_key = round(ch["y"] / row_gap) * row_gap
+            rows[row_key].append(ch)
+
+        sorted_rows = sorted(rows.items(), key=lambda kv: kv[0])  # top → bottom
+
+        page_lines: list[str] = []
+        for _row_y, row_chars in sorted_rows:
+            row_chars.sort(key=lambda ch: ch["x"])  # left → right
+            line = "".join(ch["text"] for ch in row_chars
+                          if not ch["text"].strip().isdigit())
+            stripped = line.strip()
+            if stripped and not stripped.isdigit():
+                page_lines.append(stripped)
+
+        output_lines.append(f"<!-- page {pg} -->")
+        output_lines.extend(page_lines)
+        output_lines.append("")
+
+    return "\n".join(output_lines)
+
+
+def _detect_is_horizontal(chars: list[dict], max_sample_pages: int = 3) -> bool:
+    """检测 PDF 是否为横排：对前几页同时尝试竖排/横排，比较输出文本质量
+
+    同一作品所有页面排向一致。若无法判定，默认竖排（保持原有行为）。
+
+    返回: True = 横排, False = 竖排
+    """
+    from collections import defaultdict
+
+    if not chars:
+        return False
+
+    pages = defaultdict(list)
+    for ch in chars:
+        pages[ch["page"]].append(ch)
+
+    sample_pages = sorted(pages.keys())[:max_sample_pages]
+    votes_horizontal = 0
+    votes_vertical = 0
+
+    for pg in sample_pages:
+        page_chars = pages[pg]
+        if len(page_chars) < 30:
+            continue  # 跳过封面等字符太少的页面
+
+        # 尝试竖排
+        vert_lines = _reorder_vertical_page(page_chars)
+        # 尝试横排
+        horz_lines = _reorder_horizontal_page(page_chars)
+
+        vert_score = _score_text_quality(vert_lines)
+        horz_score = _score_text_quality(horz_lines)
+
+        if horz_score > vert_score:
+            votes_horizontal += 1
+        elif vert_score > horz_score:
+            votes_vertical += 1
+
+    # 无法判定时默认竖排（保持原有行为）
+    if votes_horizontal == 0 and votes_vertical == 0:
+        return False
+
+    return votes_horizontal > votes_vertical
+
+
+def _score_text_quality(lines: list[str]) -> float:
+    """评分文本质量：CJK 字符连续度越高、孤立符号越少，分数越高"""
+    if not lines:
+        return 0.0
+
+    total_score = 0.0
+    total_len = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.isdigit():
+            continue
+
+        length = len(stripped)
+        total_len += length
+
+        cjk = len(re.findall(r'[぀-ゟ゠-ヺ一-鿿⺀-⻿㈀-㋿㐀-䶿豈-﫿]', stripped))
+        symbols = len(re.findall(r'[♡♪/＝・…※✧⩌⩊]', stripped))
+
+        cjk_ratio = cjk / max(length, 1)
+        symbol_penalty = symbols / max(length, 1) * 2.0
+
+        line_score = cjk_ratio - symbol_penalty
+        total_score += line_score * length
+
+    return total_score / max(total_len, 1)
+
+
+def _reorder_vertical_page(page_chars: list[dict], col_gap: float = 12.0) -> list[str]:
+    """竖排单页（供 _detect_is_horizontal 内部使用）"""
+    from collections import defaultdict
+
+    columns = defaultdict(list)
+    for ch in page_chars:
+        col_key = round(ch["x"] / col_gap) * col_gap
+        columns[col_key].append(ch)
+
+    sorted_cols = sorted(columns.items(), key=lambda kv: -kv[0])
+
+    page_lines: list[str] = []
+    for _col_x, col_chars in sorted_cols:
+        col_chars.sort(key=lambda ch: ch["y"])
+        line = "".join(ch["text"] for ch in col_chars
+                      if not ch["text"].strip().isdigit())
+        stripped = line.strip()
+        if stripped and not stripped.isdigit():
+            page_lines.append(stripped)
+
+    return page_lines
+
+
+def _reorder_horizontal_page(page_chars: list[dict], row_gap: float = 8.0) -> list[str]:
+    """横排单页（供 _detect_is_horizontal 内部使用）"""
+    from collections import defaultdict
+
+    rows = defaultdict(list)
+    for ch in page_chars:
+        row_key = round(ch["y"] / row_gap) * row_gap
+        rows[row_key].append(ch)
+
+    sorted_rows = sorted(rows.items(), key=lambda kv: kv[0])
+
+    page_lines: list[str] = []
+    for _row_y, row_chars in sorted_rows:
+        row_chars.sort(key=lambda ch: ch["x"])
+        line = "".join(ch["text"] for ch in row_chars
+                      if not ch["text"].strip().isdigit())
+        stripped = line.strip()
+        if stripped and not stripped.isdigit():
+            page_lines.append(stripped)
+
+    return page_lines
 
 
 # ── 后处理 ──

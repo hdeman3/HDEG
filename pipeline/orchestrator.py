@@ -332,13 +332,22 @@ def _llm_identify_scriptbook_files(
         api_key = api_cfg.get('key') or api_cfg.get('api_key', '')
         base_url = api_cfg.get('base_url', 'https://api.deepseek.com')
         model = api_cfg.get('model', 'deepseek-v4-flash')
-        timeout = api_cfg.get('timeout', 60)
+        # config.json 中的 timeout 字段可能为毫秒或秒；OpenAI 客户端需要秒
+        raw_timeout = api_cfg.get('timeout', 60)
+        if raw_timeout > 300:
+            # 如果值很大（如 2000），很可能是毫秒配置，转换为秒
+            timeout = max(raw_timeout / 1000.0, 30.0)
+        elif raw_timeout < 5:
+            # 如果值太小（如 2），也按秒处理但至少给 30 秒
+            timeout = 30.0
+        else:
+            timeout = float(raw_timeout)
 
         if not api_key:
             _log("  [台本·LLM] 未配置 API Key，回退到正则识别")
             return []  # 失败 → 回退正则
 
-        _log(f"  [台本·LLM] 发送 {len(candidates)} 个备选文件给 LLM 识别 (model={model})")
+        _log(f"  [台本·LLM] 发送 {len(candidates)} 个备选文件给 LLM 识别 (model={model}, timeout={timeout}s)")
 
         # 清理代理环境变量（避免 httpx 走代理导致连接失败）
         import os as _os
@@ -354,20 +363,37 @@ def _llm_identify_scriptbook_files(
                 {'role': 'user', 'content': user_prompt},
             ],
             temperature=0.1,
-            max_tokens=500,
+            max_tokens=4096,  # 足够容纳 JSON + reasoning，500 容易截断
         )
 
         content = response.choices[0].message.content or ''
-        _log(f"  [台本·LLM] 响应: {content[:200]}")
+        _log(f"  [台本·LLM] 响应: {content[:300]}")
 
         # 提取 JSON
         result_text = content.strip()
+
+        # 校验：空响应直接判定 API 失败（不回退，因为强制 JSON 模式不应返回空）
+        if not result_text:
+            _log(f"  [台本·LLM] API 返回空内容 (model={model})，请检查模型名/网络/API配额")
+            return []  # API 失败 → 回退正则
+
         if '```json' in result_text:
             result_text = result_text.split('```json')[1].split('```')[0].strip()
         elif '```' in result_text:
             result_text = result_text.split('```')[1].split('```')[0].strip()
 
-        result = _json.loads(result_text)
+        # 二次校验：清理后仍为空
+        if not result_text:
+            _log(f"  [台本·LLM] 清理后 JSON 文本为空，原始响应: {content[:500]}")
+            return []
+
+        try:
+            result = _json.loads(result_text)
+        except _json.JSONDecodeError as e:
+            _log(f"  [台本·LLM] JSON 解析失败: {e}")
+            _log(f"  [台本·LLM] 原始响应 (前500字符): {content[:500]}")
+            _log(f"  [台本·LLM] 提取的 JSON 文本 (前300字符): {result_text[:300]}")
+            return []  # API JSON 格式异常 → 回退正则
         indices = result.get('scriptbook_indices', [])
         is_pre_split = result.get('is_pre_split', False)
         file_track_mapping = result.get('file_track_mapping', {})
@@ -462,6 +488,42 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
         if all_candidates:
             _log(f"\n[台本] LLM 识别失败，回退到正则关键词识别")
         scriptbook_files = find_scriptbooks_in_dir(work_dir)
+
+        # 正则回退时，检查文件名是否暗示已预分割（如 トラック1, track01, Tr.1 等）
+        if scriptbook_files and not is_pre_split:
+            import re as _re_fallback
+            _track_pattern = _re_fallback.compile(
+                r'(?:トラック|track|tr|トラ)[\s_．.\-]*([０-９0-9]+)',
+                _re_fallback.IGNORECASE,
+            )
+            _pre_split_count = 0
+            for _f in scriptbook_files:
+                if _track_pattern.search(_f.stem):
+                    _pre_split_count += 1
+            # 如果超过半数文件名包含音轨编号，判定为预分割
+            if _pre_split_count >= len(scriptbook_files) * 0.5:
+                is_pre_split = True
+                # 尝试按编号匹配到 track_names
+                for _idx, _f in enumerate(scriptbook_files, 1):
+                    _m = _track_pattern.search(_f.stem)
+                    if _m and track_names:
+                        _num = _m.group(1).translate(
+                            str.maketrans('０１２３４５６７８９', '0123456789'))
+                        try:
+                            _num_int = int(_num)
+                            # 在 track_names 中找包含此编号的条目
+                            for _tn in track_names:
+                                _tn_clean = _tn.translate(
+                                    str.maketrans('０１２３４５６７８９', '0123456789'))
+                                if str(_num_int).zfill(2) in _tn_clean or f'トラック{_num_int}' in _tn_clean.lower():
+                                    file_track_mapping[str(_idx)] = _tn
+                                    break
+                            # 如果 track_names 匹配不上，至少建一个编号映射
+                            if str(_idx) not in file_track_mapping:
+                                file_track_mapping[str(_idx)] = f"{_num_int:02d}"
+                        except ValueError:
+                            pass
+                _log(f"  [台本] 正则回退检测到预分割: {_pre_split_count}/{len(scriptbook_files)} 个文件含音轨编号")
 
     if not scriptbook_files:
         # 回退：搜索根目录下带 | 分隔符的台本 txt 文件

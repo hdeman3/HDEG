@@ -539,7 +539,11 @@ def _simplify_repeated_moans(text: str) -> str:
 
 def clean_script_for_translation(text: str, skip_intro: bool = True) -> str:
     """清洗台本内容，只保留角色对话
-    
+
+    【已弃用】来自旧版逻辑（git: 739f6b17 重构）。
+    清洗效果不好、容易误伤台词，已改为 LLM（Flash）完成清洗。
+    保留此函数仅作兼容参考，不再在主流程中调用。
+
     改进的清洗规则：
     
     去除内容：

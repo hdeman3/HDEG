@@ -907,100 +907,38 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
     from engines.term_manager import (
         get_terms_path, get_alias_path,
         load_terms_from_file, load_alias,
-        save_terms_to_file, save_alias, update_terms_and_alias,
-        extract_names_from_filenames,
-        sample_all_lrc_files,
-        find_similar_reading_clusters,
-        analyze_characters_with_llm,
-        ROLE_TRANSLATIONS,
+        # save_terms_to_file, save_alias,  # 术语分析已禁用
+        # extract_names_from_filenames,
+        # sample_all_lrc_files,
+        # find_similar_reading_clusters,
+        # analyze_characters_with_llm,
+        # ROLE_TRANSLATIONS,
     )
     from engines.worldview_engine import (
-        get_worldview_path, load_worldview, save_worldview,
-        analyze_worldview_with_llm,
-        is_freetalk_context,
+        get_worldview_path, load_worldview,
+        # save_worldview,
+        # analyze_worldview_with_llm,
+        # is_freetalk_context,
     )
 
     terms_path = get_terms_path(work_dir)
     alias_path = get_alias_path(work_dir)
     worldview_path = get_worldview_path(work_dir)
 
-    # 已存在则直接加载
-    if terms_path.exists() and alias_path.exists() and worldview_path.exists():
-        terms = load_terms_from_file(terms_path)
-        alias_list = load_alias(work_dir)
-        worldview = load_worldview(work_dir)
-        _log(f"  加载已有术语表: {len(terms)} 个 ({terms_path.absolute()})")
-        _log(f"  加载已有 alias 表: {len(alias_list)} 个 ({alias_path.absolute()})")
-        _log(f"  加载已有世界观: {worldview_path.absolute()}")
-        _log(f"    内容预览: {str(worldview.get('worldview', ''))[:80]}...")
-        return terms, alias_list, worldview
+    # 加载已缓存的术语/alias/世界观
+    terms = load_terms_from_file(terms_path) if terms_path.exists() else {}
+    alias_list = load_alias(work_dir) if alias_path.exists() else []
+    worldview = load_worldview(work_dir) if worldview_path.exists() else {}
 
-    # 检测是否为 freetalk 或热门CV
-    is_ft, cv_name = is_freetalk_context(work_dir)
-    if is_ft:
-        if cv_name:
-            _log(f"  [检测到 FreeTalk/CV] 目录包含热门CV「{cv_name}」，跳过世界观构建和分词")
-        else:
-            _log(f"  [检测到 FreeTalk] 目录包含 freetalk 关键词，跳过世界观构建和分词")
-        return {}, [], {}
-
-    if not is_fugashi_available():
-        _log("  ⚠ fugashi 未安装，跳过术语分析")
-        return {}, [], {}
-
-    _log("  正在分析作品...")
-    _log()
-
-    # 1. 从文件名提取角色名候选
-    _log("    [文件名] 正在提取角色名候选...")
-    app_cfg = ctx.config.get('app', {})
-    audio_suffixes = app_cfg.get('audio_suffixes', None)
-    subtitle_exts = app_cfg.get('subtitle_exts', None)
-    filename_names = extract_names_from_filenames(work_dir, audio_suffixes, subtitle_exts)
-    if filename_names:
-        _log(f"    [文件名] 发现角色名候选: {', '.join(list(filename_names)[:5])}")
-
-    # 2. 抽样 + 提取 cores
-    _log("    [1/5] 抽样所有字幕文件...")
-    samples, cores = sample_all_lrc_files(work_dir, lines_per_file=40)
-    _log(f"    [1/5] 抽样完成: {len(samples)} 个文件样本, {len(cores)} 个 core")
-
-    # 3. 世界观分析
-    _log("    [2/5] 调用 LLM 分析世界观...")
-    worldview = analyze_worldview_with_llm(ctx.translate_engine, samples)
+    if terms:
+        _log(f"  加载已有术语表: {len(terms)} 个")
+    if alias_list:
+        _log(f"  加载已有 alias 表: {len(alias_list)} 个")
     if worldview:
-        save_worldview(work_dir, worldview)
-        _log(f"    [2/5] 世界观已保存")
+        _log(f"  加载已有世界观 ({len(str(worldview.get('worldview', '')))} 字符)")
+    else:
+        _log(f"  跳过术语/世界观自动分析（已禁用），使用已有缓存")
 
-    # 4. 读音相似簇
-    _log("    [3/5] 正在比对读音相似性...")
-    clusters = find_similar_reading_clusters(cores)
-    _log(f"    [3/5] 读音相似候选簇: {len(clusters)} 个")
-    for i, c in enumerate(clusters[:5], 1):
-        _log(f"      簇{i}: {' / '.join(c)}")
-
-    # 5. LLM 分析术语和 alias
-    _log("    [4/5] 调用 LLM 分析角色和术语...")
-    terms, alias_list = analyze_characters_with_llm(
-        ctx.translate_engine, cores, clusters, filename_names)
-
-    # 添加 ROLE_TRANSLATIONS 预设（LLM 结果优先，预设兜底）
-    for jp, zh in ROLE_TRANSLATIONS.items():
-        if jp not in terms:
-            terms[jp] = zh
-
-    # 6. 保存（三个文件都创建，即使为空，避免下次重复分析）
-    _log("    [5/5] 保存分析结果...")
-    save_terms_to_file(work_dir, terms)
-    _log(f"    已保存术语表({len(terms)}个)")
-    save_alias(work_dir, alias_list)
-    _log(f"    已保存 alias 表({len(alias_list)}个)")
-    if not worldview:
-        worldview = {}
-    save_worldview(work_dir, worldview)
-    _log(f"    已保存世界观")
-
-    _log("  作品分析完成！")
     return terms, alias_list, worldview
 
 

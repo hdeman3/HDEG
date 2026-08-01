@@ -443,7 +443,7 @@ def build_worldview_prompt(worldview: dict) -> str:
     """将世界观构建为 prompt 附加内容
 
     兼容两种 characters 格式：
-    - 数组: [{name, role, personality}]
+    - 数组: [{name, name_cn, role, personality}]
     - 字典: {name: description}
     """
     if not worldview:
@@ -454,30 +454,41 @@ def build_worldview_prompt(worldview: dict) -> str:
     if worldview.get('worldview'):
         lines.append(f"  世界观: {worldview['worldview']}")
 
+    # 主题（影响翻译语气和风格）
+    themes = worldview.get('themes', [])
+    if themes:
+        themes_str = '、'.join(themes) if isinstance(themes, list) else str(themes)
+        lines.append(f"  作品主题: {themes_str}")
+
     characters = worldview.get('characters', [])
     if characters:
         lines.append("  角色:")
         if isinstance(characters, list):
-            for char in characters[:5]:
+            for char in characters[:20]:
                 name = char.get('name', '') if isinstance(char, dict) else str(char)
+                name_cn = char.get('name_cn', '') if isinstance(char, dict) else ''
                 role = char.get('role', '') if isinstance(char, dict) else ''
                 personality = char.get('personality', '') if isinstance(char, dict) else ''
                 if name:
                     char_info = f"    {name}"
+                    if name_cn:
+                        char_info += f"（中文: {name_cn}）"
                     if role:
-                        char_info += f" ({role})"
+                        char_info += f" [{role}]"
                     if personality:
-                        char_info += f" - {personality}"
+                        char_info += f" — 性格: {personality}"
                     lines.append(char_info)
         elif isinstance(characters, dict):
-            for name, desc in list(characters.items())[:5]:
+            for name, desc in list(characters.items())[:20]:
                 lines.append(f"    {name}: {desc}")
 
+    # 特殊设定术语 —— 提升为翻译硬约束
     special_terms = worldview.get('special_terms', {})
     if special_terms:
-        lines.append("  特殊设定:")
-        for term, desc in list(special_terms.items())[:5]:
-            lines.append(f"    {term}: {desc}")
+        lines.append("")
+        lines.append("  【特殊设定术语——翻译时必须严格遵守以下译法，确保全文一致】")
+        for term, desc in list(special_terms.items())[:20]:
+            lines.append(f"    「{term}」→ 译作「{desc}」")
 
     lines.append("【背景信息结束】\n")
     return "\n".join(lines)
@@ -490,12 +501,14 @@ WORLDVIEW_ANALYSIS_PROMPT = (
     "请分析这些样本，提取作品的世界观信息。\n\n"
     "输出要求（紧凑JSON格式）：\n"
     '{"worldview": "作品世界观简介（150字以内，包含：时代背景、主要角色关系、核心设定）", '
-    '"characters": [{"name": "角色名", "role": "角色定位", "personality": "性格特点"}], '
-    '"themes": ["主题1", "主题2"], "special_terms": {"术语": "简短解释"}}\n\n'
+    '"characters": [{"name": "日文角色名", "name_cn": "建议中文译名（用于确保全文翻译一致性）", '
+    '"role": "角色定位", "personality": "性格特点"}], '
+    '"themes": ["主题1", "主题2"], '
+    '"special_terms": {"日文术语": "中文译名"}}\n\n'
     "注意：\n"
     "- worldview 必须精炼，用于辅助后续翻译理解上下文，控制在150字以内\n"
-    "- characters 只列出主要角色，最多5个\n"
-    "- special_terms 只列出对翻译有影响的特殊设定术语\n"
+    "- characters 只列出主要角色，最多5个；name_cn 是角色名的建议中文翻译，将作为术语表强制使用\n"
+    "- special_terms 列出对翻译有影响的特殊设定术语。值必须是纯中文译名（词语/短語），禁止加括号注释、解释说明、或任何额外文字。因为该译名会被直接注入术语表作为强制翻译\n"
     "- 成人向内容请客观描述设定，无需回避\n"
     "- 不要输出任何 JSON 之外的内容\n"
 )
@@ -521,7 +534,10 @@ def analyze_worldview_with_llm(engine, samples: list[str]) -> dict:
 
     try:
         system_prompt = "你是精通日语ASMR/R18音声作品的分析专家。请严格按照JSON格式输出分析结果，不要输出任何其他内容。"
-        raw_output, token_stats = engine.call_api(system_prompt, content)
+        raw_output, token_stats = engine.call_api(
+            system_prompt, content,
+            override_gen_params={'temperature': 0.1},
+        )
         print(f"    [调试] LLM 原始输出 (前300字): {raw_output[:300]}", flush=True)
 
         json_match = re.search(r'\{.*\}', raw_output, re.DOTALL)

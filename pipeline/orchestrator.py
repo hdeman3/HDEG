@@ -728,7 +728,7 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
                 continue
             if 0 <= idx < len(scriptbook_files):
                 f = scriptbook_files[idx]
-                content = load_scriptbook_content(f)
+                content = load_scriptbook_content(f, api_config=ctx.api_cfg)
                 if content:
                     cleaned = _conservative_pre_clean(content)
                     lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
@@ -766,7 +766,7 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     # ═══════════════════════════════════════════════════════════
     # 非预分割路径: 拼接全文 → Flash 分割+清洗
     # ═══════════════════════════════════════════════════════════
-    raw_map = build_raw_scriptbook_map(scriptbook_files)
+    raw_map = build_raw_scriptbook_map(scriptbook_files, api_config=ctx.api_cfg)
     all_lines: list[str] = []
     for track_num in sorted(raw_map.keys()):
         all_lines.extend(raw_map[track_num])
@@ -897,6 +897,90 @@ def _apply_keyword_filter(lines: list[str]) -> list[str]:
 
 # ==================== 自动术语/世界观分析（LLM驱动） ====================
 
+def _sample_ja_lrc_for_worldview(work_dir: Path, lines_per_file: int = 40) -> list[str]:
+    """抽样 .ja.lrc 文件内容，用于世界观 LLM 分析
+
+    从 work_dir 递归搜索所有 .ja.lrc 文件，每个文件均匀抽样若干行。
+
+    返回: ["=== 文件: xxx.ja.lrc ===\\nline1\\nline2\\n...", ...]
+    """
+    samples: list[str] = []
+    ja_files = sorted(work_dir.rglob('*.ja.lrc'))
+
+    for ja_path in ja_files:
+        # 排除 bug 收集目录
+        if 'Hde_G_bug_lrc_collection' in ja_path.parts:
+            continue
+        try:
+            sub = parse_subtitle_file(ja_path)
+            if sub is None:
+                continue
+            texts = [t.strip() for t in sub.original_lyrics if t.strip()]
+            if not texts:
+                continue
+
+            # 均匀抽样
+            step = max(1, len(texts) // lines_per_file)
+            sampled: list[str] = []
+            for i in range(0, len(texts), step):
+                if len(sampled) >= lines_per_file:
+                    break
+                sampled.append(texts[i])
+
+            if sampled:
+                samples.append(f"=== 文件: {ja_path.name} ===\n" + "\n".join(sampled))
+        except Exception:
+            continue
+
+    return samples
+
+
+def _inject_worldview_terms(worldview: dict, terms: dict, work_dir: Path) -> int:
+    """将世界观中的角色名(name→name_cn)和 special_terms 注入术语表
+
+    只添加 terms 中尚不存在的条目，避免覆盖手动编辑的术语。
+    自动清理 LLM 可能附加的括号注释。
+
+    返回: 注入的条目数
+    """
+    import re as _re_clean
+
+    def _clean(v: str) -> str:
+        """去除括号注释，只保留纯译名"""
+        v = _re_clean.sub(r'[（(][^）)]*[）)]', '', v)  # 去除中文/英文括号内容
+        v = _re_clean.sub(r'[（(][^）)]*$', '', v)     # 去除末尾未闭合括号内容
+        return v.strip()
+
+    injected = 0
+    chars = worldview.get('characters', [])
+    if isinstance(chars, list):
+        for char in chars:
+            if isinstance(char, dict):
+                jp_name = char.get('name', '').strip()
+                cn_name = _clean(char.get('name_cn', '').strip())
+                if jp_name and cn_name and jp_name not in terms:
+                    terms[jp_name] = cn_name
+                    injected += 1
+                    _log(f"  [术语] +{jp_name} → {cn_name}")
+
+    sp_terms = worldview.get('special_terms', {})
+    if isinstance(sp_terms, dict):
+        for jp_term, cn_term in sp_terms.items():
+            jp_term = jp_term.strip()
+            cn_term = _clean(cn_term.strip() if isinstance(cn_term, str) else '')
+            if jp_term and cn_term and jp_term not in terms:
+                terms[jp_term] = cn_term
+                injected += 1
+                _log(f"  [术语] +{jp_term} → {cn_term}")
+
+    if injected > 0:
+        from engines.term_manager import save_terms_to_file, get_terms_path as _get_terms_path
+        save_terms_to_file(work_dir, terms)
+        _log(f"  [术语] 已将 {injected} 个术语写入 {_get_terms_path(work_dir)}")
+
+    return injected
+
+
 def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, list, dict]:
     """分析作品目录，自动生成术语表、alias表和世界观
 
@@ -916,9 +1000,9 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
     )
     from engines.worldview_engine import (
         get_worldview_path, load_worldview,
-        # save_worldview,
-        # analyze_worldview_with_llm,
-        # is_freetalk_context,
+        save_worldview,
+        analyze_worldview_with_llm,
+        is_freetalk_context,
     )
 
     terms_path = get_terms_path(work_dir)
@@ -936,8 +1020,46 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
         _log(f"  加载已有 alias 表: {len(alias_list)} 个")
     if worldview:
         _log(f"  加载已有世界观 ({len(str(worldview.get('worldview', '')))} 字符)")
-    else:
-        _log(f"  跳过术语/世界观自动分析（已禁用），使用已有缓存")
+
+        # ── 从缓存世界观注入角色名和特殊术语到术语表（补漏）──
+        _inject_worldview_terms(worldview, terms, work_dir)
+
+    # ── 世界观自动分析（仅当不存在缓存时）──
+    if not worldview:
+        is_ft, cv_name = is_freetalk_context(work_dir)
+        if is_ft:
+            if cv_name:
+                _log(f"  [世界观] 检测到 FreeTalk/CV「{cv_name}」，跳过世界观分析")
+            else:
+                _log(f"  [世界观] 检测到 FreeTalk，跳过世界观分析")
+        else:
+            samples = _sample_ja_lrc_for_worldview(work_dir)
+            if samples:
+                total_chars = sum(len(s) for s in samples)
+                _log(f"  [世界观] 抽样 {len(samples)} 个 .ja.lrc 文件, 共 {total_chars} 字符，调用 LLM 分析...")
+                api_config = get_api_config(ctx.config)
+                if api_config.get('key') or api_config.get('api_key'):
+                    try:
+                        from engines.translate_engine import OpenAICompatEngine
+                        engine = OpenAICompatEngine(api_config, verbose=True)
+                        worldview = analyze_worldview_with_llm(engine, samples)
+                        if worldview:
+                            save_worldview(work_dir, worldview)
+                            chars = worldview.get('characters', [])
+                            char_count = len(chars) if isinstance(chars, list) else (len(chars) if isinstance(chars, dict) else 0)
+                            _log(f"  [世界观] 已生成并保存: {len(str(worldview.get('worldview', '')))} 字符世界观, "
+                                 f"{char_count} 个角色")
+
+                            # ── 将世界观中的角色名和特殊术语注入术语表 ──
+                            _inject_worldview_terms(worldview, terms, work_dir)
+                        else:
+                            _log(f"  [世界观] LLM 分析返回空结果")
+                    except Exception as e:
+                        _log(f"  [世界观] 分析异常: {e}")
+                else:
+                    _log(f"  [世界观] 未配置 API Key，跳过")
+            else:
+                _log(f"  [世界观] 无 .ja.lrc 样本可抽样，跳过")
 
     return terms, alias_list, worldview
 

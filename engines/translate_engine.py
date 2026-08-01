@@ -96,18 +96,19 @@ class OpenAICompatEngine:
     _FORMAT_REQUIREMENTS = (
         "【输入输出格式 —— 最高优先级，必须严格遵守】\n"
         "输入和输出均使用**纯 JSON 对象**格式。\n\n"
-        "输入格式（系统会将待翻译行封装为此格式）：\n"
+        "输入格式：\n"
         '{"lines": [{"index": 1, "text": "日文第1行"}, {"index": 2, "text": "日文第2行"}]}\n\n'
-        "输出格式（你必须严格按此格式返回）：\n"
+        "输出格式：\n"
         '{"translations": [{"index": 1, "text": "中文第1行"}, {"index": 2, "text": "中文第2行"}]}\n\n'
-        "【严格规则】\n"
-        "1. 输出必须是**纯 JSON 对象**，以 { 开头, 以 } 结尾，只包含一个 \"translations\" 键。\n"
-        "2. translations 数组长度必须与输入 lines 数组长度**完全一致**，一条不能多、一条不能少。\n"
-        "3. 每个元素的 index 对应输入行的编号，text 是该行的中文翻译文本。\n"
-        "4. 空行或纯符号行保留为空字符串 \"\"。\n"
-        "5. 每行翻译保持原文段落结构，不得自行合并或拆分。\n"
-        "6. **禁止**输出任何 JSON 之外的内容（解释、分析、标记、前言、后语）。\n"
-        "7. JSON 字符串内的双引号必须转义为 \\\"，换行用 \\n 表示。\n\n"
+        "【绝对规则 —— 违反任何一条都会导致整个翻译批次作废】\n"
+        "1. 输出必须是**合法的 JSON 对象**，能被任何 JSON 解析器解析。\n"
+        "2. translations 数组长度必须与输入 lines 数组长度**精确相等**。\n"
+        "3. 数组中**每个元素都必须同时包含 \"index\" 和 \"text\" 两个键**，缺一不可。\n"
+        "4. 禁止出现 {\"\":\"\"} 或键名缺失的情况，每条必须是 {\"index\": N, \"text\": \"...\"}。\n"
+        "5. 空行或纯符号行的 text 设为空字符串 \"\"，但 index 和 text 键必须保留。\n"
+        "6. 禁止输出 JSON 之外的任何内容（解释、标记、前言、后语）。\n"
+        "7. 字符串内的双引号必须转义为 \\\"，换行用 \\n。\n"
+        "8. JSON 中不得出现尾随逗号或缺少逗号。\n\n"
     )
 
     def __init__(self, config: dict, verbose: bool = True, system_prompt_file: str = None):
@@ -540,9 +541,13 @@ class OpenAICompatEngine:
                         return arr
             except _json.JSONDecodeError:
                 pass
-            # 修复引号后重试
+            # 修复常见 JSON 错误后重试
+            import re as _re
+            # 1) 修复引号
+            fixed = OpenAICompatEngine._fix_json_quotes(candidate)
+            # 2) 修复 {"":""} 漏 index/text 键的情况
+            fixed = _re.sub(r'\{"":""\}', '{"index":0,"text":""}', fixed)
             try:
-                fixed = OpenAICompatEngine._fix_json_quotes(candidate)
                 result = _json.loads(fixed)
                 if isinstance(result, dict) and 'translations' in result:
                     arr = result['translations']
@@ -731,22 +736,18 @@ class OpenAICompatEngine:
 
             return original_lines, translated
 
-        # JSON 解析失败 —— 回退到逐行解析
-        if self.verbose:
-            print(f"  [JSON解析] 失败，回退到逐行解析模式")
-
-        translated_lines = translated_text.strip().split('\n')
-
-        if len(translated_lines) != n_input:
-            if self.verbose:
-                print(f"  [回退模式] 行数不一致: 翻译 {len(translated_lines)} vs 原文 {n_input}")
-
-        # 对齐：补全或截断
-        while len(translated_lines) < n_input:
-            translated_lines.append('')
-        translated_lines = translated_lines[:n_input]
-
-        return original_lines, translated_lines
+        # JSON 解析失败 —— 不启用逐行回退，记录错误并返回空
+        print(f"  [JSON解析] 失败！原文{n_input}行全部留空")
+        print(f"  [JSON解析] 响应类型: {type(translated_text).__name__}, 长度: {len(translated_text)}")
+        print(f"  [JSON解析] 响应前100字: {translated_text[:100]}")
+        print(f"  [JSON解析] 响应后100字: {translated_text[-100:]}")
+        # 单独试一下 json.loads 看报什么错
+        import json as _json_debug
+        try:
+            _json_debug.loads(translated_text)
+        except Exception as _e:
+            print(f"  [JSON解析] json.loads 报错: {_e}")
+        return original_lines, [''] * n_input
 
     # ---------- 批量翻译 ----------
 

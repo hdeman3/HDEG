@@ -964,7 +964,10 @@ def analyze_characters_with_llm(
 
     try:
         system_prompt = "你是精通日语角色语言学和ASR纠错的专家。请严格按照JSON格式输出分析结果，不要输出任何其他内容。"
-        raw_output, token_stats = engine.call_api(system_prompt, content)
+        raw_output, token_stats = engine.call_api(
+            system_prompt, content,
+            override_gen_params={'temperature': 0.1},
+        )
         print(f"    [调试] LLM 原始输出 (前500字):", flush=True)
         print(f"    {raw_output[:500]}", flush=True)
         if len(raw_output) > 500:
@@ -1050,7 +1053,10 @@ def extract_terms_from_translation(
 
     try:
         system_prompt = "你是精通日语字幕翻译术语的专家。请严格按照JSON格式输出。"
-        raw_output, _token_stats = engine.call_api(system_prompt, content)
+        raw_output, _token_stats = engine.call_api(
+            system_prompt, content,
+            override_gen_params={'temperature': 0.1},
+        )
 
         json_match = _re.search(r'\{.*\}', raw_output, _re.DOTALL)
         if json_match:

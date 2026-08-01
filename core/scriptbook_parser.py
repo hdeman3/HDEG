@@ -226,17 +226,17 @@ def is_scriptbook_file(file_path: Path) -> bool:
 
 # ==================== 台本加载 ====================
 
-def load_scriptbook_content(file_path: Path) -> Optional[str]:
+def load_scriptbook_content(file_path: Path, api_config: dict = None) -> Optional[str]:
     """加载台本文件内容
 
     支持 .txt 和 .pdf 格式。
-    PDF 使用 pypdfium2 逐字符提取 + 竖排列重排。
+    PDF 使用 fitz (PyMuPDF) 提取，若提供 api_config 则先过 LLM 分析排版参数。
     TXT 尝试多种编码（UTF-8, Shift-JIS, CP932, EUC-JP）。
 
     返回: 文本内容，失败返回 None
     """
     if file_path.suffix.lower() == '.pdf':
-        return _load_pdf_scriptbook(file_path)
+        return _load_pdf_scriptbook(file_path, api_config=api_config)
     else:
         # 尝试多种编码，日文 Windows 上常见 Shift-JIS
         for encoding in ('utf-8', 'shift-jis', 'cp932', 'euc-jp', 'iso-2022-jp'):
@@ -249,13 +249,13 @@ def load_scriptbook_content(file_path: Path) -> Optional[str]:
         return None
 
 
-def _load_pdf_scriptbook(file_path: Path) -> Optional[str]:
+def _load_pdf_scriptbook(file_path: Path, api_config: dict = None) -> Optional[str]:
     """从 PDF 加载台本内容
 
-    使用 pypdfium2 逐字符提取 + 竖排列重排。
-    OCR 回退已禁用。
+    全链路 fitz (PyMuPDF)：采样 → LLM 分析 → 文本提取 → 逐字重排回退。
+    若提供 api_config，LLM 分析排版参数提升精度。
     """
-    text = _extract_pdf_text(file_path)
+    text = _extract_pdf_text(file_path, api_config=api_config)
     if text and len(text) > 100:
         import re
         japanese_chars = len(re.findall(r'[぀-ゟ゠-ヺ一-鿿]', text))
@@ -269,109 +269,348 @@ def _load_pdf_scriptbook(file_path: Path) -> Optional[str]:
     return None
 
 
-# ==================== PDF 提取（参照 vertical_sort.py） ====================
+# ==================== LLM 排版参数分析 ====================
 
-def _extract_pdf_text(file_path: Path) -> Optional[str]:
-    """从 PDF 逐字符提取 + 竖排列重排
+def _analyze_pdf_layout(all_chars: list[dict], api_config: dict) -> dict:
+    """调用 LLM 分析 PDF 排版参数（排向、col_gap/row_gap、阅读方向）
 
-    与 vertical_sort.py 完全一致的实现：
-    1. pypdfium2 逐字符获取 (text, x, y, w, h)
-    2. 按页分组，每页 X 聚类成列（右→左），列内 Y 升序
-    3. 后处理：去除 CJK 字符间空格、清理残留数字行
-    失败时回退到 PyMuPDF 简单文本提取。
+    从字符坐标中取样，发送给 Flash LLM 做一次性判断。
+    失败时返回默认竖排参数。
     """
-    try:
-        import pypdfium2 as pdfium
-    except ImportError:
-        return _extract_pdf_text_fitz_fallback(file_path)
-
     from collections import defaultdict
 
+    if not api_config or not (api_config.get('key') or api_config.get('api_key')):
+        return {"orientation": "vertical", "col_gap": 24.0, "reading_order": "right-to-left"}
+
+    # 选字符最多的 3 页做样本
+    page_chars = defaultdict(list)
+    for ch in all_chars:
+        page_chars[ch['page']].append(ch)
+    sorted_pages = sorted(page_chars.items(), key=lambda kv: -len(kv[1]))
+    sample_pages = [chars for _pg, chars in sorted_pages[:3] if len(chars) > 50]
+
+    if not sample_pages:
+        return {"orientation": "vertical", "col_gap": 24.0, "reading_order": "right-to-left"}
+
+    # 格式化：X 分布 + Y 分布 + 抽样字符
+    parts = []
+    for i, chars in enumerate(sample_pages):
+        pw = chars[0].get('page_w', 842)
+        ph = chars[0].get('page_h', 595)
+        # X 分布
+        x_buckets = defaultdict(int)
+        for c in chars:
+            x_buckets[int(c['x']) // 20 * 20] += 1
+        x_dist = '  '.join('x≈{}:{}字'.format(k, x_buckets[k])
+                          for k in sorted(x_buckets.keys(), reverse=True))
+        # Y 分布
+        y_buckets = defaultdict(int)
+        for c in chars:
+            y_buckets[int(c['y']) // 30 * 30] += 1
+        y_dist = '  '.join('y≈{}:{}字'.format(k, y_buckets[k])
+                          for k in sorted(y_buckets.keys()))
+        # 抽样（带 X,Y 坐标）
+        step = max(1, len(chars) // 150)
+        sampled = chars[::step][:150]
+        segs = ['[{:.0f},{:.0f}]{}'.format(c['x'], c['y'], c['text']) for c in sampled]
+        parts.append('=== 样本页{} ({:.0f}x{:.0f}, {}字) ===\nX分布:\n{}\nY分布:\n{}\n抽样({}个,步长{}):\n{}'.format(
+            i + 1, pw, ph, len(chars), x_dist, y_dist, len(sampled), step, ' '.join(segs)))
+
+    prompt = '\n\n'.join(parts) + '''
+
+基于以上坐标数据，输出JSON（不要其他内容）：
+{"orientation":"horizontal或vertical","reading_order":"竖排填right-to-left或left-to-right，横排填top-to-bottom","col_gap":20,"body_y_min":100,"body_y_max":560}
+
+判断横排/竖排的关键：
+- 竖排：X分布有多个密集峰值（多列），Y范围覆盖页面大部分高度
+- 横排：Y分布只有少量峰值（少数行），字符Y接近但X跨度大，抽样中同一行的字符Y坐标几乎相同
+body_y_min/body_y_max 是正文Y范围。页眉在顶部少量字符，页码在底部少量字符，中间密集区是正文。'''
+
     try:
-        pdf = pdfium.PdfDocument(str(file_path))
-        all_chars: list[dict] = []
+        from openai import OpenAI
+        import os as _os
+        for k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+            _os.environ.pop(k, None)
+        _os.environ['NO_PROXY'] = '*'
 
-        for pg_idx in range(len(pdf)):
-            page = pdf[pg_idx]
-            tp = page.get_textpage()
-            n = tp.count_chars()
-            page_h = page.get_height()
-            page_w = page.get_width()
+        raw_timeout = api_config.get('timeout', 60)
+        timeout = max(raw_timeout / 1000.0, 30.0) if raw_timeout > 300 else (30.0 if raw_timeout < 5 else float(raw_timeout))
+        api_key = api_config.get('key') or api_config.get('api_key', '')
+        base_url = api_config.get('base_url', 'https://api.deepseek.com')
 
-            for ci in range(n):
-                try:
-                    box = tp.get_charbox(ci)  # (x1, y1, x2, y2) bottom-left origin
-                    c = tp.get_text_range(index=ci, count=1)
-                    x, y1, w_box, y2 = box[0], box[1], box[2] - box[0], box[3] - box[1]
-                    h = abs(y2)
-                    y = page_h - max(y1, y2)  # flip to top-left
-                    all_chars.append({
-                        "text": c,
-                        "x": round(x, 1),
-                        "y": round(y, 1),
-                        "w": round(w_box, 1),
-                        "h": round(h, 1),
-                        "page": pg_idx + 1,
-                        "page_w": round(page_w, 1),
-                        "page_h": round(page_h, 1),
-                    })
-                except Exception:
-                    pass
-
-        pdf.close()
-
-        if not all_chars:
-            return None
-
-        # 检测排向：横排走横排逻辑，竖排保持原有逻辑不变
-        is_horizontal = _detect_is_horizontal(all_chars)
-        if is_horizontal:
-            result = _reorder_horizontal_pages(all_chars)
-        else:
-            result = _reorder_vertical_pages(all_chars, col_gap=12.0)
-
-        result = _remove_cjk_spaces(result)
-        result = _clean_number_lines(result)
-
-        from utils.text_filter import _filter_page_numbers
-        return _filter_page_numbers(result)
-
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+        response = client.chat.completions.create(
+            model='deepseek-v4-pro',
+            messages=[{'role': 'user', 'content': prompt}],
+            temperature=0.1, max_tokens=262140, timeout=300,
+        )
+        content = response.choices[0].message.content or ''
+        if not content:
+            content = getattr(response.choices[0].message, 'reasoning_content', '') or ''
     except Exception as e:
-        print(f"  pypdfium2 提取失败: {e}，尝试 PyMuPDF 回退...")
-        return _extract_pdf_text_fitz_fallback(file_path)
+        print(f'  [PDF排版] LLM 分析失败: {e}，用默认参数')
+        return {"orientation": "vertical", "col_gap": 24.0, "reading_order": "right-to-left"}
+
+    import re, json
+    m = re.search(r'\{[^{}]*\}', content, re.DOTALL)
+    if m:
+        try:
+            params = json.loads(m.group())
+            col_gap = float(params.get('col_gap', 24))
+            reading = params.get('reading_order', 'right-to-left')
+            orient = params.get('orientation', 'vertical')
+            body_y_min = float(params.get('body_y_min', 0))
+            body_y_max = float(params.get('body_y_max', 99999))
+            print(f'  [PDF排版] LLM 分析: orientation={orient}, col_gap={col_gap:.0f}, reading={reading}, body_y=[{body_y_min:.0f},{body_y_max:.0f}]')
+            return {"orientation": orient, "col_gap": col_gap, "reading_order": reading,
+                    "body_y_min": body_y_min, "body_y_max": body_y_max}
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    print(f'  [PDF排版] LLM 返回非JSON，用默认参数')
+    return {"orientation": "vertical", "col_gap": 24.0, "reading_order": "right-to-left"}
 
 
-def _extract_pdf_text_fitz_fallback(file_path: Path) -> Optional[str]:
-    """PyMuPDF 简单文本提取（pypdfium2 不可用时的回退）"""
+# ==================== PDF 提取（参照 vertical_sort.py） ====================
+
+# ==================== fitz 字符采样（替代 pypdfium2） ====================
+
+def _sample_chars_fitz(file_path: Path, max_pages: int = 5) -> list[dict]:
+    """用 fitz rawdict 逐字符提取坐标，用于 LLM 排版分析"""
+    try:
+        import fitz
+    except ImportError:
+        return []
+
+    _ctrl = {'\r', '\n', '\t', '\x00', '\x0c', '\x0b'}
+    chars = []
+
+    try:
+        doc = fitz.open(str(file_path))
+        for pg_idx in range(min(len(doc), max_pages)):
+            page = doc[pg_idx]
+            page_w = page.rect.width
+            page_h = page.rect.height
+            raw = page.get_text("rawdict")
+            for block in raw.get("blocks", []):
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        for ch_data in span.get("chars", []):
+                            c = ch_data.get("c", "")
+                            if c in _ctrl or not c.strip():
+                                continue
+                            bbox = ch_data.get("bbox")
+                            if not bbox:
+                                continue
+                            chars.append({
+                                "text": c,
+                                "x": round(bbox[0], 1),
+                                "y": round(bbox[1], 1),
+                                "w": round(bbox[2] - bbox[0], 1),
+                                "h": round(bbox[3] - bbox[1], 1),
+                                "page": pg_idx + 1,
+                                "page_w": round(page_w, 1),
+                                "page_h": round(page_h, 1),
+                            })
+        doc.close()
+    except Exception as e:
+        print(f"  fitz 采样失败: {e}")
+        return []
+
+    return chars
+
+
+# ==================== fitz 逐字重排（替代 pypdfium2 回退） ====================
+
+def _reorder_fitz_vertical(chars: list[dict], col_gap: float = 24.0) -> str:
+    """fitz 字符 + LLM 参数：竖排列重排（右→左，列内 Y 升序）"""
+    from collections import defaultdict
+
+    pages = defaultdict(list)
+    for ch in chars:
+        pages[ch["page"]].append(ch)
+
+    output_lines = []
+    for pg in sorted(pages.keys()):
+        page_chars = pages[pg]
+        columns = defaultdict(list)
+        for ch in page_chars:
+            col_key = round(ch["x"] / col_gap) * col_gap
+            columns[col_key].append(ch)
+
+        sorted_cols = sorted(columns.items(), key=lambda kv: -kv[0])
+        page_lines = []
+        for _col_x, col_chars in sorted_cols:
+            col_chars.sort(key=lambda ch: ch["y"])
+            line = "".join(ch["text"] for ch in col_chars).strip()
+            if line and not line.isdigit():
+                page_lines.append(line)
+
+        if page_lines:
+            output_lines.append(f"<!-- page {pg} -->")
+            output_lines.extend(page_lines)
+            output_lines.append("")
+
+    return "\n".join(output_lines)
+
+
+def _reorder_fitz_horizontal(chars: list[dict], row_gap: float = 8.0) -> str:
+    """fitz 字符 + LLM 参数：横排行重排（上→下，行内 X 升序）"""
+    from collections import defaultdict
+
+    pages = defaultdict(list)
+    for ch in chars:
+        pages[ch["page"]].append(ch)
+
+    output_lines = []
+    for pg in sorted(pages.keys()):
+        page_chars = pages[pg]
+        rows = defaultdict(list)
+        for ch in page_chars:
+            row_key = round(ch["y"] / row_gap) * row_gap
+            rows[row_key].append(ch)
+
+        sorted_rows = sorted(rows.items(), key=lambda kv: kv[0])
+        page_lines = []
+        for _row_y, row_chars in sorted_rows:
+            row_chars.sort(key=lambda ch: ch["x"])
+            line = "".join(ch["text"] for ch in row_chars).strip()
+            if line and not line.isdigit():
+                page_lines.append(line)
+
+        if page_lines:
+            output_lines.append(f"<!-- page {pg} -->")
+            output_lines.extend(page_lines)
+            output_lines.append("")
+
+    return "\n".join(output_lines)
+
+
+# ==================== 主提取函数 ====================
+
+def _extract_pdf_text(file_path: Path, api_config: dict = None) -> Optional[str]:
+    """从 PDF 提取文本（全链路 fitz）
+
+    1. fitz rawdict 逐字符采样 → LLM 分析 {orientation, col_gap, body_y, reading_order}
+    2. fitz 文本提取 + body_y 过滤 → 优先返回
+    3. fitz 质量不够 → fitz 逐字重排 + LLM 参数回退
+    """
+    import re as _re_q
+
+    # ── 第一步：LLM 排版分析（有 api_config 时必过，用 fitz 采样）──
+    layout = None
+    if api_config:
+        sample_chars = _sample_chars_fitz(file_path, max_pages=5)
+        if sample_chars:
+            layout = _analyze_pdf_layout(sample_chars, api_config)
+
+    # ── 第二步：按 LLM 排向选择路径 ──
+    if layout and layout.get('orientation') == 'vertical':
+        # 竖排：fitz 文本不可靠（单字行或乱序碎片），走逐字重排
+        all_chars = _sample_chars_fitz(file_path, max_pages=999)
+        if all_chars:
+            col_gap = float(layout.get('col_gap', 24.0))
+            if layout.get('body_y_min', 0) > 0:
+                ymin = layout['body_y_min']; ymax = layout.get('body_y_max', 99999)
+                all_chars = [ch for ch in all_chars if ymin <= ch['y'] <= ymax]
+            result = _reorder_fitz_vertical(all_chars, col_gap=col_gap)
+            result = _remove_cjk_spaces(result)
+            result = _clean_number_lines(result)
+            from utils.text_filter import _filter_page_numbers
+            return _filter_page_numbers(result)
+
+    # 横排或无 LLM 参数：fitz 文本提取
+    fitz_result = _extract_pdf_text_fitz(file_path, layout)
+    if fitz_result and len(fitz_result) > 100:
+        jp = len(_re_q.findall(r'[぀-ゟ゠-ヺ一-鿿]', fitz_result))
+        total = len(fitz_result.replace('\n', '').replace(' ', ''))
+        if total > 0 and jp / total > 0.05:
+            return fitz_result
+        print(f"  fitz 日文占比低 ({jp}/{total}={jp/total:.1%})，回退逐字重排...")
+
+    # ── 第三步：逐字重排回退，复用 LLM 参数 ──
+    all_chars = _sample_chars_fitz(file_path, max_pages=999)
+    if not all_chars:
+        return fitz_result
+
+    # body_y 过滤
+    if layout and layout.get('body_y_min', 0) > 0:
+        ymin = layout['body_y_min']; ymax = layout.get('body_y_max', 99999)
+        all_chars = [ch for ch in all_chars if ymin <= ch['y'] <= ymax]
+
+    # 排向：优先 LLM，其次本地检测
+    if layout and layout.get('orientation') == 'horizontal':
+        row_gap = float(layout.get('row_gap', 8.0))
+        result = _reorder_fitz_horizontal(all_chars, row_gap=row_gap)
+    elif layout and layout.get('orientation') == 'vertical':
+        col_gap = float(layout.get('col_gap', 24.0))
+        result = _reorder_fitz_vertical(all_chars, col_gap=col_gap)
+    else:
+        is_h = _detect_is_horizontal(all_chars)
+        if is_h:
+            result = _reorder_fitz_horizontal(all_chars, row_gap=8.0)
+        else:
+            result = _reorder_fitz_vertical(all_chars, col_gap=24.0)
+
+    result = _remove_cjk_spaces(result)
+    result = _clean_number_lines(result)
+
+    from utils.text_filter import _filter_page_numbers
+    return _filter_page_numbers(result)
+
+
+def _extract_pdf_text_fitz(file_path: Path, layout: dict = None) -> Optional[str]:
+    """PyMuPDF 提取，支持 LLM 排版参数（body_y 过滤页眉页码）"""
     try:
         import fitz
     except ImportError:
         return None
 
+    body_ymin = layout.get('body_y_min', 0) if layout else 0
+    body_ymax = layout.get('body_y_max', 99999) if layout else 99999
+    has_body_filter = body_ymin > 0
+
     try:
         text_blocks: list[str] = []
-        with fitz.open(file_path) as doc:
+        with fitz.open(str(file_path)) as doc:
             for page in doc:
-                text = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE)
-                if text and text.strip():
-                    text_blocks.append(text.strip())
+                page_h = page.rect.height
+                if has_body_filter:
+                    # 用 block 级别坐标过滤
+                    blocks = page.get_text("blocks")
+                    page_lines = []
+                    for b in blocks:
+                        # b = (x0, y0, x1, y1, text, block_no, block_type)
+                        y0, y1 = b[1], b[3]
+                        text = b[4] if len(b) > 4 else ''
+                        if not text or not text.strip():
+                            continue
+                        # block 的 Y 范围与 body_y 有交集则保留
+                        if y1 >= body_ymin and y0 <= body_ymax:
+                            page_lines.append(text.strip())
+                    if page_lines:
+                        text_blocks.append('\n'.join(page_lines))
+                else:
+                    text = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+                    if text and text.strip():
+                        text_blocks.append(text.strip())
 
-        if not text_blocks:
-            return None
-
-        result = "\n\n".join(text_blocks)
-        from utils.text_filter import _filter_page_numbers
-        return _filter_page_numbers(result)
+        return '\n\n'.join(text_blocks) if text_blocks else None
 
     except Exception as e:
-        print(f"  PyMuPDF 回退提取失败: {e}")
+        print(f"  PyMuPDF 提取失败: {e}")
         return None
+
+
+def _extract_pdf_text_fitz_fallback(file_path: Path) -> Optional[str]:
+    """PyMuPDF 简单文本提取（无参数，兼容旧接口）"""
+    return _extract_pdf_text_fitz(file_path, layout=None)
 
 
 # ── 竖排列重排（与 vertical_sort.py 完全一致，不改动）──
 
-def _reorder_vertical_pages(chars: list[dict], col_gap: float = 12.0) -> str:
-    """按页分组，每页 X 聚类成列（右→左），列内 Y 升序（上→下）"""
+def _reorder_vertical_pages(chars: list[dict], col_gap: float = 24.0) -> str:
+    """按页分组，每页 X 分组为列（右→左），列内 Y 升序（上→下）"""
     from collections import defaultdict
 
     if not chars:
@@ -398,8 +637,7 @@ def _reorder_vertical_pages(chars: list[dict], col_gap: float = 12.0) -> str:
         page_lines: list[str] = []
         for _col_x, col_chars in sorted_cols:
             col_chars.sort(key=lambda ch: ch["y"])
-            line = "".join(ch["text"] for ch in col_chars
-                          if not ch["text"].strip().isdigit())
+            line = "".join(ch["text"] for ch in col_chars)
             stripped = line.strip()
             if stripped and not stripped.isdigit():
                 page_lines.append(stripped)
@@ -527,9 +765,17 @@ def _score_text_quality(lines: list[str]) -> float:
     return total_score / max(total_len, 1)
 
 
-def _reorder_vertical_page(page_chars: list[dict], col_gap: float = 12.0) -> list[str]:
+def _reorder_vertical_page(page_chars: list[dict], col_gap: float = 24.0) -> list[str]:
     """竖排单页（供 _detect_is_horizontal 内部使用）"""
     from collections import defaultdict
+
+    # 过滤控制字符
+    _ctrl = {'\r', '\n', '\t', '\x00', '\x0c', '\x0b'}
+    page_chars = [ch for ch in page_chars
+                  if ch["text"] not in _ctrl and ch["text"].strip()]
+
+    if not page_chars:
+        return []
 
     columns = defaultdict(list)
     for ch in page_chars:
@@ -541,8 +787,7 @@ def _reorder_vertical_page(page_chars: list[dict], col_gap: float = 12.0) -> lis
     page_lines: list[str] = []
     for _col_x, col_chars in sorted_cols:
         col_chars.sort(key=lambda ch: ch["y"])
-        line = "".join(ch["text"] for ch in col_chars
-                      if not ch["text"].strip().isdigit())
+        line = "".join(ch["text"] for ch in col_chars)
         stripped = line.strip()
         if stripped and not stripped.isdigit():
             page_lines.append(stripped)
@@ -826,12 +1071,14 @@ def build_track_scriptbook_map(
 
 def build_raw_scriptbook_map(
     scriptbook_files: list[Path],
+    api_config: dict = None,
 ) -> dict[int, list[str]]:
     """
     构建音轨→原始台本行映射（不做结构化解析，保留全文）
 
     参数:
         scriptbook_files: 台本文件列表
+        api_config: API 配置，用于 LLM 分析 PDF 排版参数
 
     返回:
         {track_num: [raw_line1, raw_line2, ...]}
@@ -840,7 +1087,7 @@ def build_raw_scriptbook_map(
 
     for idx, sb_file in enumerate(scriptbook_files):
         track_num = idx + 1
-        content = load_scriptbook_content(sb_file)
+        content = load_scriptbook_content(sb_file, api_config=api_config)
         if not content:
             continue
 

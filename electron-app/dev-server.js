@@ -22,6 +22,10 @@ var PROJECT_ROOT = (typeof process.pkg !== 'undefined')
   : fs.existsSync(path.join(__dirname, 'main.exe'))
     ? __dirname
     : path.resolve(__dirname, '..');
+// main.exe 统一放在 HDEG/Hde_G_release/ 下
+var MAIN_EXE_DIR = path.join(PROJECT_ROOT, 'Hde_G_release');
+var MAIN_EXE = path.join(MAIN_EXE_DIR, 'main.exe');
+var USE_MAIN_EXE = fs.existsSync(MAIN_EXE);
 var CONFIG_PATH = path.join(PROJECT_ROOT, 'config.json');
 var PRESETS_PATH = path.join(PROJECT_ROOT, 'presets.json');
 var CONFIG_SECTIONS = ['api', 'app', 'ocr', 'pricing', 'network', 'prompts', 'transcription'];
@@ -185,8 +189,6 @@ function findRJWorks(dirPath) {
 
 // ---- Python 进程管理 ----
 var pythonProcess = null;
-var MAIN_EXE = path.join(PROJECT_ROOT, 'main.exe');
-var USE_MAIN_EXE = fs.existsSync(MAIN_EXE);
 
 // 翻译状态缓存（浏览器重连时恢复）
 var translateState = {

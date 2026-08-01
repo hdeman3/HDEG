@@ -11,7 +11,7 @@ echo [配置] 正在读取 config.json 中的转录配置...
 
 :: Python 内部直接用 UTF-8 写文件，绕过 Shell 重定向前编码损坏
 set "cfg_tmp=%temp%\trans_cfg.txt"
-python -c "import json;c=json.load(open(r'!cpath!\config.json','r',encoding='utf-8'))['transcription'];t=c;f=open(r'!cfg_tmp!','w',encoding='utf-8');f.write(t.get('infer_exe','')+'\n');f.write(t.get('model_dir','')+'\n');f.write(t.get('device','cuda')+'\n');f.write(t.get('compute_type','int8_float16')+'\n');f.write(t.get('audio_suffixes','mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv')+'\n');f.write(t.get('sub_formats','lrc')+'\n');f.close()"
+python -c "import json;c=json.load(open(r'!cpath!\config.json','r',encoding='utf-8'))['transcription'];t=c;f=open(r'!cfg_tmp!','w',encoding='utf-8');f.write(t.get('infer_exe','')+'\n');f.write(t.get('model_dir','')+'\n');f.write(t.get('device','cuda')+'\n');f.write(t.get('compute_type','int8_float16')+'\n');f.write(t.get('audio_suffixes','mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv')+'\n');f.write('lrc'+'\n');f.close()"
 
 < "!cfg_tmp!" (
     set /p "infer_exe="
@@ -31,6 +31,15 @@ echo   计算类型: !compute_type!
 :: 移除可能存在的首尾空格
 for /f "tokens=*" %%a in ("!infer_exe!") do set "infer_exe=%%a"
 for /f "tokens=*" %%a in ("!model_dir!") do set "model_dir=%%a"
+
+:: 解析相对路径（相对于 cpath 即 bat 所在目录）
+:: infer_exe 为空时默认使用 bat 同目录下的 infer.exe
+if "!infer_exe!"=="" set "infer_exe=.\infer.exe"
+if "!infer_exe:~0,2!"==".\" set "infer_exe=!cpath!\!infer_exe:~2!"
+if "!infer_exe:~0,2!"=="./" set "infer_exe=!cpath!/!infer_exe:~2!"
+if "!model_dir!"=="" set "model_dir=.\models"
+if "!model_dir:~0,2!"==".\" set "model_dir=!cpath!\!model_dir:~2!"
+if "!model_dir:~0,2!"=="./" set "model_dir=!cpath!/!model_dir:~2!"
 
 :: 验证 infer.exe 是否存在
 if not exist "!infer_exe!" (

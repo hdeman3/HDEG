@@ -275,55 +275,206 @@ def copy_exe():
     
     shutil.copy2(exe_src, exe_dst)
     print(f"✓ 复制: {exe_src} -> {exe_dst}")
-
-    # 复制一份重命名为 translate.exe（兼容 bat 文件中的调用名）
-    translate_dst = RELEASE_DIR / "translate.exe"
-    shutil.copy2(exe_src, translate_dst)
-    print(f"✓ 复制: {exe_src} -> {translate_dst}")
     print()
 
 
-def collect_bat_files():
-    """收集以 Hde鸡 开头的 .bat 文件"""
+def _generate_bats():
+    """直接生成所有 Hde鸡 bat 文件（不依赖外部源）"""
     print("=" * 50)
-    print("步骤 4: 收集 Hde鸡 开头的 .bat 文件")
+    print("步骤 4: 生成 Hde鸡 .bat 文件")
     print("=" * 50)
-    
-    bat_files = list(SCRIPT_DIR.glob("Hde鸡*.bat"))
 
-    # 也尝试从 config.json 中的转录模型目录收集 bat 文件
-    import json
-    config_path = SCRIPT_DIR / "config.json"
-    if config_path.exists():
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            model_dir = config.get('transcription', {}).get('model_dir', '')
-            if model_dir:
-                model_path = Path(model_dir)
-                # model_dir 可能是 "E:\转录模型\models"，需要取其父目录
-                if model_path.name.lower() == "models":
-                    parent_dir = model_path.parent
-                else:
-                    parent_dir = model_path
-                if parent_dir.is_dir():
-                    extra_bats = list(parent_dir.glob("Hde鸡*.bat"))
-                    for b in extra_bats:
-                        if b not in bat_files:
-                            bat_files.append(b)
-        except Exception:
-            pass
+    # ── 公共模板（前中后三段） ──
+    HEAD = '''@echo off
+setlocal EnableDelayedExpansion
+chcp 65001 >nul
+set "cpath=%~dp0"
+set "cpath=%cpath:~0,-1%"
 
-    if not bat_files:
-        print("  ⚠ 未找到任何 Hde鸡 开头的 .bat 文件")
-        return
-    
-    for bat_src in bat_files:
-        bat_dst = RELEASE_DIR / bat_src.name
-        shutil.copy2(bat_src, bat_dst)
-        print(f"  复制: {bat_src.name}")
-    
-    print(f"✓ 共收集 {len(bat_files)} 个 .bat 文件")
+if "%~1"=="" (
+    echo 请将音视频文件夹拖到此窗口，然后按回车:
+    set "src_dir="
+    set /p "src_dir="
+    if not defined src_dir (
+        echo 未提供输入文件夹。
+        pause
+        exit /b 1
+    )
+) else (
+    set "src_dir=%~f1"
+)
+
+setlocal DisableDelayedExpansion
+if not exist "%src_dir%\\" (
+    echo 错误: 指定的路径不是有效文件夹。
+    pause
+    exit /b 1
+)
+setlocal EnableDelayedExpansion
+
+echo.
+echo ========================================
+echo 工作目录: !src_dir!
+echo ========================================
+echo.
+
+echo [0/2] 准备转录标记...
+
+set "has_ja_lrc=0"
+for /f "delims=" %%f in ('dir /s /b "!src_dir!\\*.ja.lrc" 2^>nul') do (
+    set "has_ja_lrc=1"
+    set "ja_name=%%~nf"
+    set "ja_dir=%%~dpf"
+    set "base_name=!ja_name:~0,-3!"
+    set "lrc_path=!ja_dir!!base_name!.lrc"
+    if not exist "!lrc_path!" (
+        copy "%%f" "!lrc_path!" >nul
+        echo   恢复: !base_name!.lrc (从 .ja.lrc)
+    )
+)
+
+echo [0/2] 准备完成。
+echo.
+
+set "need_transcribe=0"
+set "audio_extensions=.mp3 .wav .flac .m4a .aac .ogg .wma .mp4 .mkv .avi .mov .webm .flv .wmv"
+
+for %%e in (%audio_extensions%) do (
+    for /f "delims=" %%a in ('dir /s /b "!src_dir!\\*%%e" 2^>nul') do (
+        set "audio_name=%%~na"
+        set "audio_dir=%%~dpa"
+        set "ja_lrc_path=!audio_dir!!audio_name!.ja.lrc"
+        if not exist "!ja_lrc_path!" set "need_transcribe=1"
+    )
+)
+
+if "!need_transcribe!"=="0" (
+    echo [1/2] 检测到所有音频已有 .ja.lrc 留档，跳过转录。
+    echo.
+    goto :translate
+)
+'''
+
+    MID_START = 'echo [1/2] 正在执行日文转录'
+    MID_END = '''"%cpath%\\infer.exe" ^'''
+
+    TAIL = '''
+if errorlevel 1 (
+    echo [错误] 转录过程出错。
+    pause
+    exit /b 1
+)
+
+echo [1/2] 转录阶段结束，正在留档日文歌词...
+
+for %%e in (%audio_extensions%) do (
+    for /f "delims=" %%a in ('dir /s /b "!src_dir!\\*%%e" 2^>nul') do (
+        set "audio_dir=%%~dpa"
+        set "audio_name=%%~na"
+        set "lrc_path=!audio_dir!!audio_name!.lrc"
+        set "ja_lrc_path=!audio_dir!!audio_name!.ja.lrc"
+        if exist "!lrc_path!" (
+            if not exist "!ja_lrc_path!" (
+                copy "!lrc_path!" "!ja_lrc_path!" >nul
+                echo   留档: !audio_name!.ja.lrc
+            )
+        )
+    )
+)
+
+echo.
+
+:translate
+echo [2/2] 正在启动翻译...（自动处理留档和去重）
+> "%cpath%\\input_path.txt" echo(!src_dir!
+
+:: 读取 config.json 中的 main_exe，为空则默认同目录下的 main.exe
+set "main_exe="
+set "cfg_tmp=%temp%\\hdeg_mainexe.txt"
+if exist "%cpath%\\config.json" (
+    python -c "import json;c=json.load(open(r'%cpath:\\=/%/config.json','r',encoding='utf-8'));v=c.get('transcription',{}).get('main_exe','');f=open(r'%cfg_tmp:\\=/%','w',encoding='utf-8');f.write(v);f.close()" 2>nul
+    if exist "%cfg_tmp%" (
+        set /p "main_exe=" < "%cfg_tmp%"
+        del "%cfg_tmp%" 2>nul
+    )
+)
+if "!main_exe!"=="" set "main_exe=%cpath%\\main.exe"
+if "!main_exe:~0,2!"==".\\" set "main_exe=%cpath%\\!main_exe:~2!"
+if "!main_exe:~0,2!"=="./" set "main_exe=%cpath%/!main_exe:~2!"
+echo [引擎] main.exe: !main_exe!
+"!main_exe!"
+
+if errorlevel 1 (
+    echo [错误] 翻译失败。
+    del "%cpath%\\input_path.txt" 2>nul
+    pause
+    exit /b 1
+)
+
+del "%cpath%\\input_path.txt" 2>nul
+
+echo.
+echo ========================================
+echo 全部完成！
+echo.
+echo 文件说明:
+echo   .lrc     = 当前使用的中文歌词（播放器读取）
+echo   .ja.lrc  = 日文原版留档
+echo ========================================
+pause'''
+
+    # ── 5 个变体 ──
+    variants = {
+        "Hde鸡-翻译(GPU).bat": {
+            "desc": "GPU 转录 + 翻译",
+            "title": "HDE G 翻译 (GPU)",
+            "mid": MID_START + '（GPU模式）...\necho     已存在同名 .lrc 的音频将自动跳过...\necho.\n\n'
+                   + MID_END + '\n    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^\n'
+                   + '    --sub_formats="lrc" ^\n    --device="cuda" ^\n    --task="transcribe" ^\n    "!src_dir!"',
+        },
+        "Hde鸡-翻译(CPU).bat": {
+            "desc": "CPU 转录 + 翻译",
+            "title": "HDE G 翻译 (CPU)",
+            "mid": MID_START + '（CPU模式）...\necho     已存在同名 .lrc 的音频将自动跳过...\necho.\n\n'
+                   + MID_END + '\n    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^\n'
+                   + '    --sub_formats="lrc" ^\n    --device="cpu" ^\n    --task="transcribe" ^\n    "!src_dir!"',
+        },
+        "Hde鸡-翻译(GPU,低显存模式).bat": {
+            "desc": "GPU 低显存转录 + 翻译",
+            "title": "HDE G 翻译 (GPU, 低显存)",
+            "mid": MID_START + '（GPU低显存模式）...\necho     已存在同名 .lrc 的音频将自动跳过...\necho.\n\n'
+                   + MID_END + '\n    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^\n'
+                   + '    --sub_formats="lrc" ^\n    --device="cuda" ^\n    --compute_type="int8_float16" ^\n'
+                   + '    --task="transcribe" ^\n    "!src_dir!"',
+        },
+        "Hde鸡-翻译(GPU,高显存加速模式).bat": {
+            "desc": "GPU 高显存批处理转录 + 翻译",
+            "title": "HDE G 翻译 (GPU, 批处理加速)",
+            "mid": MID_START + '（GPU批处理加速模式）...\necho     自动检测最佳批处理大小以提高速度...\necho     需要更多显存 (建议8GB+)...\necho.\n\n'
+                   + MID_END + '\n    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^\n'
+                   + '    --sub_formats="lrc" ^\n    --device="cuda" ^\n    --task="transcribe" ^\n'
+                   + '    --enable_batching --max_batch_size=8 ^\n    "!src_dir!"',
+        },
+        "Hde鸡-翻译(GPU)(输出到当前文件夹).bat": {
+            "desc": "GPU 转录 + 翻译 (输出到源目录)",
+            "title": "HDE G 翻译 (GPU, 输出到当前文件夹)",
+            "mid": MID_START + '（GPU模式, 输出到当前文件夹）...\necho     已存在同名 .lrc 的音频将自动跳过...\necho.\n\n'
+                   + MID_END + '\n    --audio_suffixes="mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv" ^\n'
+                   + '    --sub_formats="lrc" ^\n    --device="cuda" ^\n    --output_dir="输出" ^\n'
+                   + '    --task="transcribe" ^\n    "!src_dir!"',
+        },
+    }
+
+    count = 0
+    for filename, v in variants.items():
+        header = f'echo ========================================\necho   {v["title"]}\necho ========================================\necho.\necho.\n'
+        bat_content = HEAD + header + v["mid"] + TAIL
+        dst = RELEASE_DIR / filename
+        dst.write_text(bat_content, encoding='utf-8')
+        count += 1
+        print(f"  生成: {filename}")
+
+    print(f"✓ 共生成 {count} 个 .bat 文件")
     print()
 
 
@@ -511,8 +662,8 @@ def main():
     # 步骤 3: 复制 exe
     copy_exe()
     
-    # 步骤 4: 收集 .bat 文件
-    collect_bat_files()
+    # 步骤 4: 生成 .bat 文件
+    _generate_bats()
     
     # 步骤 5: 提取 system prompt
     extract_system_prompt()

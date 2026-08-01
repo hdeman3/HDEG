@@ -295,7 +295,7 @@ def _llm_identify_scriptbook_files(
 
 【台本文件典型特征】
 - 文件名或所在目录包含: 台本、だいほん、シナリオ、script、セリフ、本編、台詞
-- 按音轨编号命名: 01, 02, トラック1, track1, Tr.1, １, ２ 等
+- 按音轨编号命名: 01, 02, トラック1, track1, Tr.1, １, ２, #1, #2 等
 - PDF格式的剧本/台词文档
 - 内容以角色对话（台词）为主
 
@@ -310,17 +310,21 @@ def _llm_identify_scriptbook_files(
 【预分割判断】（is_pre_split）
 - true: 台本已按音轨拆分为独立文件，每个文件对应一个音轨
 - false: 台本是整体文件（单个PDF或txt），需程序再分割
+- **重要**: 文件名以纯数字或编号开头（1, 01, １, #1, トラック1 等）且数量与音轨数接近 → 判定为预分割
 
 【文件→音轨匹配】（仅 is_pre_split=true 时需要 file_track_mapping）
-将台本文件编号匹配到音轨名。文件名和音轨名通常共享编号前缀（01, 02...），
-以此为线索匹配。如果编号无法确定对应关系，跳过该文件。
-示例: {{"1": "01_プロローグ／再開", "2": "02_久しぶりの..."}}
+将台本文件的编号与音轨名进行匹配。关键规则：
+1. 从文件名提取数字编号（全角数字１→半角1）
+2. 在音轨名列表中查找包含相同编号的条目（#1, 01, track1 均视为编号1）
+3. 示例: 文件「１.txt」的编号=1 → 匹配音轨名「#1彼氏持ちJKの...」
+4. 示例: 文件「２.txt」的编号=2 → 匹配音轨名「#2彼氏と待ち合わせ...」
+5. 编号无法确定时跳过该文件
 
 【文件列表】（共 {len(candidates)} 个）
 {file_list_text}
 
 请返回JSON（仅JSON）：
-{{"scriptbook_indices": [1, 2], "is_pre_split": true, "file_track_mapping": {{"1": "01_音轨名", "2": "02_音轨名"}}, "reasoning": "简短依据"}}
+{{"scriptbook_indices": [1, 2, 3], "is_pre_split": true, "file_track_mapping": {{"1": "完整音轨名1", "2": "完整音轨名2"}}, "reasoning": "简短依据"}}
 
 无台本时: {{"scriptbook_indices": [], "is_pre_split": false, "file_track_mapping": {{}}, "reasoning": "无"}}"""
 
@@ -515,7 +519,35 @@ def _try_load_cached_scriptbook(work_dir: Path, track_names: list[str]) -> dict[
     return None
 
 
-def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str] = None) -> dict[str, list[str]] | None:
+def _extract_track_asr_samples(work_dir: Path, track_names: list[str], max_lines: int = 10) -> dict[str, str]:
+    """从 .ja.lrc 文件中提取每条音轨的前几句 ASR 台词样本
+
+    参数:
+        work_dir: 作品目录
+        track_names: 音轨名列表（LRC 文件 stem）
+        max_lines: 每条音轨最多提取的行数
+
+    返回:
+        {track_name: "台词1\\n台词2\\n..."}  仅包含有样本的条目
+    """
+    from io_adapter.lrc_handler import parse_lrc_file
+    samples: dict[str, str] = {}
+    for name in track_names:
+        ja_path = work_dir / f'{name}.ja.lrc'
+        if not ja_path.exists():
+            continue
+        try:
+            lrc_lines = parse_lrc_file(ja_path)
+        except Exception:
+            continue
+        non_empty = [l.text.strip() for l in lrc_lines if l.text and l.text.strip()]
+        if non_empty:
+            samples[name] = '\n'.join(non_empty[:max_lines])
+    return samples
+
+
+def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str] = None,
+                     track_samples: dict[str, str] = None) -> dict[str, list[str]] | None:
     """加载台本参考，按音轨分割+清洗后返回 {音轨名: [清洁台词]}
 
     流程:
@@ -525,6 +557,11 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     4. 预分割台本 → 按文件编号匹配音轨，仅本地清洗（节省 Flash token）
     5. 非预分割台本 → Flash 分割+清洗 → 按音轨名匹配
     6. Flash 失败时回退到正则分割
+
+    参数:
+        work_dir: 作品目录
+        track_names: 音轨名列表（LRC 文件 stem）
+        track_samples: 每条音轨的前几句 ASR 台词样本 {track_name: "样本文本"}
 
     返回:
         {track_name: [clean_lines]} 映射，或 None 表示无台本
@@ -580,36 +617,53 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
             _log(f"\n[台本] LLM 识别失败，回退到正则关键词识别")
         scriptbook_files = find_scriptbooks_in_dir(work_dir)
 
-        # 正则回退时，检查文件名是否暗示已预分割（如 トラック1, track01, Tr.1 等）
+        # 正则回退时，检查文件名是否暗示已预分割（如 トラック1, track01, Tr.1, 01, １ 等）
         if scriptbook_files and not is_pre_split:
             import re as _re_fallback
             _track_pattern = _re_fallback.compile(
-                r'(?:トラック|track|tr|トラ)[\s_．.\-]*([０-９0-9]+)',
+                r'(?:トラック|track|tr|トラ)[\s_．.\-]*([０-９0-9]+)'
+                r'|^[#＃]?([０-９0-9]+)[\s_．.\-]',  # 纯数字开头 #1 / １ / 01
                 _re_fallback.IGNORECASE,
             )
             _pre_split_count = 0
             for _f in scriptbook_files:
-                if _track_pattern.search(_f.stem):
+                _m = _track_pattern.search(_f.stem)
+                if _m:
+                    _pre_split_count += 1
+                elif _f.stem.strip().isdigit():
+                    # 全数字文件名（如 "１", "2", "13"）——直接判定为编号
+                    _pre_split_count += 1
+                elif _re_fallback.match(r'^[０-９0-9]+$', _f.stem.strip()):
                     _pre_split_count += 1
             # 如果超过半数文件名包含音轨编号，判定为预分割
             if _pre_split_count >= len(scriptbook_files) * 0.5:
                 is_pre_split = True
                 # 尝试按编号匹配到 track_names
                 for _idx, _f in enumerate(scriptbook_files, 1):
+                    _num_str = None
                     _m = _track_pattern.search(_f.stem)
-                    if _m and track_names:
-                        _num = _m.group(1).translate(
+                    if _m:
+                        # 优先取 group(2)（纯数字模式），再 group(1)（track前缀模式）
+                        _num_str = (_m.group(2) or _m.group(1) or '').translate(
                             str.maketrans('０１２３４５６７８９', '0123456789'))
+                    else:
+                        # 纯数字文件名
+                        _raw = _f.stem.strip().translate(
+                            str.maketrans('０１２３４５６７８９', '0123456789'))
+                        if _raw.isdigit():
+                            _num_str = _raw
+                    if _num_str and track_names:
                         try:
-                            _num_int = int(_num)
-                            # 在 track_names 中找包含此编号的条目
+                            _num_int = int(_num_str)
+                            # 在 track_names 中找包含此编号的条目（#1, 01, track1 等格式）
                             for _tn in track_names:
                                 _tn_clean = _tn.translate(
                                     str.maketrans('０１２３４５６７８９', '0123456789'))
-                                if str(_num_int).zfill(2) in _tn_clean or f'トラック{_num_int}' in _tn_clean.lower():
+                                if (str(_num_int).zfill(2) in _tn_clean
+                                        or f'#{_num_int}' in _tn_clean
+                                        or f'トラック{_num_int}' in _tn_clean.lower()):
                                     file_track_mapping[str(_idx)] = _tn
                                     break
-                            # 如果 track_names 匹配不上，至少建一个编号映射
                             if str(_idx) not in file_track_mapping:
                                 file_track_mapping[str(_idx)] = f"{_num_int:02d}"
                         except ValueError:
@@ -736,7 +790,7 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
         api_config = ctx.api_cfg
         try:
             splitter = ScriptbookSplitter(api_config, verbose=True)
-            track_map = splitter.split_and_clean_all_in_one(track_names, raw_text)
+            track_map = splitter.split_and_clean_all_in_one(track_names, raw_text, track_samples=track_samples)
         except Exception as e:
             _log(f"  [台本] Flash 分割失败: {e}，回退到正则分割")
             track_map = {}
@@ -1052,7 +1106,24 @@ def translate_one_lrc(
         return False
 
     texts = sub_file.original_lyrics
-    _log(f"  [解析] {len(texts)} 行文本")
+    total_chars = sum(len(t) for t in texts)
+    _log(f"  [解析] {len(texts)} 行文本, {total_chars} 字符")
+
+    # 原文全空 → 尝试从 .ja.lrc 恢复（上次翻译可能写坏了）
+    if total_chars == 0 and len(texts) > 0:
+        ja_path = lrc_path.parent / f"{lrc_path.stem}.ja{lrc_path.suffix}"
+        if ja_path.exists():
+            _log(f"  [恢复] 原文为空，从 {ja_path.name} 恢复")
+            shutil.copy2(ja_path, lrc_path)
+            sub_file = parse_subtitle_file(lrc_path)
+            if sub_file:
+                texts = sub_file.original_lyrics
+                total_chars = sum(len(t) for t in texts)
+                _log(f"  [恢复] 重新解析: {len(texts)} 行, {total_chars} 字符")
+        if total_chars == 0:
+            _log(f"  [跳过] 原文内容为空（仅有时间戳），跳过翻译")
+            ctx.stats["skipped"] += 1
+            return False
 
     # 检测是否已是中文（启发式：若大部分字符在 CJK 范围则跳过）
     lang = detect_subtitle_language(lrc_path)
@@ -1115,6 +1186,14 @@ def translate_one_lrc(
     call_elapsed = time.time() - call_start
 
     translated_batch = result.get('translated_lines', [])
+    # 调试：翻译全空时打印 LLM 原始响应
+    if len(translated_batch) > 0 and all(not (t or '').strip() for t in translated_batch):
+        _log(f"  🔍 DEBUG: translated_batch前3=[{str(translated_batch[:3])[:200]}]")
+        _log(f"  🔍 DEBUG: engine type={type(ctx.translate_engine).__name__}")
+        raw_resp = getattr(ctx.translate_engine, '_last_raw_response', 'NOT_FOUND')
+        _log(f"  🔍 LLM原始响应 ({len(raw_resp) if raw_resp != 'NOT_FOUND' else 'N/A'}字符): {(raw_resp or '')[:500]}")
+        if raw_resp and raw_resp != 'NOT_FOUND' and len(raw_resp) > 500:
+            _log(f"  🔍 ...末尾: {raw_resp[-300:]}")
     for t_line in translated_batch:
         # 去掉编号前缀 "0001: "
         if ': ' in t_line:
@@ -1125,6 +1204,14 @@ def translate_one_lrc(
         translated_texts.append(t_line)
 
     _log(f"  ← 响应: {len(translated_batch)} 行, 耗时 {call_elapsed:.1f}s")
+    # 预览前5行翻译结果（排查空输出问题）
+    non_empty = [t for t in translated_texts if t and t.strip()]
+    _log(f"  📝 有效行: {len(non_empty)}/{len(translated_texts)}")
+    if non_empty:
+        for i, t in enumerate(non_empty[:3]):
+            _log(f"     [{i+1}] {t[:80]}")
+    else:
+        _log(f"  ⚠ 所有行为空！首3行原文: {[t[:40] for t in texts[:3]]}")
     hit = result.get('hit_tokens', 0)
     miss = result.get('miss_tokens', 0)
     comp = result.get('completion_tokens', 0)
@@ -1171,6 +1258,13 @@ def translate_one_lrc(
             except Exception as e:
                 _log(f"  [留档失败] {lrc_path.name}: {e}")
 
+    # 翻译全空但原文非空 → 不覆盖，保留原文件
+    trans_chars = sum(len(t) for t in translated_texts if t)
+    if trans_chars == 0 and total_chars > 0:
+        _log(f"  [跳过写入] 翻译结果全空，保留原文件不覆盖")
+        ctx.stats["skipped"] += 1
+        return False
+
     # 写回翻译结果（通用字幕格式）
     write_subtitle_file(sub_file, translated_texts, lrc_path)
     _log(f"\n[写入] -> {abs_path}")
@@ -1203,16 +1297,16 @@ def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext) -> None:
     device = tc.get('device', 'cuda')
     compute_type = tc.get('compute_type', 'int8_float16')
 
-    if not infer_exe:
-        _log("[转录] 未配置 infer.exe，跳过转录步骤")
-        return
-
     # 解析相对路径（从 HDEG 根目录，不是作品目录）
     import sys
     if getattr(sys, 'frozen', False):
         hdeg_root = Path(sys.executable).parent
     else:
         hdeg_root = Path(__file__).parent.parent  # pipeline/ -> HDEG/
+
+    if not infer_exe:
+        infer_exe = './infer.exe'
+        _log(f"[转录] 未配置 infer.exe，默认使用同目录: {hdeg_root / infer_exe}")
     exe_path = Path(infer_exe)
     if not exe_path.is_absolute():
         exe_path = hdeg_root / exe_path
@@ -1582,7 +1676,12 @@ def run_pipeline(
                 _gk = _rj_root if _rj_root else _fp.parent
                 if str(_gk) == _dir_key:
                     _dir_track_names.append(_fp.stem)
-        dir_scriptbook = _load_scriptbook(group_key, ctx, track_names=_dir_track_names)
+        # 提取每条音轨的前几句 ASR 台词，辅助 LLM 定位台本段落
+        _dir_track_samples = _extract_track_asr_samples(group_key, _dir_track_names)
+        if _dir_track_samples:
+            _log(f"  [台本] 提取 ASR 样本: {len(_dir_track_samples)}/{len(_dir_track_names)} 条音轨有 .ja.lrc")
+        dir_scriptbook = _load_scriptbook(group_key, ctx, track_names=_dir_track_names,
+                                          track_samples=_dir_track_samples if _dir_track_samples else None)
         if dir_scriptbook:
             work_scriptbook[_dir_key] = dir_scriptbook
             _total_sb_lines = sum(len(v) for v in dir_scriptbook.values())

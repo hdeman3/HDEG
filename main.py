@@ -94,6 +94,11 @@ if hasattr(sys, '_MEIPASS'):
 # ==================== 主入口 ====================
 
 if __name__ == '__main__':
+    import os as _os
+    if _os.environ.get('_HDEG_RUNNING'):
+        print('[入口] 检测到重复执行，跳过', flush=True)
+        _os._exit(0)
+    _os.environ['_HDEG_RUNNING'] = '1'
     import argparse
     parser = argparse.ArgumentParser(
         description='翻译工具 - 日文字幕翻译',
@@ -136,7 +141,11 @@ if __name__ == '__main__':
         #   kikoeru 后台模式（同时指定 --config 和 root）→ 命令行参数最优先
         #   input_path.txt（bat 拖放模式）
         #   当前目录（默认）
-        SCRIPT_DIR = Path(__file__).parent.resolve()
+        # PyInstaller 打包后 __file__ 指向临时目录，用 sys.executable 获取 exe 真实路径
+        if getattr(sys, 'frozen', False):
+            SCRIPT_DIR = Path(sys.executable).parent.resolve()
+        else:
+            SCRIPT_DIR = Path(__file__).parent.resolve()
         root = SCRIPT_DIR  # 默认
 
         # 1. kikoeru 后台模式：--config 和 root 同时指定时，命令行参数优先

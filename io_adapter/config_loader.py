@@ -68,6 +68,7 @@ def load_config(path: Path = None) -> dict[str, Any]:
         print(f"[配置] 请编辑 {path} 填入 API key 后重新运行")
         return default_config
 
+    print(f"[配置] 读取: {path}")
     with open(path, 'r', encoding='utf-8') as f:
         config = json.load(f)
 

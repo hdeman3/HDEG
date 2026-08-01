@@ -121,6 +121,7 @@ class OpenAICompatEngine:
         self.verbose = verbose
         self._client = None
         self._system_prompt_file = system_prompt_file
+        self._last_raw_response = ''
         # 预加载外部 prompt（优先指定的文件，其次内置融合版，最后回退到硬编码默认）
         self._external_system_prompt: str | None = None
         try:
@@ -350,6 +351,7 @@ class OpenAICompatEngine:
         user_prompt: str,
         *,
         max_retries: int = 3,
+        override_gen_params: dict | None = None,
     ) -> tuple[str, dict]:
         """
         调用 API 并返回结果 + token 统计
@@ -358,6 +360,7 @@ class OpenAICompatEngine:
             system_prompt: 系统提示词
             user_prompt: 用户提示词
             max_retries: 最大重试次数
+            override_gen_params: 覆盖全局 generation_params 的参数（仅对本次调用生效）
 
         返回:
             (response_text, token_stats)
@@ -365,7 +368,9 @@ class OpenAICompatEngine:
         """
         self._ensure_client()
 
-        gen_params = self.config.get('generation_params', {})
+        gen_params = dict(self.config.get('generation_params', {}))
+        if override_gen_params:
+            gen_params.update(override_gen_params)
         last_error = None
 
         # DEBUG: 只打印待翻译的日文原文（跳过格式说明和台本参考）
@@ -428,7 +433,13 @@ class OpenAICompatEngine:
                     heartbeat_stop.set()
                     heartbeat_thread.join(timeout=1)
 
-                content = response.choices[0].message.content or ''
+                msg = response.choices[0].message
+                content = msg.content or ''
+                # DeepSeek V4 reasoning: content 为空时回退到 reasoning_content
+                if not content and hasattr(msg, 'reasoning_content') and msg.reasoning_content:
+                    if self.verbose:
+                        print(f"  [API] content 为空, 使用 reasoning_content ({len(msg.reasoning_content)} 字符)")
+                    content = msg.reasoning_content
 
                 # DEBUG: 尝试提取翻译结果供预览
                 if self.verbose:
@@ -448,6 +459,7 @@ class OpenAICompatEngine:
                 hit = hit_tokens.cached_tokens if hit_tokens else 0
                 miss = usage.prompt_tokens - hit if usage.prompt_tokens else 0
 
+                self._last_raw_response = content
                 return content, {
                     'hit_tokens': hit,
                     'miss_tokens': miss,
@@ -697,8 +709,12 @@ class OpenAICompatEngine:
         json_result = self._extract_json_array(translated_text)
         if json_result is not None:
             parsed_count = len(json_result)
+            non_empty = sum(1 for x in json_result if x and x.strip())
             if self.verbose:
-                print(f"  [JSON解析] 成功: 提取到 {parsed_count} 条翻译 (输入 {n_input} 行)")
+                print(f"  [JSON解析] 成功: {parsed_count}条, 非空{non_empty}条 (输入{n_input}行)")
+                if non_empty == 0 and parsed_count > 0:
+                    print(f"  [JSON解析] ⚠ 全部为空！LLM原始响应前300字: {translated_text[:300]}")
+                    print(f"  [JSON解析] ⚠ LLM原始响应后200字: {translated_text[-200:]}")
 
             # 按索引精确对齐
             translated: list[str] = []

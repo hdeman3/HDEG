@@ -24,55 +24,39 @@ SPLIT_SYSTEM_PROMPT = (
     "严格按照 JSON 格式输出，不要输出任何其他内容。"
 )
 
-_SPLIT_USER_TEMPLATE = """【音轨列表】（必须使用以下名称作为输出的 key）
+# ══ V1 (已废弃) — 全文本输出方案 ══
+# _SPLIT_USER_TEMPLATE = """【音轨列表】（必须使用以下名称作为输出的 key）
+# {track_names_json}
+# ...
+# 仅输出 JSON（无任何解释）：
+# {{"tracks": {{"音轨名1": ["台词1", "台词2"], "音轨名2": [...]}}}}
+# 如果某个音轨在台本中找不到对应内容，其值设为空数组 []。"""
+
+
+# ══ V2 (已废弃) — 全文本输出 + 清洗规则 ══
+# _SPLIT_USER_TEMPLATE_V2 = """..."""
+# 由 V3 行号范围方案替代
+
+
+# ── V3 Prompt（行号范围输出，不做清洗，只做定位） ──
+
+_SPLIT_USER_TEMPLATE_V3 = """【音轨列表】（必须使用以下名称作为输出的 key）
 {track_names_json}
 
-【原始台本】
-{raw_scriptbook}
+【音轨 ASR 样本】（每条音轨的前几句实际台词，用于辅助定位台本中的对应段落。⚠ ASR 识别可能有误，仅作语义锚点参考，不要逐字匹配）
+{track_samples_text}
+
+【原始台本】（每行已编号，格式为 行号|内容。使用行号引用区间）
+{numbered_scriptbook}
 
 【规则】
-1. 将台本内容按音轨分割，每个音轨对应上面音轨列表中的一个名称
-2. 匹配时根据台本中的章节标题（如《トラック1 常識改変聖女…》）与音轨名进行语义匹配
-3. 每个音轨内：拼接因换行而断裂的句子、丢弃舞台指示/音效描述/纯拟声词行/空行/注释行（※开头）
-4. 保留 ♥ 等语气符号
-5. 只做整理，不做翻译
+1. 按音轨标题语义 + ASR 样本定位每个音轨在台本中的起止位置
+2. 输出 [起始行号, 结束行号]（均为整数，1-based，闭区间）
+3. 找不到内容的音轨设为空数组 []
+4. 只做定位，不做清洗、不做翻译、不拼接断行
 
 仅输出 JSON（无任何解释）：
-{{"tracks": {{"音轨名1": ["台词1", "台词2"], "音轨名2": [...]}}}}
-
-如果某个音轨在台本中找不到对应内容，其值设为空数组 []。"""
-
-
-# ── 增强版 Prompt（合并清洗+分割，一次请求完成） ──
-
-_SPLIT_USER_TEMPLATE_V2 = """【音轨列表】（必须使用以下名称作为输出的 key）
-{track_names_json}
-
-【原始台本】
-{raw_scriptbook}
-
-【规则 —— 以下三类内容必须删除】
-1. **SE（音效）**：ＳＥ：开头或包含音效描述的行/片段
-2. **演技指示**：■ 开头的纯指示行（但紧接台词/发声的保留发声部分）、（）包裹的演技注记
-3. **场景描述/设定**：⚪︎⚫︎标记的场景说明、角色设定、世界观介绍、非台词的叙述文
-
-【规则 —— 以下内容必须保留】
-- 拼接PDF断行后的完整台词
-- 【角色名】标记的行
-- 台词中的娇喘/发声（んっ、あっ、はぁ 等）
-- ♥♡ 等语气符号
-
-【规则 —— 每个音轨内】
-1. 按音轨标题语义匹配到对应编号
-2. 拼接因换行而断裂的句子
-3. 只做整理，不做翻译、不做纠错
-4. **台词按说话顺序排列**，不按角色分组
-5. **适当拆句**，每句对话作为独立数组元素——禁止一整段返回
-
-仅输出 JSON（无任何解释）：
-{{"tracks": {{"track_name": ["台词1", "台词2"], ...}}}}
-
-台本不一定存在——找不到内容的音轨设为空数组 []，不强求。"""
+{{"tracks": {{"track_name": [start, end], ...}}}}"""
 
 
 # ── 预分割台本清洗 Prompt（已按文件分轨，只需清洗） ──
@@ -117,6 +101,26 @@ def _conservative_pre_clean(text: str) -> str:
     return text.strip()
 
 
+def _merge_short_lines(text: str, min_len: int = 10) -> str:
+    """合并短行：将 < min_len 字的行拼接到上行，降低 PDF 提取碎片度
+
+    跳过角色标记（◆）、演技指示（■）、音响标记（○●）开头的行。
+    返回合并后的文本。
+    """
+    lines = text.split('\n')
+    merged: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            merged.append('')
+            continue
+        if merged and merged[-1] and len(s) < min_len and s[0] not in ('◆', '■', '○', '●'):
+            merged[-1] = merged[-1] + s
+        else:
+            merged.append(s)
+    return '\n'.join(m for m in merged if m)
+
+
 # ==================== 分割器实现 ====================
 
 class ScriptbookSplitter:
@@ -128,8 +132,8 @@ class ScriptbookSplitter:
 
     # 固定使用 Flash 模型（不跟随 config 的翻译模型设置）
     SPLIT_MODEL = 'deepseek-v4-flash'
-    # 输出窗口开大，容纳全部音轨的清洗后台本（500行×10轨 ≈ 50000 chars ≈ 25000 tokens + JSON overhead）
-    SPLIT_MAX_TOKENS = 32768
+    # 输出窗口：flash 模型有内部推理 token 开销，给足余量
+    SPLIT_MAX_TOKENS = 262144
 
     def __init__(self, config: dict, verbose: bool = False):
         """
@@ -159,90 +163,29 @@ class ScriptbookSplitter:
             timeout=self.timeout,
         )
 
-    def split_and_clean(
-        self,
-        track_names: list[str],
-        raw_scriptbook: str,
-        *,
-        max_retries: int = 2,
-    ) -> dict[str, list[str]]:
-        """
-        一次 Flash 调用完成台本分割+清洗。
-
-        参数:
-            track_names: 音轨名列表（LRC 文件名，不含扩展名）
-            raw_scriptbook: 原始台本全文
-
-        返回:
-            {track_name: [clean_lines]}
-            失败时返回空 dict
-        """
-        if not track_names or not raw_scriptbook.strip():
-            return {}
-
-        # 构建请求
-        track_names_json = _json.dumps(track_names, ensure_ascii=False)
-        user_prompt = _SPLIT_USER_TEMPLATE.format(
-            track_names_json=track_names_json,
-            raw_scriptbook=raw_scriptbook,
-        )
-
-        if self.verbose:
-            print(f"  [台本分割] 输入 {len(raw_scriptbook)} 字符, {len(track_names)} 个音轨")
-
-        self._ensure_client()
-
-        last_error = None
-        for attempt in range(max_retries):
-            try:
-                response = self._client.chat.completions.create(
-                    model=self.SPLIT_MODEL,
-                    messages=[
-                        {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
-                        {'role': 'user', 'content': user_prompt},
-                    ],
-                    temperature=0.1,
-                    max_tokens=self.SPLIT_MAX_TOKENS,
-                )
-                content = response.choices[0].message.content or ''
-
-                result = self._parse_response(content, track_names)
-                if result:
-                    if self.verbose:
-                        total_lines = sum(len(v) for v in result.values())
-                        print(f"  [台本分割] 成功: {len(result)}/{len(track_names)} 个音轨, "
-                              f"共 {total_lines} 行台词")
-                    return result
-
-            except Exception as e:
-                last_error = e
-                if self.verbose:
-                    print(f"  [台本分割] 尝试 {attempt+1}/{max_retries} 失败: {e}")
-                if attempt < max_retries - 1:
-                    _time_mod.sleep(2 ** attempt)
-
-        if self.verbose:
-            print(f"  [台本分割] 全部尝试失败: {last_error}")
-        return {}
+    # ══ V1 (已废弃) — 全文本输出，LLM 返回清洗+分割后的完整台本 ══
+    # def split_and_clean(self, track_names, raw_scriptbook, *, max_retries=2):
+    #     """一次 Flash 调用完成台本分割+清洗。"""
+    #     ... (已废弃，由 V3 行号范围方案替代)
 
     def split_and_clean_all_in_one(
         self,
         track_names: list[str],
         raw_scriptbook: str,
         *,
+        track_samples: dict[str, str] = None,
         max_retries: int = 2,
     ) -> dict[str, list[str]]:
         """
-        一次 Flash 调用完成「清洗 + 分割」（合并版）。
+        V3: 一次 Flash 调用完成「定位」（行号范围输出）。
 
-        与 split_and_clean 的区别：
-        - 使用增强版 prompt (_SPLIT_USER_TEMPLATE_V2)，明确列举要删除的内容类型
-        - 输入是保守预清洗后的文本（非 regex 深度清洗）
-        - 一次调用完成原本 clean_script_for_translation + split_and_clean 的工作
+        LLM 只返回每个音轨对应台本的行号区间 [start, end]，
+        文本提取和清洗全部在本地完成，输出 token 减少 ~99%。
 
         参数:
-            track_names: 音轨名列表（数字字符串，如 ["01","02",...]）
-            raw_scriptbook: 预清洗后的台本全文
+            track_names: 音轨名列表（LRC 文件 stem）
+            raw_scriptbook: 原始台本全文
+            track_samples: 每条音轨的前几句 ASR 台词样本
 
         返回:
             {track_name: [clean_lines]}
@@ -250,53 +193,184 @@ class ScriptbookSplitter:
         if not track_names or not raw_scriptbook.strip():
             return {}
 
-        # 保守预清洗
+        # 1. 保守预清洗
         cleaned = _conservative_pre_clean(raw_scriptbook)
         if self.verbose:
             red_pct = (1 - len(cleaned) / max(len(raw_scriptbook), 1)) * 100
-            print(f"  [台本分割V2] 预清洗: {len(raw_scriptbook)} → {len(cleaned)} 字符 ({red_pct:.0f}% 减少)")
+            print(f"  [台本分割V3] 预清洗: {len(raw_scriptbook)} → {len(cleaned)} 字符 ({red_pct:.0f}% 减少)")
 
+        # 1.5 短行合并 (降低 PDF 碎片度)
+        cleaned = _merge_short_lines(cleaned)
+        if self.verbose:
+            print(f"  [台本分割V3] 短行合并后: {len(cleaned)} 字符")
+
+        # 2. 编号行号
+        numbered_text, original_lines = self._number_scriptbook_lines(cleaned)
+        if self.verbose:
+            print(f"  [台本分割V3] 编号 {len(original_lines)} 行")
+
+        # 3. 构建 ASR 样本参考文本
+        if track_samples:
+            sample_parts = []
+            for name in track_names:
+                sample_text = track_samples.get(name, '')
+                if sample_text:
+                    sample_parts.append(f'【{name}】\n{sample_text}')
+                else:
+                    sample_parts.append(f'【{name}】\n（无样本）')
+            track_samples_text = '\n\n'.join(sample_parts)
+        else:
+            track_samples_text = '（无 ASR 样本，仅根据音轨名匹配）'
+
+        # 4. 构建 V3 prompt
         track_names_json = _json.dumps(track_names, ensure_ascii=False)
-        user_prompt = _SPLIT_USER_TEMPLATE_V2.format(
+        user_prompt = _SPLIT_USER_TEMPLATE_V3.format(
             track_names_json=track_names_json,
-            raw_scriptbook=cleaned,
+            track_samples_text=track_samples_text,
+            numbered_scriptbook=numbered_text,
         )
 
         if self.verbose:
-            print(f"  [台本分割V2] {len(track_names)} 个音轨, prompt {len(user_prompt)} 字符")
+            print(f"  [台本分割V3] {len(track_names)} 个音轨, prompt {len(user_prompt)} 字符, "
+                  f"max_tokens={self.SPLIT_MAX_TOKENS}")
 
         self._ensure_client()
 
         last_error = None
         for attempt in range(max_retries):
             try:
-                response = self._client.chat.completions.create(
-                    model=self.SPLIT_MODEL,
-                    messages=[
-                        {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
-                        {'role': 'user', 'content': user_prompt},
-                    ],
-                    temperature=0.1,
-                    max_tokens=max(self.SPLIT_MAX_TOKENS, 65536),
-                )
+                # 心跳线程：长请求时打印等待进度
+                import threading
+                heartbeat_stop = threading.Event()
+                heartbeat_count = [0]
+
+                def _print_heartbeat():
+                    while not heartbeat_stop.is_set():
+                        heartbeat_stop.wait(10)
+                        if not heartbeat_stop.is_set():
+                            heartbeat_count[0] += 10
+                            print(f"    [等待] 已等待 {heartbeat_count[0]} 秒...", flush=True)
+
+                heartbeat_thread = threading.Thread(target=_print_heartbeat, daemon=True)
+                heartbeat_thread.start()
+
+                try:
+                    response = self._client.chat.completions.create(
+                        model=self.SPLIT_MODEL,
+                        messages=[
+                            {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
+                            {'role': 'user', 'content': user_prompt},
+                        ],
+                        temperature=0.1,
+                        max_tokens=self.SPLIT_MAX_TOKENS,
+                    )
+                finally:
+                    heartbeat_stop.set()
+                    heartbeat_thread.join(timeout=1)
+
                 content = response.choices[0].message.content or ''
-                result = self._parse_response(content, track_names)
+                finish = response.choices[0].finish_reason or 'unknown'
+                usage_info = f"prompt={response.usage.prompt_tokens if response.usage else '?'}, completion={response.usage.completion_tokens if response.usage else '?'}" if response.usage else ''
+                if self.verbose:
+                    print(f"  [台本分割V3] finish_reason={finish}, {usage_info}")
+                    preview = content[:500] + ('...' if len(content) > 500 else '')
+                    print(f"  [台本分割V3] LLM 响应 ({len(content)} 字符): {preview}")
+                    if len(content) > 500:
+                        print(f"  [台本分割V3] ...末尾: {content[-200:]}")
+                result = self._parse_response(content, track_names, original_lines=original_lines)
                 if result:
                     if self.verbose:
                         total_lines = sum(len(v) for v in result.values())
-                        print(f"  [台本分割V2] 成功: {len(result)}/{len(track_names)} 个音轨, "
+                        print(f"  [台本分割V3] 成功: {len(result)}/{len(track_names)} 个音轨, "
                               f"共 {total_lines} 行台词")
                     return result
+
             except Exception as e:
                 last_error = e
                 if self.verbose:
-                    print(f"  [台本分割V2] 尝试 {attempt+1}/{max_retries} 失败: {e}")
+                    print(f"  [台本分割V3] 尝试 {attempt+1}/{max_retries} 失败: {e}")
                 if attempt < max_retries - 1:
                     _time_mod.sleep(2 ** attempt)
 
         if self.verbose:
-            print(f"  [台本分割V2] 全部尝试失败: {last_error}")
+            print(f"  [台本分割V3] 全部尝试失败: {last_error}")
         return {}
+
+    # ═════════════════════════════════════════════════════════
+    # V2 (注释保留): 全文本输出方案，LLM 返回完整清洗后台本。
+    # 如需回退，取消下方注释并注释掉上面的 V3 实现。
+    # ═════════════════════════════════════════════════════════
+    # def split_and_clean_all_in_one_v2(
+    #     self,
+    #     track_names: list[str],
+    #     raw_scriptbook: str,
+    #     *,
+    #     track_samples: dict[str, str] = None,
+    #     max_retries: int = 2,
+    # ) -> dict[str, list[str]]:
+    #     """V2: 一次 Flash 调用完成「清洗 + 分割」（全文本输出）"""
+    #     if not track_names or not raw_scriptbook.strip():
+    #         return {}
+    #
+    #     cleaned = _conservative_pre_clean(raw_scriptbook)
+    #     if self.verbose:
+    #         red_pct = (1 - len(cleaned) / max(len(raw_scriptbook), 1)) * 100
+    #         print(f"  [台本分割V2] 预清洗: {len(raw_scriptbook)} → {len(cleaned)} 字符 ({red_pct:.0f}% 减少)")
+    #
+    #     if track_samples:
+    #         sample_parts = []
+    #         for name in track_names:
+    #             sample_text = track_samples.get(name, '')
+    #             if sample_text:
+    #                 sample_parts.append(f'【{name}】\n{sample_text}')
+    #             else:
+    #                 sample_parts.append(f'【{name}】\n（无样本）')
+    #         track_samples_text = '\n\n'.join(sample_parts)
+    #     else:
+    #         track_samples_text = '（无 ASR 样本，仅根据音轨名匹配）'
+    #
+    #     track_names_json = _json.dumps(track_names, ensure_ascii=False)
+    #     user_prompt = _SPLIT_USER_TEMPLATE_V2.format(
+    #         track_names_json=track_names_json,
+    #         track_samples_text=track_samples_text,
+    #         raw_scriptbook=cleaned,
+    #     )
+    #
+    #     if self.verbose:
+    #         print(f"  [台本分割V2] {len(track_names)} 个音轨, prompt {len(user_prompt)} 字符")
+    #
+    #     self._ensure_client()
+    #
+    #     last_error = None
+    #     for attempt in range(max_retries):
+    #         try:
+    #             response = self._client.chat.completions.create(
+    #                 model=self.SPLIT_MODEL,
+    #                 messages=[
+    #                     {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
+    #                     {'role': 'user', 'content': user_prompt},
+    #                 ],
+    #                 temperature=0.1,
+    #                 max_tokens=max(self.SPLIT_MAX_TOKENS, 65536),
+    #             )
+    #             content = response.choices[0].message.content or ''
+    #             result = self._parse_response(content, track_names)
+    #             if result:
+    #                 if self.verbose:
+    #                     total_lines = sum(len(v) for v in result.values())
+    #                     print(f"  [台本分割V2] 成功: {len(result)}/{len(track_names)} 个音轨, "
+    #                           f"共 {total_lines} 行台词")
+    #                 return result
+    #         except Exception as e:
+    #             last_error = e
+    #             if self.verbose:
+    #                 print(f"  [台本分割V2] 尝试 {attempt+1}/{max_retries} 失败: {e}")
+    #             if attempt < max_retries - 1:
+    #                 _time_mod.sleep(2 ** attempt)
+    #
+    #     if self.verbose:
+    #         print(f"  [台本分割V2] 全部尝试失败: {last_error}")
+    #     return {}
 
     def clean_pre_split_tracks(
         self,
@@ -375,12 +449,58 @@ class ScriptbookSplitter:
             print(f"  [预分割清洗] 全部尝试失败: {last_error}")
         return {}
 
+    @staticmethod
+    def _number_scriptbook_lines(text: str) -> tuple[str, list[str]]:
+        """给台本每行加上行号前缀，供 LLM 引用
+
+        返回:
+            numbered_text: "00001|行内容\\n00002|行内容..."
+            original_lines: 原始行列表（用于后续按行号切片）
+        """
+        original_lines = text.split('\n')
+        numbered_lines = [f"{i+1:05d}|{line}" for i, line in enumerate(original_lines)]
+        return '\n'.join(numbered_lines), original_lines
+
+    @staticmethod
+    def _extract_lines_by_range(
+        original_lines: list[str],
+        start: int,
+        end: int,
+    ) -> list[str]:
+        """从原始行列表中按 1-indexed 闭区间提取并清洗行
+
+        参数:
+            original_lines: 未编号的原始行列表
+            start: 起始行号（1-indexed，包含）
+            end: 结束行号（1-indexed，包含）
+
+        返回:
+            清洗后的行列表
+        """
+        if start < 1 or end < start or start > len(original_lines):
+            return []
+        end = min(end, len(original_lines))
+        extracted = original_lines[start - 1 : end]
+        # 对整个片段做保守预清洗
+        cleaned = _conservative_pre_clean('\n'.join(extracted))
+        lines = cleaned.split('\n')
+        return [
+            line for line in lines
+            if line.strip() and not ScriptbookSplitter._is_noise_line(line)
+        ]
+
     def _parse_response(
         self,
         content: str,
         track_names: list[str],
+        original_lines: list[str] = None,
     ) -> dict[str, list[str]] | None:
-        """解析 LLM 返回的 JSON，校验并返回结果"""
+        """解析 LLM 返回的 JSON，校验并返回结果
+
+        支持两种输出格式：
+        - V3 行号范围: {"tracks": {"name": [start, end]}}
+        - V2/V1 全文本: {"tracks": {"name": ["line1", "line2"]}}
+        """
         # 提取 JSON
         json_text = content.strip()
         if '```json' in json_text:
@@ -409,9 +529,16 @@ class ScriptbookSplitter:
         # 建立 track_names 的标准化索引（用于模糊匹配）
         name_index = {self._normalize(n): n for n in track_names}
 
-        for key, lines in raw_tracks.items():
-            if not isinstance(lines, list):
+        for key, value in raw_tracks.items():
+            if not isinstance(value, list):
                 continue
+
+            # ── 检测格式：V3 行号范围 vs V2/V1 全文本 ──
+            is_range_format = (
+                len(value) == 2
+                and all(isinstance(v, (int, float)) for v in value)
+            )
+
             # 标准化匹配
             norm_key = self._normalize(key)
             matched_name = name_index.get(norm_key)
@@ -426,12 +553,17 @@ class ScriptbookSplitter:
                     print(f"  [台本分割] 跳过未匹配的音轨: {key}")
                 continue
 
-            # 过滤空行 + 纯符号行
-            clean_lines = [
-                line for line in lines
-                if isinstance(line, str) and line.strip()
-                and not self._is_noise_line(line)
-            ]
+            if is_range_format and original_lines is not None:
+                # V3 格式: [start, end] → 本地提取+清洗
+                start, end = int(value[0]), int(value[1])
+                clean_lines = self._extract_lines_by_range(original_lines, start, end)
+            else:
+                # V2/V1 格式: list[str] → 直接过滤
+                clean_lines = [
+                    line for line in value
+                    if isinstance(line, str) and line.strip()
+                    and not self._is_noise_line(line)
+                ]
             result[matched_name] = clean_lines
 
         # 确保所有 track_names 都有条目（缺失的给空数组）
@@ -474,8 +606,8 @@ class ScriptbookSplitter:
         # ※ 开头的注释
         if s.startswith('※'):
             return True
-        # 纯拟声词行（只含假名 + ♥ + …… + っ）
-        if re.match(r'^[ぁ-んァ-ン♥……っ！!～~。、\s]+$', s) and len(s) < 20:
+        # 纯拟声词行（只含假名 + ♥ + …… + っ），阈值降到 8 避免误伤短对话
+        if re.match(r'^[ぁ-んァ-ン♥……っ！!～~。、\s]+$', s) and len(s) < 8:
             return True
         return False
 

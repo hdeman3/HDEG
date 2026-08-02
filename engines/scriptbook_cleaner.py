@@ -40,20 +40,21 @@ SPLIT_SYSTEM_PROMPT = (
 
 # ── V3 Prompt（行号范围输出，不做清洗，只做定位） ──
 
-_SPLIT_USER_TEMPLATE_V3 = """【音轨列表】（必须使用以下名称作为输出的 key）
+_SPLIT_USER_TEMPLATE_V3 = """【音轨列表】（必须使用以下名称作为输出的 key，一个都不能少）
 {track_names_json}
 
 【音轨 ASR 样本】（每条音轨的前几句实际台词，用于辅助定位台本中的对应段落。⚠ ASR 识别可能有误，仅作语义锚点参考，不要逐字匹配）
 {track_samples_text}
 
-【原始台本】（每行已编号，格式为 行号|内容。使用行号引用区间）
+{fz_hint_section}【原始台本】（每行已编号，格式为 行号|内容。使用行号引用区间）
 {numbered_scriptbook}
 
-【规则】
-1. 按音轨标题语义 + ASR 样本定位每个音轨在台本中的起止位置
-2. 输出 [起始行号, 结束行号]（均为整数，1-based，闭区间）
-3. 找不到内容的音轨设为空数组 []
-4. 只做定位，不做清洗、不做翻译、不拼接断行
+【规则 —— 严格遵守】
+1. 如果上方提供了「FZ 锚点定位结果」，请在各锚点附近 ±50 行范围内精确定位起止行号
+2. 如果未提供锚点，按音轨标题语义 + ASR 样本在全文定位
+3. 输出 [起始行号, 结束行号]（均为整数，1-based，闭区间）
+4. 找不到内容的音轨设为空数组 []（仅限台本中确实不存在的 FreeTalk/特典等内容）
+5. 只做定位，不做清洗、不做翻译、不拼接断行
 
 仅输出 JSON（无任何解释）：
 {{"tracks": {{"track_name": [start, end], ...}}}}"""
@@ -119,6 +120,81 @@ def _merge_short_lines(text: str, min_len: int = 10) -> str:
         else:
             merged.append(s)
     return '\n'.join(m for m in merged if m)
+
+
+# ==================== FZ 锚点定位（ASR→台本） ====================
+
+def find_anchors_by_asr(
+    track_names: list[str],
+    track_samples: dict[str, str],
+    scriptbook_lines: list[str],
+    min_asr_line_len: int = 8,
+    top_n: int = 5,
+    min_score: int = 50,
+) -> dict[str, int]:
+    """用 ASR 前 N 句在台本中逐行匹配，定位每个音轨的近似锚点。
+
+    算法：
+    1. 每个音轨取 ASR 前 top_n 句（跳过 ≤min_asr_line_len 字符的短句）
+    2. 每句对台本所有行做 partial_ratio 匹配，取最高分
+    3. 分数 ≥min_score 的匹配行号取中位数 → 锚点
+
+    参数:
+        track_names: 音轨名列表
+        track_samples: {track_name: "ASR文本（换行分隔）"}
+        scriptbook_lines: 台本行列表（已预清洗）
+        min_asr_line_len: ASR 行最短字符数（过滤太短的句子）
+        top_n: 使用 ASR 前 N 句
+        min_score: 匹配分数阈值 (0-100)
+
+    返回:
+        {track_name: anchor_line}  仅包含成功定位的音轨
+    """
+    from rapidfuzz import fuzz
+    from statistics import median
+
+    # 预处理台本：只保留非空行，建立 (行号, 文本) 索引
+    valid_lines = [(i, line.strip()) for i, line in enumerate(scriptbook_lines) if line.strip()]
+    if not valid_lines:
+        return {}
+
+    anchors: dict[str, int] = {}
+
+    for tn in track_names:
+        sample_text = track_samples.get(tn, '')
+        if not sample_text:
+            continue
+
+        # 取前 top_n 句，跳过短句
+        asr_lines = [
+            l.strip() for l in sample_text.split('\n')
+            if len(l.strip()) > min_asr_line_len
+        ][:top_n]
+
+        if not asr_lines:
+            continue
+
+        # 每句 ASR 在台本中找最佳匹配行
+        match_lines: list[int] = []
+        for a_line in asr_lines:
+            best_score = 0
+            best_line = -1
+            for idx, text in valid_lines:
+                score = fuzz.partial_ratio(a_line, text)
+                if score > best_score:
+                    best_score = score
+                    best_line = idx
+            if best_score >= min_score:
+                match_lines.append(best_line)
+
+        if not match_lines:
+            continue
+
+        # 中位数做锚点
+        anchor = int(median(match_lines))
+        anchors[tn] = anchor
+
+    return anchors
 
 
 # ==================== 分割器实现 ====================
@@ -191,7 +267,7 @@ class ScriptbookSplitter:
             {track_name: [clean_lines]}
         """
         if not track_names or not raw_scriptbook.strip():
-            return {}
+            return {}, {}
 
         # 1. 保守预清洗
         cleaned = _conservative_pre_clean(raw_scriptbook)
@@ -204,12 +280,34 @@ class ScriptbookSplitter:
         if self.verbose:
             print(f"  [台本分割V3] 短行合并后: {len(cleaned)} 字符")
 
-        # 2. 编号行号
+        # 2. FZ 锚点定位（用 ASR 前 5 句逐行匹配，缩窄 LLM 搜索范围）
+        cleaned_lines = cleaned.split('\n')
+        fz_anchors = {}
+        if track_samples:
+            print(f"  [FZ锚点] 正在用 ASR 前5句逐行匹配台本...", flush=True)
+            import time as _tz
+            _tz0 = _tz.time()
+            fz_anchors = find_anchors_by_asr(
+                track_names, track_samples, cleaned_lines,
+                min_asr_line_len=8, top_n=5, min_score=50,
+            )
+            _tz_elapsed = _tz.time() - _tz0
+            matched = len(fz_anchors)
+            print(f"  [FZ锚点] {matched}/{len(track_names)} 个音轨定位成功 ({_tz_elapsed:.1f}s)", flush=True)
+            for tn in track_names:
+                a = fz_anchors.get(tn)
+                if a is not None:
+                    near_text = cleaned_lines[a][:60].strip() if a < len(cleaned_lines) else '?'
+                    print(f"    行{a:5d} → {tn}  「{near_text}」", flush=True)
+                else:
+                    print(f"    未定位 → {tn}", flush=True)
+
+        # 3. 编号行号
         numbered_text, original_lines = self._number_scriptbook_lines(cleaned)
         if self.verbose:
             print(f"  [台本分割V3] 编号 {len(original_lines)} 行")
 
-        # 3. 构建 ASR 样本参考文本
+        # 4. 构建 ASR 样本参考文本
         if track_samples:
             sample_parts = []
             for name in track_names:
@@ -222,17 +320,35 @@ class ScriptbookSplitter:
         else:
             track_samples_text = '（无 ASR 样本，仅根据音轨名匹配）'
 
-        # 4. 构建 V3 prompt
+        # 5. 构建 FZ 锚点提示（如果可用）
+        if fz_anchors:
+            anchor_lines = []
+            for name in track_names:
+                a = fz_anchors.get(name)
+                if a is not None:
+                    anchor_lines.append(f'  【{name}】≈ 行号 {a+1} 附近（±50行内，请在此范围内精确定位起止行号）')
+                else:
+                    anchor_lines.append(f'  【{name}】≈ 未定位，请在全文搜索')
+            anchor_hints_text = '\n'.join(anchor_lines)
+            fz_hint_section = (
+                '【FZ 锚点定位结果（程序自动估算，偏差约 ±50 行，供参考）】\n'
+                '以下锚点由 ASR 样本与台本模糊匹配得出，请在各锚点附近 ±50 行范围内精确定位起止行号。\n'
+                f'{anchor_hints_text}\n'
+            )
+        else:
+            fz_hint_section = ''
+
+        # 6. 构建 V3 prompt
         track_names_json = _json.dumps(track_names, ensure_ascii=False)
         user_prompt = _SPLIT_USER_TEMPLATE_V3.format(
             track_names_json=track_names_json,
             track_samples_text=track_samples_text,
             numbered_scriptbook=numbered_text,
+            fz_hint_section=fz_hint_section,
         )
 
-        if self.verbose:
-            print(f"  [台本分割V3] {len(track_names)} 个音轨, prompt {len(user_prompt)} 字符, "
-                  f"max_tokens={self.SPLIT_MAX_TOKENS}")
+        fz_tag = " (含FZ锚点)" if fz_anchors else " (无锚点,全文搜索)"
+        print(f"  [LLM分割] 发送 {len(track_names)} 个音轨给 Flash{fz_tag}, prompt {len(user_prompt)} 字符, max_tokens={self.SPLIT_MAX_TOKENS}", flush=True)
 
         self._ensure_client()
 
@@ -270,20 +386,35 @@ class ScriptbookSplitter:
 
                 content = response.choices[0].message.content or ''
                 finish = response.choices[0].finish_reason or 'unknown'
-                usage_info = f"prompt={response.usage.prompt_tokens if response.usage else '?'}, completion={response.usage.completion_tokens if response.usage else '?'}" if response.usage else ''
+                # 提取 token 统计（兼容 DeepSeek 原生 + OpenAI 代理层）
+                usage = response.usage
+                token_stats = {}
+                if usage:
+                    hit = getattr(usage, 'prompt_cache_hit_tokens', None)
+                    miss = getattr(usage, 'prompt_cache_miss_tokens', None)
+                    if hit is None:
+                        details = getattr(usage, 'prompt_tokens_details', None)
+                        hit = details.cached_tokens if details else 0
+                        miss = usage.prompt_tokens - hit if usage.prompt_tokens else 0
+                    token_stats = {
+                        'hit_tokens': hit or 0,
+                        'miss_tokens': miss or 0,
+                        'prompt_tokens': usage.prompt_tokens or 0,
+                        'completion_tokens': usage.completion_tokens or 0,
+                    }
+                usage_info = f"prompt={token_stats.get('prompt_tokens', '?')}, completion={token_stats.get('completion_tokens', '?')}" if token_stats else ''
+                print(f"  [LLM分割] finish={finish}, {usage_info}", flush=True)
                 if self.verbose:
-                    print(f"  [台本分割V3] finish_reason={finish}, {usage_info}")
                     preview = content[:500] + ('...' if len(content) > 500 else '')
-                    print(f"  [台本分割V3] LLM 响应 ({len(content)} 字符): {preview}")
+                    print(f"  [LLM分割] 响应预览: {preview}", flush=True)
                     if len(content) > 500:
-                        print(f"  [台本分割V3] ...末尾: {content[-200:]}")
+                        print(f"  [LLM分割] ...末尾: {content[-200:]}", flush=True)
                 result = self._parse_response(content, track_names, original_lines=original_lines)
                 if result:
-                    if self.verbose:
-                        total_lines = sum(len(v) for v in result.values())
-                        print(f"  [台本分割V3] 成功: {len(result)}/{len(track_names)} 个音轨, "
-                              f"共 {total_lines} 行台词")
-                    return result
+                    total_lines = sum(len(v) for v in result.values())
+                    matched = sum(1 for v in result.values() if v)
+                    print(f"  [LLM分割] 成功: {matched}/{len(track_names)} 个音轨有内容, 共 {total_lines} 行台词", flush=True)
+                    return result, token_stats
 
             except Exception as e:
                 last_error = e
@@ -294,7 +425,7 @@ class ScriptbookSplitter:
 
         if self.verbose:
             print(f"  [台本分割V3] 全部尝试失败: {last_error}")
-        return {}
+        return {}, {}
 
     # ═════════════════════════════════════════════════════════
     # V2 (注释保留): 全文本输出方案，LLM 返回完整清洗后台本。
@@ -575,10 +706,13 @@ class ScriptbookSplitter:
 
     @staticmethod
     def _normalize(name: str) -> str:
-        """标准化音轨名：去空格、去特殊符号、小写，用于匹配"""
+        """标准化音轨名：Unicode 正规化 + 去特殊符号 + 小写，用于匹配"""
         import re
-        # 只保留中日文字符、英文、数字
-        cleaned = re.sub(r'[\s_\-・·／／《》「」【】（）\(\)\[\]{}「」]', '', name)
+        import unicodedata
+        # NFC 正规化：统一合成形/分解形（如 フ+゚→プ）
+        name = unicodedata.normalize('NFC', name)
+        # 去除特殊符号
+        cleaned = re.sub(r'[\s_\-・·／／《》「」【】（）\(\)\[\]{}「」\.\,\#]', '', name)
         return cleaned.lower()
 
     @staticmethod

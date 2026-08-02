@@ -514,22 +514,24 @@ WORLDVIEW_ANALYSIS_PROMPT = (
 )
 
 
-def analyze_worldview_with_llm(engine, samples: list[str]) -> dict:
+def analyze_worldview_with_llm(engine, samples: list[str], verbose: bool = False) -> tuple:
     """调用 LLM 分析作品世界观
 
     参数:
         engine: OpenAICompatEngine 实例
         samples: 抽样文本列表
+        verbose: 是否输出调试信息
 
-    返回: 世界观字典
+    返回: (世界观字典, token_stats)
     """
     import json as _json
 
     if not samples:
-        return {}
+        return {}, {}
 
     content = WORLDVIEW_ANALYSIS_PROMPT + "\n\n" + "\n\n".join(samples)
-    print(f"    [调试] 发送给 LLM 的文本长度: {len(content)} 字符", flush=True)
+    if verbose:
+        print(f"    [DEBUG] 发送给 LLM 的文本长度: {len(content)} 字符", flush=True)
     print(f"    [世界观分析] 正在调用 LLM...", flush=True)
 
     try:
@@ -538,7 +540,8 @@ def analyze_worldview_with_llm(engine, samples: list[str]) -> dict:
             system_prompt, content,
             override_gen_params={'temperature': 0.1},
         )
-        print(f"    [调试] LLM 原始输出 (前300字): {raw_output[:300]}", flush=True)
+        if verbose:
+            print(f"    [DEBUG] LLM 原始输出 (前300字): {raw_output[:300]}", flush=True)
 
         json_match = re.search(r'\{.*\}', raw_output, re.DOTALL)
         if json_match:
@@ -547,17 +550,17 @@ def analyze_worldview_with_llm(engine, samples: list[str]) -> dict:
                 print(f"    [世界观分析] 完成!", flush=True)
                 print(f"      世界观: {result.get('worldview', '')[:100]}...", flush=True)
                 print(f"      角色: {len(result.get('characters', []))} 个", flush=True)
-                return result
+                return result, token_stats
             except _json.JSONDecodeError as e:
                 print(f"    ⚠ JSON 解析错误: {e}", flush=True)
-                return {}
+                return {}, {}
         else:
             print(f"    ⚠ 未找到 JSON 格式内容", flush=True)
-            return {}
+            return {}, {}
 
     except Exception as e:
         print(f"    ⚠ 世界观分析失败: {e}", flush=True)
-        return {}
+        return {}, {}
 
 
 # ==================== FreeTalk 检测 ====================

@@ -667,7 +667,7 @@ def extract_cores_from_dir(work_dir: "Path", filename_names: set[str] = None) ->
 
 # ==================== 抽样函数 ====================
 
-def sample_all_lrc_files(work_dir: "Path", lines_per_file: int = 40) -> tuple[list[str], dict[str, dict]]:
+def sample_all_lrc_files(work_dir: "Path", lines_per_file: int = 40, verbose: bool = False) -> tuple[list[str], dict[str, dict]]:
     """抽样所有字幕文件的内容，用于世界观和术语分析
 
     返回: (抽样文本列表, cores字典)
@@ -713,7 +713,8 @@ def sample_all_lrc_files(work_dir: "Path", lines_per_file: int = 40) -> tuple[li
 
         if sampled_lines:
             samples.append(f"=== 文件: {ja_path.name} ===\n" + "\n".join(sampled_lines[:lines_per_file]))
-            print(f"      [{idx}/{len(ja_files)}] {ja_path.name}: 抽取 {len(sampled_lines[:lines_per_file])} 行", flush=True)
+            if verbose:
+                print(f"      [{idx}/{len(ja_files)}] {ja_path.name}: 抽取 {len(sampled_lines[:lines_per_file])} 行", flush=True)
 
         file_cores = extract_cores_from_file(ja_path)
         for core, info in file_cores.items():
@@ -897,6 +898,7 @@ def analyze_characters_with_llm(
     cores: dict[str, dict],
     clusters: list[list[str]],
     filename_names: set[str] = None,
+    verbose: bool = False,
 ) -> tuple[dict[str, str], list[dict]]:
     """调用 LLM 分析角色和术语
 
@@ -960,7 +962,8 @@ def analyze_characters_with_llm(
                     lines.append(f"      上下文: {ctx[:60]}")
 
     content = CHARACTER_ANALYSIS_PROMPT + "\n\n" + "\n".join(lines)
-    print(f"    [调试] 发送给 LLM 的文本长度: {len(content)} 字符", flush=True)
+    if verbose:
+        print(f"    [DEBUG] 发送给 LLM 的文本长度: {len(content)} 字符", flush=True)
 
     try:
         system_prompt = "你是精通日语角色语言学和ASR纠错的专家。请严格按照JSON格式输出分析结果，不要输出任何其他内容。"
@@ -968,39 +971,46 @@ def analyze_characters_with_llm(
             system_prompt, content,
             override_gen_params={'temperature': 0.1},
         )
-        print(f"    [调试] LLM 原始输出 (前500字):", flush=True)
-        print(f"    {raw_output[:500]}", flush=True)
-        if len(raw_output) > 500:
-            print(f"    ... (共 {len(raw_output)} 字)", flush=True)
+        if verbose:
+            print(f"    [DEBUG] LLM 原始输出 (前500字):", flush=True)
+            print(f"    {raw_output[:500]}", flush=True)
+            if len(raw_output) > 500:
+                print(f"    ... (共 {len(raw_output)} 字)", flush=True)
 
         json_match = _re.search(r'\{.*\}', raw_output, _re.DOTALL)
         if json_match:
             try:
                 result = _json.loads(json_match.group())
                 terms = result.get('terms', {})
-                print(f"    [调试] 解析到术语: {len(terms)} 个", flush=True)
-                for ja, zh in list(terms.items())[:5]:
-                    print(f"      - {ja} -> {zh}", flush=True)
+                if verbose:
+                    print(f"    [DEBUG] 解析到术语: {len(terms)} 个", flush=True)
+                    for ja, zh in list(terms.items())[:5]:
+                        print(f"      - {ja} -> {zh}", flush=True)
 
                 alias_list = result.get('alias', [])
-                print(f"    [调试] 解析到 alias: {len(alias_list)} 个", flush=True)
-                for a in alias_list[:5]:
-                    print(f"      - {a.get('alias')} -> {a.get('target')} (conf: {a.get('confidence')})", flush=True)
+                if verbose:
+                    print(f"    [DEBUG] 解析到 alias: {len(alias_list)} 个", flush=True)
+                    for a in alias_list[:5]:
+                        print(f"      - {a.get('alias')} -> {a.get('target')} (conf: {a.get('confidence')})", flush=True)
 
                 filtered = [a for a in alias_list if a.get('confidence', 0) >= 0.8]
-                print(f"    [调试] 过滤后(>=0.8): {len(filtered)} 个", flush=True)
+                if verbose:
+                    print(f"    [DEBUG] 过滤后(>=0.8): {len(filtered)} 个", flush=True)
 
                 terms = validate_terms(terms)
-                print(f"    [调试] 术语校验后: {len(terms)} 个", flush=True)
+                if verbose:
+                    print(f"    [DEBUG] 术语校验后: {len(terms)} 个", flush=True)
 
                 print(f"  LLM 分析完成: {len(filtered)} 个高置信度 alias, {len(terms)} 个术语", flush=True)
                 return terms, filtered
             except _json.JSONDecodeError as e:
                 print(f"  ⚠ LLM 返回格式错误: {e}", flush=True)
-                print(f"    [调试] JSON片段: {json_match.group()[:200]}", flush=True)
+                if verbose:
+                    print(f"    [DEBUG] JSON片段: {json_match.group()[:200]}", flush=True)
                 return {}, []
         else:
-            print(f"    [调试] 未找到 JSON 格式内容", flush=True)
+            if verbose:
+                print(f"    [DEBUG] 未找到 JSON 格式内容", flush=True)
             return {}, []
     except Exception as e:
         print(f"  ⚠ LLM 分析失败: {e}", flush=True)

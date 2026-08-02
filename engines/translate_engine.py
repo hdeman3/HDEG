@@ -19,8 +19,10 @@ class TranslationResult(TypedDict, total=False):
     translated_lines: list[str]  # 翻译结果行
     hit_tokens: int              # 缓存命中 token
     miss_tokens: int             # 缓存未命中 token
+    prompt_tokens: int           # 总输入 token
     completion_tokens: int       # 输出 token
     cost: float                  # 费用
+    elapsed: float               # 本次调用耗时（秒）
 
 
 class BatchTranslationResult(TypedDict):
@@ -87,10 +89,8 @@ class OpenAICompatEngine:
 
     name = 'openai_compat'
 
-    # API 价格（每百万 token）
-    PRICE_HIT_PER_1M = 0.14        # 缓存命中
-    PRICE_MISS_PER_1M = 0.28       # 缓存未命中
-    PRICE_COMPLETION_PER_1M = 1.10  # 输出
+    # 定价从 config.json pricing 段读取，不再硬编码
+    # （保留类属性作为 fallback，但实例方法优先用 self.pricing）
 
     # 格式要求提示词（JSON 输入/输出方案 —— 确保行精确对齐）
     _FORMAT_REQUIREMENTS = (
@@ -111,18 +111,29 @@ class OpenAICompatEngine:
         "8. JSON 中不得出现尾随逗号或缺少逗号。\n\n"
     )
 
-    def __init__(self, config: dict, verbose: bool = True, system_prompt_file: str = None):
+    def __init__(self, config: dict, verbose: bool = True, system_prompt_file: str = None,
+                 pricing: dict = None):
         """
         参数:
             config: 配置字典
             verbose: 是否输出调试信息
             system_prompt_file: 外部 prompt 文件路径（可选）
+            pricing: 定价字典 {'hit_per_1m', 'miss_per_1m', 'completion_per_1m'}
         """
         self.config = config
         self.verbose = verbose
         self._client = None
         self._system_prompt_file = system_prompt_file
         self._last_raw_response = ''
+        # 定价：优先使用传入的 pricing，其次从 config 读取
+        if pricing:
+            self.pricing = pricing
+        else:
+            self.pricing = {
+                'hit_per_1m': 0.02,
+                'miss_per_1m': 1,
+                'completion_per_1m': 2,
+            }
         # 预加载外部 prompt（优先指定的文件，其次内置融合版，最后回退到硬编码默认）
         self._external_system_prompt: str | None = None
         try:
@@ -422,12 +433,18 @@ class OpenAICompatEngine:
                 heartbeat_thread.start()
 
                 try:
+                    # DeepSeek 思考模式：reasoning_effort 控制思考强度
+                    # 额外通过 extra_body 启用 thinking（默认已启用，此处显式声明）
+                    _extra = {}
+                    if 'reasoning_effort' in _filtered:
+                        _extra = {'thinking': {'type': 'enabled'}}
                     response = self._client.chat.completions.create(
                         model=self.config.get('model', 'gpt-4o-mini'),
                         messages=[
                             {'role': 'system', 'content': system_prompt},
                             {'role': 'user', 'content': user_prompt},
                         ],
+                        extra_body=_extra if _extra else None,
                         **_filtered,
                     )
                 finally:
@@ -455,16 +472,22 @@ class OpenAICompatEngine:
                         print(f"  [DEBUG] 返回内容(前5行):\n{resp_preview}", flush=True)
 
                 # 提取 token 统计
+                # DeepSeek 原生: usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
+                # OpenAI 代理层: usage.prompt_tokens_details.cached_tokens
                 usage = response.usage
-                hit_tokens = getattr(usage, 'prompt_tokens_details', None)
-                hit = hit_tokens.cached_tokens if hit_tokens else 0
-                miss = usage.prompt_tokens - hit if usage.prompt_tokens else 0
+                hit = getattr(usage, 'prompt_cache_hit_tokens', None)
+                miss = getattr(usage, 'prompt_cache_miss_tokens', None)
+                if hit is None:
+                    details = getattr(usage, 'prompt_tokens_details', None)
+                    hit = details.cached_tokens if details else 0
+                    miss = usage.prompt_tokens - hit if usage.prompt_tokens else 0
 
                 self._last_raw_response = content
                 return content, {
                     'hit_tokens': hit,
                     'miss_tokens': miss,
                     'completion_tokens': usage.completion_tokens or 0,
+                    'prompt_tokens': usage.prompt_tokens or 0,
                 }
 
             except Exception as e:
@@ -574,7 +597,8 @@ class OpenAICompatEngine:
                         if isinstance(arr, list) and len(arr) > 0 and isinstance(arr[0], dict):
                             sorted_arr = sorted(arr, key=lambda x: x.get('index', 0))
                             texts = [item.get('text', '') for item in sorted_arr]
-                            print(f"    [JSON修复] 成功修复截断的JSON", flush=True)
+                            if self.verbose:
+                                print(f"    [JSON修复] 成功修复截断的JSON", flush=True)
                             return texts
                     if isinstance(result, dict) and 'zh' in result:
                         arr = result['zh']
@@ -784,8 +808,10 @@ class OpenAICompatEngine:
                 translated_lines=[],
                 hit_tokens=0,
                 miss_tokens=0,
+                prompt_tokens=0,
                 completion_tokens=0,
                 cost=0.0,
+                elapsed=0.0,
             )
 
         # 幻觉预检：过滤明显异常的 ASR 行
@@ -798,8 +824,10 @@ class OpenAICompatEngine:
                 translated_lines=[],
                 hit_tokens=0,
                 miss_tokens=0,
+                prompt_tokens=0,
                 completion_tokens=0,
                 cost=0.0,
+                elapsed=0.0,
             )
 
         system_prompt = self.build_system_prompt(
@@ -818,24 +846,29 @@ class OpenAICompatEngine:
         if self.verbose:
             print(f"  [翻译] 输入 {len(lines)} 行, prompt {len(user_prompt)} 字符")
 
+        call_start = _time_mod.time()
         translated_text, token_stats = self.call_api(system_prompt, user_prompt)
+        call_elapsed = _time_mod.time() - call_start
 
         original_lines, translated_lines = self.parse_json_translation(lines, translated_text)
 
         hit = token_stats['hit_tokens']
         miss = token_stats['miss_tokens']
+        prompt = token_stats.get('prompt_tokens', hit + miss)
         completion = token_stats['completion_tokens']
-        cost = (hit / 1_000_000) * self.PRICE_HIT_PER_1M + \
-               (miss / 1_000_000) * self.PRICE_MISS_PER_1M + \
-               (completion / 1_000_000) * self.PRICE_COMPLETION_PER_1M
+        cost = (hit / 1_000_000) * self.pricing['hit_per_1m'] + \
+               (miss / 1_000_000) * self.pricing['miss_per_1m'] + \
+               (completion / 1_000_000) * self.pricing['completion_per_1m']
 
         return TranslationResult(
             original_lines=original_lines,
             translated_lines=translated_lines,
             hit_tokens=hit,
             miss_tokens=miss,
+            prompt_tokens=prompt,
             completion_tokens=completion,
             cost=cost,
+            elapsed=call_elapsed,
         )
 
 

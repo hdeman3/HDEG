@@ -46,7 +46,7 @@ LRC_PATTERN = re.compile(r'^\[(\d+):(\d+(?:\.\d+)?)\]')
 # LRC 标签正则（匹配所有 [xxx] 格式标签）
 LRC_TAG_PATTERN = re.compile(r'^(\[.*?\])\s*(.*)')
 # LRC 时间标签正则
-LRC_TIME_PATTERN = re.compile(r'\[\d{1,2}:\d{2}\.\d{2,3}\]')
+LRC_TIME_PATTERN = re.compile(r'\[\d{1,3}:\d{2}\.\d{2,3}\]')
 
 
 def parse_lrc(text: str) -> list[LrcLine]:

@@ -56,7 +56,7 @@ def load_config(path: Path = None) -> dict[str, Any]:
             "export_ja_lrc": True,
             "retry_count": 4,
         },
-        "pricing": {"hit_per_1m": 0.14, "miss_per_1m": 0.28, "completion_per_1m": 1.10},
+        "pricing": {"hit_per_1m": 0.02, "miss_per_1m": 1, "completion_per_1m": 2},
         "network": {"clear_proxy_on_startup": False},
     }
 

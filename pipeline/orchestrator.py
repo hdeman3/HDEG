@@ -37,6 +37,12 @@ from io_adapter.config_loader import (
     get_api_config,
     load_terms_from_config,
 )
+
+# utils 工具层
+from utils.token_tracker import TokenTracker, TokenUsage
+from utils.printer import Printer
+from io_adapter.file_scanner import find_rj_work_root
+
 from io_adapter.lrc_handler import (
     SUBTITLE_EXTS,
     parse_lrc_file,
@@ -51,10 +57,13 @@ from io_adapter.lrc_handler import (
 
 # ==================== 工具函数 ====================
 
+# 模块级 printer 引用（run_pipeline 启动时设置）
+_pr: Printer | None = None
+
+
 def _log(msg: str = "", *, flush: bool = True):
-    """输出日志并立即刷新 stdout，确保实时可见"""
+    """输出日志并立即刷新 stdout。通过模块级 _pr 统一格式。"""
     print(msg, flush=flush)
-    # 也刷新 stderr（某些终端可能缓冲）
     sys.stderr.flush()
 
 
@@ -68,6 +77,12 @@ def _sep(title: str = ""):
         _log("=" * 60)
 
 
+def _debug(msg: str):
+    """调试日志，仅 debug=true 时输出"""
+    if _pr and _pr.debug_enabled:
+        _log(f"    [DEBUG] {msg}")
+
+
 # ==================== 管道上下文 ====================
 
 class PipelineContext:
@@ -79,6 +94,9 @@ class PipelineContext:
         self.app_cfg = self.config.get('app', {})
         self.api_cfg = self.config.get('api', {})
         self.pricing = self.config.get('pricing', {})
+        # 统一输出 + token 追踪
+        self.pr = Printer(debug=self.app_cfg.get('debug', False))
+        self.tracker = TokenTracker(self.pricing)
         self.stats = {
             'archived': 0,
             'translated': 0,
@@ -102,11 +120,11 @@ class PipelineContext:
             api_config = get_api_config(self.config)
             prompt_file = self.config.get('prompts', {}).get('system_prompt_file', '')
             # verbose 由 config["app"]["debug"] 控制，默认关闭调试输出
-            debug_mode = self.config.get('app', {}).get('debug', False)
             self._translate_engine = create_translate_engine(
                 api_config,
                 system_prompt_file=prompt_file if prompt_file else None,
-                verbose=debug_mode,
+                verbose=self.pr.debug_enabled,
+                pricing=self.pricing,
             )
         return self._translate_engine
 
@@ -371,7 +389,40 @@ def _llm_identify_scriptbook_files(
         )
 
         content = response.choices[0].message.content or ''
-        _log(f"  [台本·LLM] 响应: {content[:300]}")
+        _debug(f"[台本·LLM] 响应: {content[:300]}")
+
+        # 统一 token 追踪：记录台本识别 LLM 调用
+        _usage = response.usage
+        if _usage:
+            _hit = getattr(_usage, 'prompt_cache_hit_tokens', None)
+            _miss = getattr(_usage, 'prompt_cache_miss_tokens', None)
+            if _hit is None:
+                _details = getattr(_usage, 'prompt_tokens_details', None)
+                _hit = _details.cached_tokens if _details else 0
+                _miss = _usage.prompt_tokens - _hit if _usage.prompt_tokens else 0
+            _token_stats = {
+                'hit_tokens': _hit or 0,
+                'miss_tokens': _miss or 0,
+                'prompt_tokens': _usage.prompt_tokens or 0,
+                'completion_tokens': _usage.completion_tokens or 0,
+            }
+            _sb_cost = ctx.tracker.compute_cost(
+                _token_stats['hit_tokens'],
+                _token_stats['miss_tokens'],
+                _token_stats['completion_tokens'],
+            )
+            ctx.tracker.record(TokenUsage(
+                request_type='scriptbook_id',
+                label=f'{len(candidates)}个备选文件',
+                work_key=str(work_dir),
+                prompt_tokens=_token_stats['prompt_tokens'],
+                hit_tokens=_token_stats['hit_tokens'],
+                miss_tokens=_token_stats['miss_tokens'],
+                completion_tokens=_token_stats['completion_tokens'],
+                cost=_sb_cost,
+                elapsed=0,
+            ))
+            ctx.pr.token_inline(ctx.tracker.records[-1])
 
         # 提取 JSON
         result_text = content.strip()
@@ -519,11 +570,11 @@ def _try_load_cached_scriptbook(work_dir: Path, track_names: list[str]) -> dict[
     return None
 
 
-def _extract_track_asr_samples(work_dir: Path, track_names: list[str], max_lines: int = 10) -> dict[str, str]:
+def _extract_track_asr_samples(work_dir: Path, track_names: list[str], max_lines: int = 15) -> dict[str, str]:
     """从 .ja.lrc 文件中提取每条音轨的前几句 ASR 台词样本
 
     参数:
-        work_dir: 作品目录
+        work_dir: 作品目录（递归搜索子目录中的 .ja.lrc）
         track_names: 音轨名列表（LRC 文件 stem）
         max_lines: 每条音轨最多提取的行数
 
@@ -532,9 +583,17 @@ def _extract_track_asr_samples(work_dir: Path, track_names: list[str], max_lines
     """
     from io_adapter.lrc_handler import parse_lrc_file
     samples: dict[str, str] = {}
+    # 递归收集所有 .ja.lrc，按 stem 建索引（处理文件分散在子目录的情况）
+    ja_map: dict[str, Path] = {}
+    for ja_file in work_dir.rglob('*.ja.lrc'):
+        stem = ja_file.stem
+        if stem.endswith('.ja'):
+            stem = stem[:-3]
+        ja_map[stem] = ja_file
+
     for name in track_names:
-        ja_path = work_dir / f'{name}.ja.lrc'
-        if not ja_path.exists():
+        ja_path = ja_map.get(name)
+        if ja_path is None:
             continue
         try:
             lrc_lines = parse_lrc_file(ja_path)
@@ -577,7 +636,9 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     cached_result = _try_load_cached_scriptbook(work_dir, track_names or [])
     if cached_result is not None:
         total_lines = sum(len(v) for v in cached_result.values())
-        _log(f"\n[台本] 检测到已缓存的台本结果 ({len(cached_result)} 个音轨, {total_lines} 行)，跳过 LLM 识别和 Flash 分割")
+        matched = sum(1 for v in cached_result.values() if v)
+        _log(f"\n[台本] 检测到已缓存的台本结果 ({matched}/{len(cached_result)} 个音轨有内容, {total_lines} 行)，跳过分割")
+        _log(f"[台本] 如需重新分割请删除缓存文件: _scriptbook_clean.json 和 _split_tracks/")
         return cached_result
 
     scriptbook_files: list[Path] = []
@@ -789,8 +850,28 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
         from engines.scriptbook_cleaner import ScriptbookSplitter, split_scriptbook_regex
         api_config = ctx.api_cfg
         try:
-            splitter = ScriptbookSplitter(api_config, verbose=True)
-            track_map = splitter.split_and_clean_all_in_one(track_names, raw_text, track_samples=track_samples)
+            splitter = ScriptbookSplitter(api_config, verbose=ctx.pr.debug)
+            track_map, sb_token_stats = splitter.split_and_clean_all_in_one(
+                track_names, raw_text, track_samples=track_samples)
+            # 统一 token 追踪：记录台本 Flash 分割调用
+            if sb_token_stats:
+                _sb_cost = ctx.tracker.compute_cost(
+                    sb_token_stats.get('hit_tokens', 0),
+                    sb_token_stats.get('miss_tokens', 0),
+                    sb_token_stats.get('completion_tokens', 0),
+                )
+                ctx.tracker.record(TokenUsage(
+                    request_type='scriptbook_split',
+                    label=f'{len(track_names)}个音轨',
+                    work_key=str(work_dir),
+                    prompt_tokens=sb_token_stats.get('prompt_tokens', 0),
+                    hit_tokens=sb_token_stats.get('hit_tokens', 0),
+                    miss_tokens=sb_token_stats.get('miss_tokens', 0),
+                    completion_tokens=sb_token_stats.get('completion_tokens', 0),
+                    cost=_sb_cost,
+                    elapsed=0,
+                ))
+                ctx.pr.token_inline(ctx.tracker.records[-1])
         except Exception as e:
             _log(f"  [台本] Flash 分割失败: {e}，回退到正则分割")
             track_map = {}
@@ -1041,8 +1122,27 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
                 if api_config.get('key') or api_config.get('api_key'):
                     try:
                         from engines.translate_engine import OpenAICompatEngine
-                        engine = OpenAICompatEngine(api_config, verbose=True)
-                        worldview = analyze_worldview_with_llm(engine, samples)
+                        engine = OpenAICompatEngine(api_config, verbose=ctx.pr.debug, pricing=ctx.pricing)
+                        worldview, wv_token_stats = analyze_worldview_with_llm(engine, samples, verbose=ctx.pr.debug)
+                        # 统一 token 追踪：记录世界观分析 LLM 调用
+                        if wv_token_stats:
+                            _wv_cost = ctx.tracker.compute_cost(
+                                wv_token_stats.get('hit_tokens', 0),
+                                wv_token_stats.get('miss_tokens', 0),
+                                wv_token_stats.get('completion_tokens', 0),
+                            )
+                            ctx.tracker.record(TokenUsage(
+                                request_type='worldview',
+                                label=f'{len(samples)}个样本',
+                                work_key=str(work_dir),
+                                prompt_tokens=wv_token_stats.get('prompt_tokens', 0),
+                                hit_tokens=wv_token_stats.get('hit_tokens', 0),
+                                miss_tokens=wv_token_stats.get('miss_tokens', 0),
+                                completion_tokens=wv_token_stats.get('completion_tokens', 0),
+                                cost=_wv_cost,
+                                elapsed=0,
+                            ))
+                            ctx.pr.token_inline(ctx.tracker.records[-1])
                         if worldview:
                             save_worldview(work_dir, worldview)
                             chars = worldview.get('characters', [])
@@ -1246,14 +1346,15 @@ def translate_one_lrc(
     call_elapsed = time.time() - call_start
 
     translated_batch = result.get('translated_lines', [])
-    # 调试：翻译全空时打印 LLM 原始响应
+    # 诊断：翻译全空时打印 LLM 原始响应（仅 debug 模式详细输出）
     if len(translated_batch) > 0 and all(not (t or '').strip() for t in translated_batch):
-        _log(f"  🔍 DEBUG: translated_batch前3=[{str(translated_batch[:3])[:200]}]")
-        _log(f"  🔍 DEBUG: engine type={type(ctx.translate_engine).__name__}")
-        raw_resp = getattr(ctx.translate_engine, '_last_raw_response', 'NOT_FOUND')
-        _log(f"  🔍 LLM原始响应 ({len(raw_resp) if raw_resp != 'NOT_FOUND' else 'N/A'}字符): {(raw_resp or '')[:500]}")
-        if raw_resp and raw_resp != 'NOT_FOUND' and len(raw_resp) > 500:
-            _log(f"  🔍 ...末尾: {raw_resp[-300:]}")
+        _log(f"  WARN: 翻译结果全空 ({len(translated_batch)}行)")
+        if ctx.pr.debug:
+            _log(f"  [DEBUG] translated_batch前3=[{str(translated_batch[:3])[:200]}]")
+            raw_resp = getattr(ctx.translate_engine, '_last_raw_response', 'NOT_FOUND')
+            _log(f"  [DEBUG] LLM原始响应 ({len(raw_resp) if raw_resp != 'NOT_FOUND' else 'N/A'}字符): {(raw_resp or '')[:500]}")
+            if raw_resp and raw_resp != 'NOT_FOUND' and len(raw_resp) > 500:
+                _log(f"  [DEBUG] ...末尾: {raw_resp[-300:]}")
     for t_line in translated_batch:
         # 去掉编号前缀 "0001: "
         if ': ' in t_line:
@@ -1264,37 +1365,46 @@ def translate_one_lrc(
         translated_texts.append(t_line)
 
     _log(f"  ← 响应: {len(translated_batch)} 行, 耗时 {call_elapsed:.1f}s")
-    # 预览前5行翻译结果（排查空输出问题）
     non_empty = [t for t in translated_texts if t and t.strip()]
-    _log(f"  📝 有效行: {len(non_empty)}/{len(translated_texts)}")
-    if non_empty:
+    _log(f"    有效行: {len(non_empty)}/{len(translated_texts)}")
+    if not non_empty:
+        _log(f"  WARN: 所有行为空！首3行原文: {[t[:40] for t in texts[:3]]}")
+    elif ctx.pr.debug:
         for i, t in enumerate(non_empty[:3]):
-            _log(f"     [{i+1}] {t[:80]}")
-    else:
-        _log(f"  ⚠ 所有行为空！首3行原文: {[t[:40] for t in texts[:3]]}")
+            _log(f"      [{i+1}] {t[:80]}")
     hit = result.get('hit_tokens', 0)
     miss = result.get('miss_tokens', 0)
+    prompt = result.get('prompt_tokens', hit + miss)
     comp = result.get('completion_tokens', 0)
-    total_tok = hit + miss + comp
-    hit_rate = (hit / (hit + miss) * 100) if (hit + miss) > 0 else 0
+    elapsed = result.get('elapsed', call_elapsed)
     cost = result.get('cost', 0)
-    _log(f"  📊 Token: 总计{total_tok:,}  🟢命中{hit:,}({hit_rate:.0f}%)  🔵未命中{miss:,}  🟣输出{comp:,}")
-    # 费用明细使用实际定价
-    ph = ctx.pricing.get('hit_per_1m', 0)
-    pm = ctx.pricing.get('miss_per_1m', 0)
-    pc = ctx.pricing.get('completion_per_1m', 0)
-    ch = hit / 1_000_000 * ph
-    cm = miss / 1_000_000 * pm
-    cc = comp / 1_000_000 * pc
-    _log(f"  💰 费用: ¥{cost:.4f}  (🟢命中¥{ch:.4f} + 🔵未命中¥{cm:.4f} + 🟣输出¥{cc:.4f})")
+
+    # 统一 token 追踪：记录 + 打印
+    # work_key 使用 RJ 作品根目录，确保同一作品的翻译/台本/世界观合并统计
+    _rj_root, _ = find_rj_work_root(lrc_path)
+    _work_key = str(_rj_root) if _rj_root else str(lrc_path.parent)
+
+    usage = TokenUsage(
+        request_type='translate',
+        label=lrc_path.name,
+        work_key=_work_key,
+        prompt_tokens=prompt,
+        hit_tokens=hit,
+        miss_tokens=miss,
+        completion_tokens=comp,
+        cost=cost,
+        elapsed=elapsed,
+    )
+    ctx.tracker.record(usage)
+    ctx.pr.token_inline(usage)
 
     ctx.stats['success_lines'] += len(translated_batch)
     ctx.stats['total_lines'] += len(translated_batch)
     ctx.stats['api_calls'] += 1
-    ctx.stats['total_cost'] += result.get('cost', 0)
-    ctx.stats['total_hit_tokens'] += result.get('hit_tokens', 0)
-    ctx.stats['total_miss_tokens'] += result.get('miss_tokens', 0)
-    ctx.stats['total_completion_tokens'] += result.get('completion_tokens', 0)
+    ctx.stats['total_cost'] += cost
+    ctx.stats['total_hit_tokens'] += hit
+    ctx.stats['total_miss_tokens'] += miss
+    ctx.stats['total_completion_tokens'] += comp
 
     # 补齐不足的行（翻译失败的回退）
     shortage = 0
@@ -1607,6 +1717,10 @@ def run_pipeline(
     ctx = PipelineContext(config_path)
     root_abs = root.absolute()
 
+    # 设置模块级 printer，使 _debug() 可以工作
+    global _pr
+    _pr = ctx.pr
+
     # 打印启动信息
     _sep("字幕翻译管道启动")
     _log(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1672,34 +1786,21 @@ def run_pipeline(
             _log(f"  (有 {len(ja_lrc_files)} 个 .ja.lrc 留档文件，但无对应 .lrc)")
         return ctx.stats
 
-    # ──── 第 2 步: 加载台本（按 RJ 目录，避免跨作品污染）──
-    _sep("第 2 步: 加载台本参考")
-    # 延迟到第 4.5 步按目录加载，此处仅占位
-    _log()
+    # ──── 文本分析（仅 debug 模式）──
+    if ctx.pr.debug_enabled:
+        all_texts = []
+        for lrc_path in lrc_files:
+            try:
+                sub_file = parse_subtitle_file(lrc_path)
+                if sub_file:
+                    all_texts.extend([t for t in sub_file.original_lyrics if t.strip()])
+            except Exception:
+                pass
+        if all_texts:
+            _analyze_texts(all_texts, ctx)
 
-    # ──── 第 3 步: 世界观延迟到第 4.5 步按目录加载（避免跨作品污染）──
-    _sep("第 3 步: 加载世界观/角色/场景（按 RJ 目录）")
-    _log()
-
-    # ──── 第 4 步: 分词 + 文本分析 ────
-    _sep("第 4 步: 文本分词与分析")
-    all_texts = []
-    for lrc_path in lrc_files:
-        try:
-            sub_file = parse_subtitle_file(lrc_path)
-            if sub_file:
-                all_texts.extend([t for t in sub_file.original_lyrics if t.strip()])
-        except Exception:
-            pass
-
-    if all_texts:
-        _analyze_texts(all_texts, ctx)
-    else:
-        _log("  -> 无有效文本行")
-    _log()
-
-    # ──── 第 4.5 步: 自动分析语料（术语/世界观） ────
-    _sep("第 4.5 步: 自动分析语料 — 术语提取 & 世界观生成")
+    # ──── 第 2 步: 加载台本 + 世界观 + 术语 ────
+    _sep("第 2 步: 加载台本 / 世界观 / 术语")
 
     # 按 RJ 根目录归组分析（同一 RJ 号的子目录共享术语/世界观/台本）
     from io_adapter.file_scanner import find_rj_work_root
@@ -1790,7 +1891,7 @@ def run_pipeline(
                 # .ja.lrc 存在 + .lrc 内容已变成中文 → 确实翻译过
                 lang = detect_lrc_language(f)
                 if lang == 'chinese':
-                    _log(f"  [跳过] 已翻译: {f.name}")
+                    _debug(f"已翻译: {f.name}")
                     ctx.stats['skipped'] += 1
                     skipped += 1
                     continue
@@ -1799,7 +1900,7 @@ def run_pipeline(
                 # 没有 .ja.lrc 但 .lrc 已经是中文 → 翻译过但留档丢失，跳过
                 lang = detect_lrc_language(f)
                 if lang == 'chinese':
-                    _log(f"  [跳过] 已翻译(无留档): {f.name}")
+                    _debug(f"已翻译(无留档): {f.name}")
                     ctx.stats['skipped'] += 1
                     skipped += 1
                     continue
@@ -1812,7 +1913,7 @@ def run_pipeline(
             file_groups = new_groups
         lrc_files = remaining
 
-    _sep(f"第 5 步: 翻译（模式: {translation_mode}）")
+    _sep(f"第 3 步: 翻译（模式: {translation_mode}）")
     _log(f"待处理文件: {len(lrc_files)} 个\n")
 
     if translation_mode == "all_at_once" and file_groups:
@@ -1982,32 +2083,35 @@ def run_pipeline(
         _log(f"  平均每文件: {elapsed/ctx.stats['translated']:.1f} 秒")
     _log()
 
-    # 费用统计
-    pricing = ctx.pricing
-    hit_per_1m = pricing.get('hit_per_1m', 0)
-    miss_per_1m = pricing.get('miss_per_1m', 0)
-    completion_per_1m = pricing.get('completion_per_1m', 0)
+    # 费用统计（由统一 TokenTracker 输出）
+    ctx.pr.token_summary(ctx.tracker, elapsed_total=ctx.elapsed)
+    # 如果 tracker 无记录，回退到旧格式
+    if not ctx.tracker.records:
+        pricing = ctx.pricing
+        hit_per_1m = pricing.get('hit_per_1m', 0)
+        miss_per_1m = pricing.get('miss_per_1m', 0)
+        completion_per_1m = pricing.get('completion_per_1m', 0)
 
-    hit_tokens = ctx.stats['total_hit_tokens']
-    miss_tokens = ctx.stats['total_miss_tokens']
-    completion_tokens = ctx.stats['total_completion_tokens']
+        hit_tokens = ctx.stats['total_hit_tokens']
+        miss_tokens = ctx.stats['total_miss_tokens']
+        completion_tokens = ctx.stats['total_completion_tokens']
 
-    cost_hit = (hit_tokens / 1_000_000) * hit_per_1m
-    cost_miss = (miss_tokens / 1_000_000) * miss_per_1m
-    cost_completion = (completion_tokens / 1_000_000) * completion_per_1m
-    cost_total = cost_hit + cost_miss + cost_completion
+        cost_hit = (hit_tokens / 1_000_000) * hit_per_1m
+        cost_miss = (miss_tokens / 1_000_000) * miss_per_1m
+        cost_completion = (completion_tokens / 1_000_000) * completion_per_1m
+        cost_total = cost_hit + cost_miss + cost_completion
 
-    total_tok = hit_tokens + miss_tokens + completion_tokens
-    hit_rate = (hit_tokens / (hit_tokens + miss_tokens) * 100) if (hit_tokens + miss_tokens) > 0 else 0
-    _sep("📊 API 用量 & 费用统计")
-    _log(f"  📊 总Token: {total_tok:,}")
-    _log(f"  🟢 缓存命中:   {hit_tokens:>10,} tokens ({hit_rate:.1f}%) × ¥{hit_per_1m}/百万 = ¥{cost_hit:.4f}")
-    _log(f"  🔵 缓存未命中: {miss_tokens:>10,} tokens × ¥{miss_per_1m}/百万 = ¥{cost_miss:.4f}")
-    _log(f"  🟣 输出Token:  {completion_tokens:>10,} tokens × ¥{completion_per_1m}/百万 = ¥{cost_completion:.4f}")
-    _log(f"  {'─'*50}")
-    _log(f"  💰 本次费用: ¥{cost_total:.4f}")
-    _sep()
-    _log()
+        total_tok = hit_tokens + miss_tokens + completion_tokens
+        hit_rate = (hit_tokens / (hit_tokens + miss_tokens) * 100) if (hit_tokens + miss_tokens) > 0 else 0
+        _sep("📊 API 用量 & 费用统计")
+        _log(f"  📊 总Token: {total_tok:,}")
+        _log(f"  🟢 缓存命中:   {hit_tokens:>10,} tokens ({hit_rate:.1f}%) × ¥{hit_per_1m}/百万 = ¥{cost_hit:.4f}")
+        _log(f"  🔵 缓存未命中: {miss_tokens:>10,} tokens × ¥{miss_per_1m}/百万 = ¥{cost_miss:.4f}")
+        _log(f"  🟣 输出Token:  {completion_tokens:>10,} tokens × ¥{completion_per_1m}/百万 = ¥{cost_completion:.4f}")
+        _log(f"  {'─'*50}")
+        _log(f"  💰 本次费用: ¥{cost_total:.4f}")
+        _sep()
+        _log()
 
     # ── 查询 DeepSeek 账户余额 ──
     _fetch_balance(ctx)

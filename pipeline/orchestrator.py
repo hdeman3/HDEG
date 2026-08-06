@@ -325,24 +325,26 @@ def _llm_identify_scriptbook_files(
 - あとがき / 感想 / 紹介 等后记感想
 - キャスト / 購入特典 等非台本内容
 
+【txt 优先规则】（重要，必须遵守）
+- 若同一台本同时存在 .txt 和 .pdf 两个版本（同名或内容相同），scriptbook_indices **只选择 .txt 版本**，忽略 .pdf
+- is_pre_split=true 时，file_track_mapping 的 value 必须指向被选中的台本文件；若该台本有 txt+pdf 两个版本，必须指向 .txt
+
 【预分割判断】（is_pre_split）
 - true: 台本已按音轨拆分为独立文件，每个文件对应一个音轨
 - false: 台本是整体文件（单个PDF或txt），需程序再分割
 - **重要**: 文件名以纯数字或编号开头（1, 01, １, #1, トラック1 等）且数量与音轨数接近 → 判定为预分割
 
 【文件→音轨匹配】（仅 is_pre_split=true 时需要 file_track_mapping）
-将台本文件的编号与音轨名进行匹配。关键规则：
-1. 从文件名提取数字编号（全角数字１→半角1）
-2. 在音轨名列表中查找包含相同编号的条目（#1, 01, track1 均视为编号1）
-3. 示例: 文件「１.txt」的编号=1 → 匹配音轨名「#1彼氏持ちJKの...」
-4. 示例: 文件「２.txt」的编号=2 → 匹配音轨名「#2彼氏と待ち合わせ...」
-5. 编号无法确定时跳过该文件
+⚠ file_track_mapping 格式: {{音轨名称: 台本文件名}}
+- key = 从【音轨名称列表】中逐字复制的完整音轨名
+- value = 从【文件列表】中逐字复制的完整文件名
+- 示例: {{"#1プロローグ": "セリフ初稿台本_tr01.txt", "#2本編": "セリフ初稿台本_tr02.txt"}}
 
 【文件列表】（共 {len(candidates)} 个）
 {file_list_text}
 
-请返回JSON（仅JSON）：
-{{"scriptbook_indices": [1, 2, 3], "is_pre_split": true, "file_track_mapping": {{"1": "完整音轨名1", "2": "完整音轨名2"}}, "reasoning": "简短依据"}}
+返回JSON（仅JSON）：
+{{"scriptbook_indices": [1, 2], "is_pre_split": true, "file_track_mapping": {{"音轨名1": "文件名1", "音轨名2": "文件名2"}}, "reasoning": "简短依据"}}
 
 无台本时: {{"scriptbook_indices": [], "is_pre_split": false, "file_track_mapping": {{}}, "reasoning": "无"}}"""
 
@@ -768,41 +770,64 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     export_scriptbook = ctx.config.get('app', {}).get('export_scriptbook_content', False)
 
     # ═══════════════════════════════════════════════════════════
-    # 预分割路径: 台本已按音轨拆分为独立文件，跳过 Flash 分割清洗
-    # 匹配关系由 LLM 在识别阶段提供（file_track_mapping），不用正则
+    # 预分割路径: LLM 已返回 file_track_mapping {文件索引→音轨名}
+    # 直接用 LLM 映射加载文件，再将 LLM 音轨名模糊匹配到真实音轨名
     # ═══════════════════════════════════════════════════════════
     if is_pre_split and file_track_mapping:
-        _log(f"  [台本] LLM 确认台本已预分割，匹配 {len(file_track_mapping)} 个音轨，跳过 Flash")
+        _log(f"  [台本] LLM 确认台本已预分割, 映射 {len(file_track_mapping)} 个音轨")
 
         from engines.scriptbook_cleaner import _conservative_pre_clean
 
-        # 按 LLM 给的映射加载文件内容（file_track_mapping: {文件索引: 音轨名}）
         track_map: dict[str, list[str]] = {}
         if track_names:
             for name in track_names:
                 track_map[name] = []
 
-        for idx_str, track_name in file_track_mapping.items():
-            try:
-                idx = int(idx_str) - 1  # LLM 返回 1-based，转 0-based
-            except (ValueError, TypeError):
-                continue
-            if 0 <= idx < len(scriptbook_files):
-                f = scriptbook_files[idx]
-                content = load_scriptbook_content(f, api_config=ctx.api_cfg)
-                if content:
-                    cleaned = _conservative_pre_clean(content)
-                    lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
-                    track_map[track_name] = lines
-                    _log(f"  [预分割] {track_name} ← {f.name} ({len(lines)} 行)")
-                else:
-                    _log(f"  [预分割] {track_name} ← {f.name} (加载失败)")
+        # LLM 返回 {音轨名: 文件名}，音轨名匹配到真实名
+        import unicodedata
+        def _norm_key(s: str) -> str:
+            s = unicodedata.normalize('NFC', s)
+            return re.sub(r'[\s_\-・·\.\,\#]', '', s).lower()
 
-        # 确保所有 track_names 都有条目
-        if track_names:
-            for name in track_names:
-                if name not in track_map:
-                    track_map[name] = []
+        real_index = {_norm_key(n): n for n in track_names} if track_names else {}
+        # 文件名 → Path 索引
+        file_index = {f.name: f for f in scriptbook_files}
+
+        for llm_track_name, llm_filename in file_track_mapping.items():
+            # 匹配真实音轨名
+            real_name = None
+            if track_names:
+                nk = _norm_key(llm_track_name)
+                real_name = real_index.get(nk)
+                if real_name is None:
+                    for rn in track_names:
+                        if nk in _norm_key(rn) or _norm_key(rn) in nk:
+                            real_name = rn
+                            break
+            if real_name is None:
+                _debug(f"预分割: LLM音轨名\"{llm_track_name}\"无法匹配, 跳过")
+                continue
+
+            # 找到对应文件
+            f = file_index.get(llm_filename)
+            if f is None:
+                # fallback: 模糊匹配文件名
+                for fn, fp in file_index.items():
+                    if _norm_key(llm_filename) in _norm_key(fn) or _norm_key(fn) in _norm_key(llm_filename):
+                        f = fp
+                        break
+            if f is None:
+                _debug(f"预分割: LLM文件名\"{llm_filename}\"找不到, 跳过")
+                continue
+
+            content = load_scriptbook_content(f, api_config=ctx.api_cfg)
+            if content:
+                cleaned = _conservative_pre_clean(content)
+                lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
+                track_map[real_name] = lines
+                _log(f"  [预分割] {real_name} ← {f.name} ({len(lines)} 行)")
+            else:
+                _log(f"  [预分割] {real_name} ← {f.name} (加载失败)")
 
         total_clean = sum(len(v) for v in track_map.values())
         _log(f"  → 预分割匹配完成: {len(track_map)} 个音轨, 共 {total_clean} 行台词")
@@ -1328,7 +1353,24 @@ def translate_one_lrc(
     else:
         _log(f"\n[台本] 无台本参考")
 
-    # 编号（整文件一次性翻译，不分块）
+    # 多对多区间对齐：把 ASR 行对齐到单轨台本，每行附对应台本原文（sb）
+    scriptbook_aligned = None
+    if scriptbook_lines and texts:
+        try:
+            from engines.scriptbook_align import align_asr_scriptbook
+            _nonempty = [i for i, t in enumerate(texts) if t and t.strip()]
+            _aligned = align_asr_scriptbook([texts[i] for i in _nonempty], scriptbook_lines)
+            scriptbook_aligned = {_nonempty[k]: v for k, v in _aligned.items()}
+            _log(f"  [台本·对齐] {len(scriptbook_aligned)}/{len(_nonempty)} 行已对齐到台本区间")
+            _preview_i = _nonempty[0] if _nonempty else 0
+            if scriptbook_aligned and ctx.pr.debug:
+                _log(f"  [台本·对齐] 示例 行{_preview_i}: sb={scriptbook_aligned[_preview_i]['sb'][:40]} "
+                     f"conf={scriptbook_aligned[_preview_i]['conf']}")
+        except Exception as _e:
+            _log(f"  [台本·对齐] 失败，跳过: {_e}")
+            scriptbook_aligned = None
+
+    # 编号（整文件一次性翻译，不分块；每行附 sb 作含义参考）
     numbered = [f"{i+1:04d}: {t}" for i, t in enumerate(texts)]
     _log(f"\n[翻译] 整文件翻译: {len(texts)} 行, {sum(len(t) for t in texts)} 字符")
 
@@ -1341,11 +1383,18 @@ def translate_one_lrc(
         alias_list=alias_list,
         worldview=worldview,
         scriptbook_lines=scriptbook_lines,
+        scriptbook_aligned=scriptbook_aligned,
         skip_hallucination_check=True,
     )
     call_elapsed = time.time() - call_start
 
     translated_batch = result.get('translated_lines', [])
+    for t_line in translated_batch:
+        if ': ' in t_line:
+            t_line = t_line.split(': ', 1)[1]
+        if t_line == '[EMPTY_LINE]':
+            t_line = ''
+        translated_texts.append(t_line)
     # 诊断：翻译全空时打印 LLM 原始响应（仅 debug 模式详细输出）
     if len(translated_batch) > 0 and all(not (t or '').strip() for t in translated_batch):
         _log(f"  WARN: 翻译结果全空 ({len(translated_batch)}行)")
@@ -1355,14 +1404,6 @@ def translate_one_lrc(
             _log(f"  [DEBUG] LLM原始响应 ({len(raw_resp) if raw_resp != 'NOT_FOUND' else 'N/A'}字符): {(raw_resp or '')[:500]}")
             if raw_resp and raw_resp != 'NOT_FOUND' and len(raw_resp) > 500:
                 _log(f"  [DEBUG] ...末尾: {raw_resp[-300:]}")
-    for t_line in translated_batch:
-        # 去掉编号前缀 "0001: "
-        if ': ' in t_line:
-            t_line = t_line.split(': ', 1)[1]
-        # 还原空行标记
-        if t_line == '[EMPTY_LINE]':
-            t_line = ''
-        translated_texts.append(t_line)
 
     _log(f"  ← 响应: {len(translated_batch)} 行, 耗时 {call_elapsed:.1f}s")
     non_empty = [t for t in translated_texts if t and t.strip()]
@@ -1738,6 +1779,7 @@ def run_pipeline(
     _log(f"  temperature: {gen_params.get('temperature', 'N/A')}")
     _log(f"  top_p: {gen_params.get('top_p', 'N/A')}")
     _log(f"  max_tokens: {gen_params.get('max_tokens', 'N/A')}")
+    _log(f"  reasoning_effort: {gen_params.get('reasoning_effort', 'N/A')}  (思考强度)")
     _log()
 
     if not root.exists():

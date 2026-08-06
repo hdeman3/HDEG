@@ -57,7 +57,7 @@ def find_scriptbooks_in_dir(
                     if _is_scriptbook_file(f):
                         candidates.append(f)
             if candidates:
-                return _sort_scriptbook_files(candidates)
+                return _finalize_scriptbook_files(candidates)
 
     # 回退：检查名称中包含「台本」的子目录（如 05.台本）
     if not candidates:
@@ -71,7 +71,7 @@ def find_scriptbooks_in_dir(
                             if _is_scriptbook_file(f):
                                 candidates.append(f)
                     if candidates:
-                        return _sort_scriptbook_files(candidates)
+                        return _finalize_scriptbook_files(candidates)
         except Exception:
             pass
 
@@ -83,7 +83,7 @@ def find_scriptbooks_in_dir(
             if _is_scriptbook_file(f):
                 candidates.append(f)
 
-    return _sort_scriptbook_files(candidates)
+    return _finalize_scriptbook_files(candidates)
 
 
 def collect_all_scriptbook_candidates(work_dir: Path) -> list[Path]:
@@ -152,6 +152,38 @@ def _sort_scriptbook_files(files: list[Path]) -> list[Path]:
         result.extend(sorted(groups[parent_key], key=_extract_number))
 
     return result
+
+
+def prefer_txt_over_pdf(files: list[Path]) -> list[Path]:
+    """同一目录下同名 txt+pdf 同时被识别为台本时，优先保留 txt、丢弃 pdf。
+
+    仅用于正则回退路径（find_scriptbooks_in_dir）：该路径不走 LLM，无法用提示词约束，
+    若 txt+pdf 都收集进来，非预分割时会重复拼接同一份台本。
+    """
+    if not files:
+        return files
+
+    # 按 (父目录, 不含扩展名的文件名) 分组，找出同名 txt/pdf 对
+    groups: dict[tuple[str, str], list[Path]] = {}
+    for f in files:
+        groups.setdefault((str(f.parent), f.stem), []).append(f)
+
+    pdf_twin: set[Path] = set()
+    for paths in groups.values():
+        pdfs = [p for p in paths if p.suffix.lower() == '.pdf']
+        txts = [p for p in paths if p.suffix.lower() == '.txt']
+        if pdfs and txts:
+            pdf_twin.update(pdfs)
+
+    if not pdf_twin:
+        return files
+    return [f for f in files if f not in pdf_twin]
+
+
+def _finalize_scriptbook_files(files: list[Path]) -> list[Path]:
+    """识别结果收尾：txt 优先于 pdf，再按编号排序"""
+    kept = prefer_txt_over_pdf(files)
+    return _sort_scriptbook_files(kept)
 
 
 # ==================== 台本识别 ====================
@@ -318,13 +350,25 @@ def _analyze_pdf_layout(all_chars: list[dict], api_config: dict) -> dict:
 
     prompt = '\n\n'.join(parts) + '''
 
-基于以上坐标数据，输出JSON（不要其他内容）：
-{"orientation":"horizontal或vertical","reading_order":"竖排填right-to-left或left-to-right，横排填top-to-bottom","col_gap":20,"body_y_min":100,"body_y_max":560}
+基于以上坐标数据和抽样字符内容，输出JSON（不要其他内容）：
+{"orientation":"horizontal或vertical","reading_order":"right-to-left或left-to-right或top-to-bottom","col_gap":0,"body_y_min":0,"body_y_max":0}
+
+各参数由你根据坐标数据和抽样字符内容独立判断，填入实际数值：
+- orientation: 横排(horizontal)或竖排(vertical)
+- reading_order: 竖排时填列阅读方向（right-to-left=右列→左列，left-to-right=左列→右列），横排时填top-to-bottom
+- col_gap: 一个完整视觉列的宽度(px)，不是字符间距。
+  同一视觉列内字符的X坐标有一定散布，不同视觉列之间有明显的X间隔。
+  col_gap应大于列内散布、小于列间间隔。
+- body_y_min: 正文顶部Y坐标。过滤此坐标以上的内容（页眉、页码、行号等非正文元素）。
+  观察Y分布和抽样字符：顶部Y值最小的少量字符通常就是页码/行号，正文从Y分布开始密集的地方开始。
+  必须填入实际值，不要填0。
+- body_y_max: 正文底部Y坐标。过滤此坐标以下的内容（底部页码等）。
+  观察Y分布尾部：底部Y值最大的少量字符通常是页码，正文到Y分布密集区结束为止。
+  如果底部无明显页码，填入页面高度。
 
 判断横排/竖排的关键：
 - 竖排：X分布有多个密集峰值（多列），Y范围覆盖页面大部分高度
-- 横排：Y分布只有少量峰值（少数行），字符Y接近但X跨度大，抽样中同一行的字符Y坐标几乎相同
-body_y_min/body_y_max 是正文Y范围。页眉在顶部少量字符，页码在底部少量字符，中间密集区是正文。'''
+- 横排：Y分布只有少量峰值（少数行），字符Y接近但X跨度大，抽样中同一行的字符Y坐标几乎相同'''
 
     try:
         from openai import OpenAI
@@ -371,12 +415,20 @@ body_y_min/body_y_max 是正文Y范围。页眉在顶部少量字符，页码在
     return {"orientation": "vertical", "col_gap": 24.0, "reading_order": "right-to-left"}
 
 
+# ── 孤儿列/行合并阈值 ──
+_ORPHAN_THRESHOLD = 5
+
+
 # ==================== PDF 提取（参照 vertical_sort.py） ====================
 
 # ==================== fitz 字符采样（替代 pypdfium2） ====================
 
-def _sample_chars_fitz(file_path: Path, max_pages: int = 5) -> list[dict]:
-    """用 fitz rawdict 逐字符提取坐标，用于 LLM 排版分析"""
+def _sample_chars_fitz(file_path: Path, max_pages: int = 5,
+                       start_page: int = 0) -> list[dict]:
+    """用 fitz rawdict 逐字符提取坐标，用于 LLM 排版分析
+
+    start_page: 起始页码(0-based)，max_pages: 最多提取页数
+    """
     try:
         import fitz
     except ImportError:
@@ -387,7 +439,8 @@ def _sample_chars_fitz(file_path: Path, max_pages: int = 5) -> list[dict]:
 
     try:
         doc = fitz.open(str(file_path))
-        for pg_idx in range(min(len(doc), max_pages)):
+        end_page = min(len(doc), start_page + max_pages)
+        for pg_idx in range(start_page, end_page):
             page = doc[pg_idx]
             page_w = page.rect.width
             page_h = page.rect.height
@@ -397,11 +450,13 @@ def _sample_chars_fitz(file_path: Path, max_pages: int = 5) -> list[dict]:
                     for span in line.get("spans", []):
                         for ch_data in span.get("chars", []):
                             c = ch_data.get("c", "")
-                            if c in _ctrl or not c.strip():
+                            if c in _ctrl:
+                                continue
+                            if c.isspace() or c == '':
                                 continue
                             bbox = ch_data.get("bbox")
                             if not bbox:
-                                continue
+                                bbox = (0.0, 0.0, 0.0, 0.0)
                             chars.append({
                                 "text": c,
                                 "x": round(bbox[0], 1),
@@ -438,6 +493,8 @@ def _reorder_fitz_vertical(chars: list[dict], col_gap: float = 24.0) -> str:
             col_key = round(ch["x"] / col_gap) * col_gap
             columns[col_key].append(ch)
 
+        columns = _merge_orphan_columns(columns, axis="x")
+
         sorted_cols = sorted(columns.items(), key=lambda kv: -kv[0])
         page_lines = []
         for _col_x, col_chars in sorted_cols:
@@ -470,6 +527,8 @@ def _reorder_fitz_horizontal(chars: list[dict], row_gap: float = 8.0) -> str:
             row_key = round(ch["y"] / row_gap) * row_gap
             rows[row_key].append(ch)
 
+        rows = _merge_orphan_columns(rows, axis="y")
+
         sorted_rows = sorted(rows.items(), key=lambda kv: kv[0])
         page_lines = []
         for _row_y, row_chars in sorted_rows:
@@ -486,6 +545,81 @@ def _reorder_fitz_horizontal(chars: list[dict], row_gap: float = 8.0) -> str:
     return "\n".join(output_lines)
 
 
+def _merge_orphan_columns(groups: dict, *, axis: str = "x",
+                          threshold: int = _ORPHAN_THRESHOLD) -> dict:
+    """将孤儿组（字符数 < threshold）合并到最近的大组。
+
+    固定宽度分桶（如 round(x/col_gap)*col_gap）会产生 1~2 字符的
+    "碎片"列/行——段首字符因微小 X/Y 偏移落入了不同的桶。
+    此函数将碎片合并到距离最近的大组，调用方随后按正交轴排序
+    即可恢复正确顺序。
+
+    Args:
+        groups: {bucket_key: [char_dicts]}
+        axis: "x"（列合并，基于 key 的 X 距离）或
+              "y"（行合并，基于 key 的 Y 距离）
+        threshold: 少于此字符数的组视为孤儿
+
+    Returns:
+        合并后的 dict（孤儿组的 key 被移除，字符合并到大组）
+    """
+    if len(groups) <= 1:
+        return dict(groups)
+
+    large = {k: v for k, v in groups.items() if len(v) >= threshold}
+    orphans = {k: v for k, v in groups.items() if len(v) < threshold}
+
+    if not orphans or not large:
+        return dict(groups)
+
+    sorted_large_keys = sorted(large.keys())
+    for orphan_key, orphan_chars in orphans.items():
+        best_key = min(
+            sorted_large_keys,
+            key=lambda lk: (abs(orphan_key - lk), -len(large[lk])),
+        )
+        large[best_key].extend(orphan_chars)
+
+    return large
+
+
+def _merge_same_flow_columns(columns: dict, max_gap: float) -> dict:
+    """合并同一阅读流的相邻列。
+
+    相邻列的X中心间距 ≤ max_gap → 视为同一阅读流 → 合并。
+    合并后列内按Y重排即得正确阅读顺序（竖排右→左列，列内上→下）。
+
+    例如：一句话跨两列时，右列x=510和左列x=480间距30px ≤ max_gap，
+    合并为一个逻辑列后Y排序，恢复正确阅读顺序。
+    """
+    if len(columns) <= 1 or max_gap <= 0:
+        return dict(columns)
+
+    sorted_keys = sorted(columns.keys(), reverse=True)
+    groups = []
+    current_group = [sorted_keys[0]]
+    for i in range(1, len(sorted_keys)):
+        gap = sorted_keys[i-1] - sorted_keys[i]
+        if gap <= max_gap:
+            current_group.append(sorted_keys[i])
+        else:
+            groups.append(current_group)
+            current_group = [sorted_keys[i]]
+    groups.append(current_group)
+
+    if all(len(g) == 1 for g in groups):
+        return dict(columns)
+
+    merged = {}
+    for group in groups:
+        target_key = group[0]
+        merged[target_key] = []
+        for key in group:
+            merged[target_key].extend(columns[key])
+
+    return merged
+
+
 # ==================== 主提取函数 ====================
 
 def _extract_pdf_text(file_path: Path, api_config: dict = None) -> Optional[str]:
@@ -500,7 +634,7 @@ def _extract_pdf_text(file_path: Path, api_config: dict = None) -> Optional[str]
     # ── 第一步：LLM 排版分析（有 api_config 时必过，用 fitz 采样）──
     layout = None
     if api_config:
-        sample_chars = _sample_chars_fitz(file_path, max_pages=5)
+        sample_chars = _sample_chars_fitz(file_path, max_pages=6, start_page=4)
         if sample_chars:
             layout = _analyze_pdf_layout(sample_chars, api_config)
 
@@ -692,6 +826,8 @@ def _reorder_vertical_page(page_chars: list[dict], col_gap: float = 24.0) -> lis
         col_key = round(ch["x"] / col_gap) * col_gap
         columns[col_key].append(ch)
 
+    columns = _merge_orphan_columns(columns, axis="x")
+
     sorted_cols = sorted(columns.items(), key=lambda kv: -kv[0])
 
     page_lines: list[str] = []
@@ -713,6 +849,8 @@ def _reorder_horizontal_page(page_chars: list[dict], row_gap: float = 8.0) -> li
     for ch in page_chars:
         row_key = round(ch["y"] / row_gap) * row_gap
         rows[row_key].append(ch)
+
+    rows = _merge_orphan_columns(rows, axis="y")
 
     sorted_rows = sorted(rows.items(), key=lambda kv: kv[0])
 

@@ -10,6 +10,9 @@ from __future__ import annotations
 import re
 from typing import Protocol, TypedDict
 
+# 台本对齐置信度阈值：conf 低于此值的行不附 sb（避免插值猜测的台本误导翻译）
+SB_MIN_CONF = 0.3
+
 
 # ==================== 翻译结果类型 ====================
 
@@ -97,7 +100,8 @@ class OpenAICompatEngine:
         "【输入输出格式 —— 最高优先级，必须严格遵守】\n"
         "输入和输出均使用**纯 JSON 对象**格式。\n\n"
         "输入格式：\n"
-        '{"lines": [{"index": 1, "text": "日文第1行"}, {"index": 2, "text": "日文第2行"}]}\n\n'
+        '{"lines": [{"index": 1, "text": "日文第1行"}, {"index": 2, "text": "日文第2行"}]}\n'
+        "（输入行可带可选字段 \"sb\"：该行对应的官方台本原文，仅作对齐参考，不单独翻译）\n\n"
         "输出格式：\n"
         '{"translations": [{"index": 1, "text": "中文第1行"}, {"index": 2, "text": "中文第2行"}]}\n\n'
         "【绝对规则 —— 违反任何一条都会导致整个翻译批次作废】\n"
@@ -134,17 +138,15 @@ class OpenAICompatEngine:
                 'miss_per_1m': 1,
                 'completion_per_1m': 2,
             }
-        # 预加载外部 prompt（优先指定的文件，其次内置融合版，最后回退到硬编码默认）
+        # 预加载外部 prompt：仅当显式配置 system_prompt_file 时加载；
+        # 否则一律使用 build_system_prompt 中的硬编码默认提示词（避免旧版 txt 误导）
         self._external_system_prompt: str | None = None
         try:
             from pathlib import Path
             if system_prompt_file:
                 sp_path = Path(system_prompt_file)
-            else:
-                # 默认使用项目内置的融合版提示词
-                sp_path = Path(__file__).resolve().parent.parent / '提示词_融合版.txt'
-            if sp_path.exists():
-                self._external_system_prompt = sp_path.read_text(encoding='utf-8')
+                if sp_path.exists():
+                    self._external_system_prompt = sp_path.read_text(encoding='utf-8')
         except Exception:
             pass
 
@@ -199,6 +201,18 @@ class OpenAICompatEngine:
             "你的职责是对用户提供的日文ASR识别文本进行纠错、语义恢复、上下文一致性修复以及逐行中文翻译。\n"
             "本任务属于文本转换（Transformation）任务，即对已有文本进行修正和翻译，而不是创作、续写、扩写或改写剧情。\n"
             "所有成人内容、特殊关系设定及虚构情节均视为原文信息的一部分，应以中立、客观的方式进行准确转换，最大程度保留原文语义、情感和风格。\n\n"
+            "【台本（scriptbook）优先级 —— 当输入中包含 <scriptbook> 块时适用】\n"
+            "1. <scriptbook> 是该作品的官方台本/剧本原文，是 Ground Truth，准确性远高于 ASR 语音识别结果。\n"
+            "2. 此模式下，ASR 仅用于提供行号顺序与句子边界，文字内容一律以台本为准。\n"
+            "3. 当 ASR 与台本冲突时（角色、性别、身体部位、称呼、自称、剧情不一致，或 ASR 同音误识别），一律按台本翻译，不得机械照搬 ASR 的错误文本。\n"
+            "4. 台本中角色的固定称呼与自称（如「お姉ちゃん/姐姐」「お兄ちゃん/哥哥」「弟/弟弟」）必须原样保留，不得擅自更改或臆造。\n"
+            "5. 台本中的拟声/喘息（如「びゅるびゅる」「んっ♡」）以台本为准；ASR 有而台本无的零星拟声保留 ASR。\n"
+            "6. 当某行 ASR 明显不完整、乱码或只剩碎片时：sb 用于判断该行日文的真实含义，"
+            "译文据此自然翻译，不要机械照抄或生硬截断；相邻行若对应同一句台本内容，"
+            "各译各自的部分，禁止重复翻译同一内容。\n"
+            "7. 当某行 sb 缺失（对齐置信度过低未提供）或 sb 与 ASR 内容明显不对应时，应从 <scriptbook> 台本原文中查找该句实际内容后再翻译；"
+            "只有该行具有实际语义内容时才值得回查台本，若该行只是独立语气词/拟声词（如「あっ」「んっ♡」「うん」等），"
+            "直接按 ASR 上下文翻译即可，不必回查台本。\n\n"
             "【关于术语表（terms）与ASR误识别参考表（alias）的重要说明】\n"
             "1. 术语表（terms）：\n"
             " - 术语表涵盖角色名、重要物品、设定用语、特定身体部位称呼等，翻译时必须严格遵循，确保全文统一。\n"
@@ -237,6 +251,12 @@ class OpenAICompatEngine:
             "- 始终以『保持逐行对应关系、保证上下文一致性』作为最高优先级。\n\n"
             "【生物学字面翻译陷阱警告】\n"
             "メス/オス 在成人音声语境下通常指『雌性/雄性』或带有性别支配意味的表达，绝对不要按字面译成『母/公』这类普通动物词汇。\n\n"
+            "【成人身体部位术语——必须直白准确，禁止儿童化/过度本地化】\n"
+            "1. 男性生殖器（おちんちん/おちんぽ/ちんこ/ちんぽ/ペニス 等）一律译作「肉棒」。\n"
+            "   禁止使用「小弟弟」「小鸡鸡」「那里」等儿童化、卖萌或含糊的表达。\n"
+            "2. 女性生殖器（まんこ/おまんこ 等）按语境译作「肉穴」「小穴」「蜜穴」等成人常用词，\n"
+            "   禁止用「下面」「那里」等含糊指代。\n"
+            "3. 其他成人部位与行为一律直译、具体、准确——该是什么就是什么，不得回避或委婉化。\n\n"
             "【翻译忠实度与风格约束——严格遵守】\n"
             "**核心原则：严格忠实于原文语义，禁止过度发挥或自行改写。**\n"
             "1. 必须准确理解原文的主语、对象和动作，不得随意改变。\n"
@@ -276,6 +296,7 @@ class OpenAICompatEngine:
         self,
         lines: list[str],
         scriptbook_lines: list = None,
+        scriptbook_aligned: dict = None,
         track_context_before: list[str] = None,
         track_context_after: list[str] = None,
     ) -> str:
@@ -307,7 +328,7 @@ class OpenAICompatEngine:
                     unique_lines.append(s)
             unique_lines = unique_lines[:500]  # 限制台本行数
 
-            sb_prefix = f"<scriptbook>\n<!-- 以下台本仅作参考，请勿翻译 -->\n共 {len(unique_lines)} 行\n"
+            sb_prefix = f"<scriptbook>\n<!-- 台本为官方Ground Truth：ASR与台本冲突时一律以台本为准翻译；本块内容不单独输出 -->\n共 {len(unique_lines)} 行\n"
             sb_prefix += "\n".join(unique_lines)
             sb_prefix += "\n</scriptbook>"
             parts.append(sb_prefix)
@@ -344,10 +365,20 @@ class OpenAICompatEngine:
             else:
                 break
 
-        lines_json = _json.dumps({
-            "lines": [{"index": i + 1, "text": t} for i, t in enumerate(pure_lines)]
-        }, ensure_ascii=False)
-        asr_section = f"<asr>\n<!-- 请翻译以下内容 -->\n{lines_json}\n</asr>"
+        line_objs = []
+        for i, t in enumerate(pure_lines):
+            obj = {"index": i + 1, "text": t}
+            if scriptbook_aligned and i in scriptbook_aligned:
+                _sb_conf = scriptbook_aligned[i]["conf"]
+                # 低置信（插值猜测）的行不附 sb，避免误导模型
+                if _sb_conf > SB_MIN_CONF:
+                    obj["sb"] = scriptbook_aligned[i]["sb"]
+                    obj["sb_conf"] = _sb_conf
+            line_objs.append(obj)
+        lines_json = _json.dumps({"lines": line_objs}, ensure_ascii=False)
+        asr_section = (f"<asr>\n<!-- 请翻译以下内容；每行可带 sb=官方台本对应原文，sb 仅作含义参考，sb 本身不输出。"
+                       f"sb_conf 为台本对齐置信度(0~1)，值越高越可信；不带 sb 的行表示对齐置信度过低，请直接按 ASR 上下文翻译。"
+                       f"译文自然流畅、口语化；相邻行对应同一句台本内容时避免重复翻译 -->\n{lines_json}\n</asr>")
         parts.append(asr_section)
 
         if trailing_empty > 0:
@@ -784,6 +815,7 @@ class OpenAICompatEngine:
         worldview: dict = None,
         worldview_hint: str = None,
         scriptbook_lines: list = None,
+        scriptbook_aligned: dict = None,
         track_context_before: list[str] = None,
         track_context_after: list[str] = None,
         skip_hallucination_check: bool = False,
@@ -839,6 +871,7 @@ class OpenAICompatEngine:
         user_prompt = self.build_user_prompt(
             lines,
             scriptbook_lines=scriptbook_lines,
+            scriptbook_aligned=scriptbook_aligned,
             track_context_before=track_context_before,
             track_context_after=track_context_after,
         )

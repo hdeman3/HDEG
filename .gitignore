@@ -27,6 +27,7 @@ _*.py
 build/
 dist/
 *.spec
+!main.spec
 *.exe
 translate.exe
 infer.exe
@@ -44,9 +45,11 @@ nul
 # 输出文件
 *.txt
 !使用说明.txt
+!requirements.txt
 
-# Markdown文件
+# Markdown文件（仅允许 README 入库）
 *.md
+!README.md
 
 # 批处理文件（只保留翻译相关）
 *.bat
@@ -147,5 +150,20 @@ pdf台本/.worldview.json
 文本台本/.alias.json
 文本台本/.terms.json
 文本台本/.worldview.json
-electron-app/node_modules/
+electron-app/
 转录模型/
+
+# 本地音声作品（版权内容，不入库）
+RJ[0-9]*/
+
+# 本地缓存/调试/临时目录
+.paddlex/
+demo/
+translate_logs/
+新建文件夹/
+
+# 意外生成的孤儿文件
+pipeline/or
+
+# 算法原型（本地保留，不入库）
+vertical_sort.py

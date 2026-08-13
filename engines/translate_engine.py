@@ -129,6 +129,9 @@ class OpenAICompatEngine:
         self._client = None
         self._system_prompt_file = system_prompt_file
         self._last_raw_response = ''
+        # 供应商识别：仅 DeepSeek 原生接口额外发送 thinking extra_body；
+        # 其余 OpenAI 兼容服务一律用通用参数，避免请求被拒
+        self._is_deepseek = 'deepseek' in (config.get('base_url') or '').lower()
         # 定价：优先使用传入的 pricing，其次从 config 读取
         if pricing:
             self.pricing = pricing
@@ -388,6 +391,22 @@ class OpenAICompatEngine:
 
     # ---------- 单轮 API 调用 ----------
 
+    @staticmethod
+    def _looks_like_unsupported_param(e: Exception) -> bool:
+        """判断错误是否源于「服务不支持某请求参数」（应剔除可选参数后重试）
+
+        适配各种 OpenAI 兼容网关：按状态码（400/422）或错误消息关键词识别。
+        """
+        status = getattr(e, 'status_code', None)
+        if status in (400, 422):
+            return True
+        msg = str(e).lower()
+        for kw in ('unknown', 'unsupported', 'not support', 'unexpected', 'unrecognized',
+                   'invalid argument', 'extra_input', 'bad_request', 'parameter'):
+            if kw in msg:
+                return True
+        return False
+
     def call_api(
         self,
         system_prompt: str,
@@ -433,9 +452,14 @@ class OpenAICompatEngine:
                 actual = '\n'.join(lines[-15:])
                 print(f"  [DEBUG] 待翻译内容(后15行):\n{actual}", flush=True)
 
+        # 部分 OpenAI 兼容服务不接受 reasoning_effort / top_k 等扩展参数，
+        # 首次被拒后自动剔除这些参数重试，保证任意 OpenAI 格式端点可用。
+        _OPTIONAL_PARAMS = ('reasoning_effort', 'top_k')
+        _stripped_optional = False
+
         for attempt in range(max_retries):
             try:
-                # 只保留 OpenAI API 接受的参数
+                # 只保留 OpenAI 兼容 API 可接受的参数
                 _allowed = ('temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty',
                            'stop', 'logit_bias', 'user', 'reasoning_effort')
                 _filtered = {k: v for k, v in gen_params.items() if k in _allowed}
@@ -447,6 +471,10 @@ class OpenAICompatEngine:
                 if _tok < 16384:
                     _tok = 131072
                 _filtered['max_tokens'] = _tok
+                # 曾因参数不被支持被拒 → 剔除可选参数重试
+                if _stripped_optional:
+                    for _k in _OPTIONAL_PARAMS:
+                        _filtered.pop(_k, None)
 
                 # 心跳线程：长请求时打印等待进度
                 import threading
@@ -464,10 +492,11 @@ class OpenAICompatEngine:
                 heartbeat_thread.start()
 
                 try:
-                    # DeepSeek 思考模式：reasoning_effort 控制思考强度
-                    # 额外通过 extra_body 启用 thinking（默认已启用，此处显式声明）
+                    # 思考模式 extra_body：仅 DeepSeek 原生接口使用（其余服务可能拒绝）
+                    # 其他 OpenAI 兼容服务走通用参数即可，无需 extra_body
                     _extra = {}
-                    if 'reasoning_effort' in _filtered:
+                    if (not _stripped_optional and self._is_deepseek
+                            and 'reasoning_effort' in _filtered):
                         _extra = {'thinking': {'type': 'enabled'}}
                     response = self._client.chat.completions.create(
                         model=self.config.get('model', 'gpt-4o-mini'),
@@ -525,6 +554,12 @@ class OpenAICompatEngine:
                 last_error = e
                 if self.verbose:
                     print(f"  [API] 尝试 {attempt+1}/{max_retries} 失败: {type(e).__name__}: {e}")
+                # 服务拒绝某参数（400/422 或提示未知参数）→ 剔除可选参数后立即重试
+                if not _stripped_optional and OpenAICompatEngine._looks_like_unsupported_param(e):
+                    _stripped_optional = True
+                    if self.verbose:
+                        print("  [API] 服务可能不支持 reasoning_effort/top_k/thinking，自动剔除后重试")
+                    continue
                 if attempt < max_retries - 1:
                     _time_mod.sleep(2 ** attempt)  # 指数退避
 
@@ -533,13 +568,74 @@ class OpenAICompatEngine:
     # ---------- JSON 翻译结果解析 ----------
 
     @staticmethod
+    def _parse_json_sequence(text: str) -> list | None:
+        """把逗号/换行分隔的 JSON 值序列（JSONL 风格）解析为值列表
+
+        例: {"index":1,"text":"啊。"},{"index":2,"text":""}
+        例: {"translations":[...]}\n{"translations":[...]}
+
+        用 raw_decode 逐值解析并跳过分隔逗号/空白；遇到无法解析的内容返回 None。
+        解决 LLM 偶尔输出「多个独立 JSON 对象用逗号相连」这种非标准格式的解析。
+
+        返回: JSON 值列表，或 None（不是完整的 JSON 序列）
+        """
+        import json as _json
+        if not text:
+            return None
+        decoder = _json.JSONDecoder()
+        values: list = []
+        pos = 0
+        n = len(text)
+        while True:
+            # 跳过空白与分隔逗号
+            while pos < n and text[pos] in ' \t\r\n,':
+                pos += 1
+            if pos >= n:
+                break
+            try:
+                val, end = decoder.raw_decode(text, pos)
+            except _json.JSONDecodeError:
+                return None
+            values.append(val)
+            pos = end
+        return values or None
+
+    @staticmethod
+    def _texts_from_sequence(seq: list) -> list[str] | None:
+        """把 JSON 值序列转换为翻译文本列表；格式不匹配返回 None"""
+        if not seq:
+            return None
+        # ① 全是 {index, text} 字典 → 按 index 排序取 text
+        if all(isinstance(v, dict) for v in seq):
+            if all('text' in v for v in seq):
+                sorted_arr = sorted(seq, key=lambda x: x.get('index', 0))
+                return [v.get('text', '') for v in sorted_arr]
+            # ② 含 {translations: [{index, text}, ...]}
+            for v in seq:
+                arr = v.get('translations') if isinstance(v, dict) else None
+                if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                    sorted_arr = sorted(arr, key=lambda x: x.get('index', 0))
+                    return [item.get('text', '') for item in sorted_arr]
+            # ③ 含 {zh: [...]}
+            for v in seq:
+                arr = v.get('zh') if isinstance(v, dict) else None
+                if isinstance(arr, list) and all(isinstance(x, str) for x in arr):
+                    return arr
+            return None
+        # 全是字符串 → 直接返回
+        if all(isinstance(v, str) for v in seq):
+            return seq
+        return None
+
+    @staticmethod
     def _extract_json_array(text: str) -> list[str] | None:
         """从 LLM 响应中提取 JSON 翻译结果
 
-        支持三种格式（按优先级）：
+        支持四种格式（按优先级）：
         1. 对象格式（indexed）: {"translations": [{"index": 1, "text": "..."}, ...]}
         2. 对象格式: {"zh": ["翻译1", "翻译2", ...]}
         3. 数组格式: ["翻译1", "翻译2", ...]  （兼容旧版）
+        4. JSON 值序列（JSONL 风格）: {"index":1,"text":"..."},{"index":2,...}
 
         尝试多种策略提取 JSON：
         1. 直接解析整个文本（支持对象和数组）
@@ -575,11 +671,25 @@ class OpenAICompatEngine:
         except _json.JSONDecodeError:
             pass
 
+        # 策略1.5: 逗号/换行分隔的 JSON 值序列（JSONL 风格）
+        # 例: {"index":1,"text":"..."},{"index":2,"text":"..."}
+        seq = OpenAICompatEngine._parse_json_sequence(text)
+        if seq is not None:
+            from_seq = OpenAICompatEngine._texts_from_sequence(seq)
+            if from_seq is not None:
+                return from_seq
+
         # 策略2: 尝试提取 { ... } 对象
         brace_start = text.find('{')
         brace_end = text.rfind('}')
         if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
             candidate = text[brace_start:brace_end + 1]
+            # 2a: candidate 本身是逗号分隔的 JSON 值序列（包裹在文本中的情况）
+            seq2 = OpenAICompatEngine._parse_json_sequence(candidate)
+            if seq2 is not None and len(seq2) > 1:
+                from_seq2 = OpenAICompatEngine._texts_from_sequence(seq2)
+                if from_seq2 is not None:
+                    return from_seq2
             try:
                 result = _json.loads(candidate)
                 # indexed 格式
@@ -628,8 +738,6 @@ class OpenAICompatEngine:
                         if isinstance(arr, list) and len(arr) > 0 and isinstance(arr[0], dict):
                             sorted_arr = sorted(arr, key=lambda x: x.get('index', 0))
                             texts = [item.get('text', '') for item in sorted_arr]
-                            if self.verbose:
-                                print(f"    [JSON修复] 成功修复截断的JSON", flush=True)
                             return texts
                     if isinstance(result, dict) and 'zh' in result:
                         arr = result['zh']

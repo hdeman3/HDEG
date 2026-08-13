@@ -115,7 +115,7 @@ HDEG 的答案很直接——**别再和 ASR 死磕，直接读官方台本**。
 ### 环境要求
 
 - Python 3.10+
-- DeepSeek API Key（当前仅支持 DeepSeek API）
+- 任意 **OpenAI 兼容 API** 的 Key（DeepSeek / 通义千问 / vLLM / Ollama / OpenRouter 等，通过 `api.base_url` + `api.model` 配置；参数不兼容时会自动降级重试）
 - 可运行的海南鸡转录模型（`infer.exe` + 模型，放入 `转录模型/`）
 
 ### 安装
@@ -134,7 +134,8 @@ cp config.example.json config.json
 
 编辑 `config.json`：
 
-- `api.key` — 填入你的 DeepSeek API Key
+- `api.key` — 填入你的 OpenAI 兼容 API Key
+- `api.base_url` / `api.model` — API 地址与模型名（默认 DeepSeek，可换任意 OpenAI 兼容服务；`api.split_model` 可单独指定台本分割用的低价模型）
 - `transcription.infer_exe` — 转录程序路径
 - `app.delay_translate_to_offpeak` — 转录完成后延迟翻译到空闲时段执行（峰谷定价：高峰 09:00–12:00、14:00–18:00 北京时间，其余空闲，空闲价 = 高峰价 50%）。`true` 时若转录完成正处高峰，程序会倒计时等待到空闲再自动翻译
 

@@ -206,7 +206,7 @@ class ScriptbookSplitter:
     仅共享 API key 和 base_url，不读取 config 中的翻译模型名。
     """
 
-    # 固定使用 Flash 模型（不跟随 config 的翻译模型设置）
+    # 分割模型：默认 Flash（低价快速）；可通过 config 的 split_model 覆盖
     SPLIT_MODEL = 'deepseek-v4-flash'
     # 输出窗口：flash 模型有内部推理 token 开销，给足余量
     SPLIT_MAX_TOKENS = 262144
@@ -214,11 +214,13 @@ class ScriptbookSplitter:
     def __init__(self, config: dict, verbose: bool = False):
         """
         参数:
-            config: API 配置字典（仅读取 key 和 base_url；model 固定为 Flash）
+            config: API 配置字典（读取 key / base_url / split_model；不跟随翻译模型）
             verbose: 是否输出调试信息
         """
         self.api_key = config.get('key') or config.get('api_key', 'sk-no-key')
         self.base_url = config.get('base_url', 'http://localhost:8000/v1')
+        # 分割模型：默认 Flash；可用 config.api.split_model 覆盖（适配其他 OpenAI 兼容服务）
+        self.split_model = config.get('split_model') or self.SPLIT_MODEL
         # 分割超时对标翻译（但截取下限，避免太短）
         self.timeout = max(config.get('timeout', 300), 300)
         self.verbose = verbose
@@ -372,7 +374,7 @@ class ScriptbookSplitter:
 
                 try:
                     response = self._client.chat.completions.create(
-                        model=self.SPLIT_MODEL,
+                        model=self.split_model,
                         messages=[
                             {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
                             {'role': 'user', 'content': user_prompt},
@@ -476,7 +478,7 @@ class ScriptbookSplitter:
     #     for attempt in range(max_retries):
     #         try:
     #             response = self._client.chat.completions.create(
-    #                 model=self.SPLIT_MODEL,
+    #                 model=self.split_model,
     #                 messages=[
     #                     {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
     #                     {'role': 'user', 'content': user_prompt},
@@ -550,7 +552,7 @@ class ScriptbookSplitter:
         for attempt in range(max_retries):
             try:
                 response = self._client.chat.completions.create(
-                    model=self.SPLIT_MODEL,
+                    model=self.split_model,
                     messages=[
                         {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
                         {'role': 'user', 'content': user_prompt},

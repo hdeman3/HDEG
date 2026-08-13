@@ -94,6 +94,8 @@ class PipelineContext:
         self.app_cfg = self.config.get('app', {})
         self.api_cfg = self.config.get('api', {})
         self.pricing = self.config.get('pricing', {})
+        # 峰谷调度开关：转录完成后延迟翻译到空闲时段（高峰价 50%）
+        self.delay_translate_to_offpeak = self.app_cfg.get('delay_translate_to_offpeak', False)
         # 统一输出 + token 追踪
         self.pr = Printer(debug=self.app_cfg.get('debug', False))
         self.tracker = TokenTracker(self.pricing)
@@ -1690,6 +1692,63 @@ def _run_transcription_if_needed(work_dir: Path, ctx: PipelineContext) -> None:
     ctx.stats['archived'] = ctx.stats.get('archived', 0) + archived + restored
 
 
+# ==================== 峰谷调度 ====================
+
+def _wait_for_offpeak_if_needed(ctx: PipelineContext) -> None:
+    """转录完成后、开始 LLM 翻译前的时间侦测（峰谷定价）
+
+    开启 config.app.delay_translate_to_offpeak 时：
+    - 空闲时段: 直接进入翻译（价格 = 高峰价的 50%）
+    - 高峰时段: 进程内倒计时等待，直到空闲时段再继续翻译
+
+    等待期间持续打印带实时时钟的进度心跳，明确"程序正常运行中、在等待空闲时段"，
+    避免被误认为已停止或出错。关闭时行为与原来完全一致。
+    """
+    if not ctx.delay_translate_to_offpeak:
+        return
+
+    from utils.time_price import (
+        is_peak_time,
+        seconds_until_idle,
+        format_hms,
+        next_idle_start,
+        now_beijing,
+    )
+
+    _sep("第 0.5 步: 峰谷调度检查")
+    if not is_peak_time():
+        _log("  [调度] 当前为空闲时段，直接进入翻译（价格 = 高峰价的 50%）")
+        return
+
+    wait_s = seconds_until_idle()
+    idle_start = next_idle_start()
+    _log("  [调度] 当前为高峰时段（09:00-12:00 / 14:00-18:00），API 费用较高")
+    _log("  [调度] 将在空闲时段自动执行翻译（价格 = 高峰价的 50%）")
+    _log(f"  [调度] 当前时间 {now_beijing():%H:%M:%S}，预计空闲开始 {idle_start:%H:%M:%S}，还需等待 {format_hms(wait_s)}")
+    _log("  ══════════════════════════════════════════════════════")
+    _log("   【等待中】程序运行正常，正在等待空闲时段，请勿关闭本窗口")
+    _log("   Ctrl+C 可中断等待，空闲时段重新运行即可从转录结果续译")
+    _log("  ══════════════════════════════════════════════════════")
+    _log()
+
+    waited = 0
+    try:
+        while wait_s > 0:
+            _log(
+                f"  [等待中 {now_beijing():%H:%M:%S}] 距空闲时段开始 {format_hms(wait_s)}"
+                f"（已等待 {format_hms(waited)}），程序正常运行，到点自动开始翻译",
+                flush=True,
+            )
+            time.sleep(min(wait_s, 60))
+            waited += min(wait_s, 60)
+            wait_s = seconds_until_idle()
+        _log("  [调度] ✅ 已进入空闲时段，现在开始翻译")
+    except KeyboardInterrupt:
+        _log()
+        _log("  [调度] 已中断等待。空闲时段重新运行本程序即可从转录结果直接续译。")
+        raise
+
+
 # ==================== 余额查询 ====================
 
 def _fetch_balance(ctx: PipelineContext) -> None:
@@ -1782,6 +1841,15 @@ def run_pipeline(
     _log(f"  reasoning_effort: {gen_params.get('reasoning_effort', 'N/A')}  (思考强度)")
     _log()
 
+    # 峰谷调度预期提示
+    if ctx.delay_translate_to_offpeak:
+        from utils.time_price import is_peak_time
+        if is_peak_time():
+            _log("⚠ [调度] 当前为高峰时段，转录完成后将等待至空闲时段再翻译（价格 = 高峰价的 50%）")
+        else:
+            _log("✓ [调度] 已开启空闲时段延迟翻译，当前为空闲时段，转录完成后直接进入翻译")
+        _log()
+
     if not root.exists():
         _log(f"❌ 错误: 工作目录不存在 - {root_abs}")
         sys.exit(1)
@@ -1807,6 +1875,10 @@ def run_pipeline(
 
     # ──── 第 0 步: 语音转录（infer.exe）──
     _run_transcription_if_needed(root, ctx)
+    _log()
+
+    # ──── 第 0.5 步: 峰谷调度（转录完成后延迟翻译到空闲时段）──
+    _wait_for_offpeak_if_needed(ctx)
     _log()
 
     # ──── 第 1 步: 扫描字幕文件 ────

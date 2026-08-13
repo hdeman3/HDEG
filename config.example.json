@@ -22,6 +22,7 @@
   "app": {
     "lrc_max_lines_per_request": 100,
     "translation_mode": "per_track",
+    "delay_translate_to_offpeak": false,
     "scriptbook_mode": "full",
     "export_ja_lrc": true,
     "use_scriptbook_for_translation": true,

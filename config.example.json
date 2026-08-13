@@ -3,7 +3,6 @@
     "key": "your-api-key-here",
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-v4-flash",
-    "split_model": "deepseek-v4-flash",
     "timeout": 2000,
     "generation_params": {
       "temperature": 1,

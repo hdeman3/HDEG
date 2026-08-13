@@ -135,7 +135,7 @@ cp config.example.json config.json
 编辑 `config.json`：
 
 - `api.key` — 填入你的 OpenAI 兼容 API Key
-- `api.base_url` / `api.model` — API 地址与模型名（默认 DeepSeek，可换任意 OpenAI 兼容服务；`api.split_model` 可单独指定台本分割用的低价模型）
+- `api.base_url` / `api.model` — API 地址与模型名（默认 DeepSeek，可换任意 OpenAI 兼容服务；翻译与台本分割共用同一模型）
 - `transcription.infer_exe` — 转录程序路径
 - `app.delay_translate_to_offpeak` — 转录完成后延迟翻译到空闲时段执行（峰谷定价：高峰 09:00–12:00、14:00–18:00 北京时间，其余空闲，空闲价 = 高峰价 50%）。`true` 时若转录完成正处高峰，程序会倒计时等待到空闲再自动翻译
 

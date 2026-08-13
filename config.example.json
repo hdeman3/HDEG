@@ -5,7 +5,7 @@
     "model": "deepseek-v4-flash",
     "timeout": 2000,
     "generation_params": {
-      "temperature": 1.3,
+      "temperature": 1,
       "top_p": 0.9,
       "max_tokens": 131072,
       "reasoning_effort": "high"
@@ -13,11 +13,12 @@
   },
   "transcription": {
     "infer_exe": "./转录模型/infer.exe",
+    "main_exe": "",
     "model_dir": "./转录模型/models",
     "device": "cuda",
     "compute_type": "int8_float16",
     "audio_suffixes": "mp3,wav,flac,m4a,aac,ogg,wma,mp4,mkv,avi,mov,webm,flv,wmv",
-    "sub_formats": "lrc,srt,vtt"
+    "sub_formats": "lrc"
   },
   "app": {
     "lrc_max_lines_per_request": 100,

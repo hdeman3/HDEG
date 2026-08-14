@@ -669,38 +669,66 @@ class OpenAICompatEngine:
 
     @staticmethod
     def _fix_json_quotes(json_str: str) -> str:
-        """修复 JSON 字符串中未转义的双引号
+        """修复 JSON 字符串中未转义的双引号（只处理 text 值区域）
 
-        在 JSON 数组上下文中，检测字符串值内部的双引号并转义。
-        策略：逐字符扫描，跟踪是否在字符串值内部。
+        原实现用全局 in_string 布尔扫描，无法区分「键名」与「值」——
+        键名 "translations"/"index" 的结束引号后跟的是 ':'，不在 ]} 集合内，
+        会被误判成字符串内部的引号而转义成 \\\"，导致键名全坏、JSON 永远修不回来。
+
+        新实现只扫描每个 "text" 值区域的引号：
+        - 键名、数字等其它部分原样保留
+        - text 值内的引号按「其后是否为 } 或 ,"」判断是否结束，否则视为内容引号转义
+        - 这样即使译文里夹了未转义的 ASCII 双引号也能正确修复
         """
         result = []
         i = 0
-        in_string = False
-        while i < len(json_str):
-            ch = json_str[i]
-            if ch == '"':
-                if in_string:
-                    # 检查是否应该是字符串结束
-                    # 后面是 , 或 ] 或 } 或 : 或仅剩空白 -> 这是字符串结束
-                    remaining = json_str[i+1:].lstrip()
-                    if remaining and remaining[0] in ',]}':
-                        in_string = False
-                        result.append('"')
-                    else:
-                        # 在字符串内部，转义这个双引号
-                        result.append('\\"')
-                else:
-                    # 进入字符串
-                    in_string = True
+        n = len(json_str)
+        while i < n:
+            # 定位 "text" 键（前面是 { 或 , 或空白）
+            if json_str.startswith('"text"', i) and (i == 0 or json_str[i - 1] in '{, \t\r\n'):
+                result.append('"text"')
+                i += 6
+                # 跳过 : 和空白
+                while i < n and (json_str[i].isspace() or json_str[i] == ':'):
+                    result.append(json_str[i])
+                    i += 1
+                # text 值必须是字符串
+                if i < n and json_str[i] == '"':
                     result.append('"')
-            elif ch == '\\' and i + 1 < len(json_str):
-                # 已经是转义序列，保留原样
-                result.append(ch)
-                i += 1
-                result.append(json_str[i])
-            else:
-                result.append(ch)
+                    i += 1
+                    # 扫描 text 值内容，处理未转义引号
+                    while i < n:
+                        ch = json_str[i]
+                        if ch == '\\' and i + 1 < n:
+                            # 已是转义序列，原样保留
+                            result.append(ch)
+                            result.append(json_str[i + 1])
+                            i += 2
+                            continue
+                        if ch == '"':
+                            # 判断是否为 text 值结束：后跟 } 或 ,"（下一个键）
+                            rem = json_str[i + 1:]
+                            l = 0
+                            while l < len(rem) and rem[l].isspace():
+                                l += 1
+                            if l < len(rem):
+                                nxt = rem[l]
+                                if nxt == '}':
+                                    result.append('"')
+                                    i += 1
+                                    break
+                                if nxt == ',' and l + 1 < len(rem) and rem[l + 1] == '"':
+                                    result.append('"')
+                                    i += 1
+                                    break
+                            # 否则是内容里的引号，转义
+                            result.append('\\"')
+                            i += 1
+                            continue
+                        result.append(ch)
+                        i += 1
+                    continue
+            result.append(json_str[i])
             i += 1
         return ''.join(result)
 

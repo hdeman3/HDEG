@@ -216,29 +216,16 @@ class ScriptbookSplitter:
             config: API 配置字典（读取 key / base_url / model；与翻译同一模型）
             verbose: 是否输出调试信息
         """
-        self.api_key = config.get('key') or config.get('api_key', 'sk-no-key')
-        self.base_url = config.get('base_url', 'http://localhost:8000/v1')
-        # 与翻译使用同一个模型（不区分分割/翻译）
-        self.model = config.get('model') or self.SPLIT_MODEL
-        # 分割超时对标翻译（但截取下限，避免太短）
-        self.timeout = max(config.get('timeout', 300), 300)
+        # 保留 config 引用：模型随 APIClient 的配额轮换回写而同步切换
+        self._config = config
+        # 统一 API 调用层：模型轮换 / 重试 / 参数剔除全部内聚在 APIClient
+        from engines.api_client import APIClient
+        self._api = APIClient(config, verbose=verbose)
         self.verbose = verbose
-        self._client = None
 
-    def _ensure_client(self):
-        """延迟初始化客户端"""
-        if self._client is not None:
-            return
-        from openai import OpenAI
-        import os as _os
-        for _k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
-            _os.environ.pop(_k, None)
-        _os.environ['NO_PROXY'] = '*'
-        self._client = OpenAI(
-            base_url=self.base_url,
-            api_key=self.api_key,
-            timeout=self.timeout,
-        )
+    def _current_model(self) -> str:
+        """动态读取当前激活模型（受配额轮换影响）"""
+        return self._config.get('model') or self.SPLIT_MODEL
 
     # ══ V1 (已废弃) — 全文本输出，LLM 返回清洗+分割后的完整台本 ══
     # def split_and_clean(self, track_names, raw_scriptbook, *, max_retries=2):
@@ -351,81 +338,43 @@ class ScriptbookSplitter:
         fz_tag = " (含FZ锚点)" if fz_anchors else " (无锚点,全文搜索)"
         print(f"  [LLM分割] 发送 {len(track_names)} 个音轨给 Flash{fz_tag}, prompt {len(user_prompt)} 字符, max_tokens={self.SPLIT_MAX_TOKENS}", flush=True)
 
-        self._ensure_client()
+        from engines.api_client import APIClient
 
-        last_error = None
-        for attempt in range(max_retries):
-            try:
-                # 心跳线程：长请求时打印等待进度
-                import threading
-                heartbeat_stop = threading.Event()
-                heartbeat_count = [0]
+        try:
+            response = self._api.chat(
+                messages=[
+                    {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': user_prompt},
+                ],
+                max_tokens=self.SPLIT_MAX_TOKENS,
+                temperature=0.1,
+                max_retries=max_retries,
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"  [台本分割V3] 全部尝试失败: {e}")
+            return {}, {}
 
-                def _print_heartbeat():
-                    while not heartbeat_stop.is_set():
-                        heartbeat_stop.wait(10)
-                        if not heartbeat_stop.is_set():
-                            heartbeat_count[0] += 10
-                            print(f"    [等待] 已等待 {heartbeat_count[0]} 秒...", flush=True)
-
-                heartbeat_thread = threading.Thread(target=_print_heartbeat, daemon=True)
-                heartbeat_thread.start()
-
-                try:
-                    response = self._client.chat.completions.create(
-                        model=self.model,
-                        messages=[
-                            {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
-                            {'role': 'user', 'content': user_prompt},
-                        ],
-                        temperature=0.1,
-                        max_tokens=self.SPLIT_MAX_TOKENS,
-                    )
-                finally:
-                    heartbeat_stop.set()
-                    heartbeat_thread.join(timeout=1)
-
-                content = response.choices[0].message.content or ''
-                finish = response.choices[0].finish_reason or 'unknown'
-                # 提取 token 统计（兼容 DeepSeek 原生 + OpenAI 代理层）
-                usage = response.usage
-                token_stats = {}
-                if usage:
-                    hit = getattr(usage, 'prompt_cache_hit_tokens', None)
-                    miss = getattr(usage, 'prompt_cache_miss_tokens', None)
-                    if hit is None:
-                        details = getattr(usage, 'prompt_tokens_details', None)
-                        hit = details.cached_tokens if details else 0
-                        miss = usage.prompt_tokens - hit if usage.prompt_tokens else 0
-                    token_stats = {
-                        'hit_tokens': hit or 0,
-                        'miss_tokens': miss or 0,
-                        'prompt_tokens': usage.prompt_tokens or 0,
-                        'completion_tokens': usage.completion_tokens or 0,
-                    }
-                usage_info = f"prompt={token_stats.get('prompt_tokens', '?')}, completion={token_stats.get('completion_tokens', '?')}" if token_stats else ''
-                print(f"  [LLM分割] finish={finish}, {usage_info}", flush=True)
-                if self.verbose:
-                    preview = content[:500] + ('...' if len(content) > 500 else '')
-                    print(f"  [LLM分割] 响应预览: {preview}", flush=True)
-                    if len(content) > 500:
-                        print(f"  [LLM分割] ...末尾: {content[-200:]}", flush=True)
-                result = self._parse_response(content, track_names, original_lines=original_lines)
-                if result:
-                    total_lines = sum(len(v) for v in result.values())
-                    matched = sum(1 for v in result.values() if v)
-                    print(f"  [LLM分割] 成功: {matched}/{len(track_names)} 个音轨有内容, 共 {total_lines} 行台词", flush=True)
-                    return result, token_stats
-
-            except Exception as e:
-                last_error = e
-                if self.verbose:
-                    print(f"  [台本分割V3] 尝试 {attempt+1}/{max_retries} 失败: {e}")
-                if attempt < max_retries - 1:
-                    _time_mod.sleep(2 ** attempt)
+        _model = self._api.current_model
+        content = response.choices[0].message.content or ''
+        finish = response.choices[0].finish_reason or 'unknown'
+        token_stats = APIClient.extract_token_stats(response.usage)
+        usage_info = f"prompt={token_stats.get('prompt_tokens', '?')}, completion={token_stats.get('completion_tokens', '?')}"
+        print(f"  [LLM分割] finish={finish}, {usage_info}", flush=True)
+        if self.verbose:
+            preview = content[:500] + ('...' if len(content) > 500 else '')
+            print(f"  [LLM分割] 响应预览: {preview}", flush=True)
+            if len(content) > 500:
+                print(f"  [LLM分割] ...末尾: {content[-200:]}", flush=True)
+        result = self._parse_response(content, track_names, original_lines=original_lines)
+        if result:
+            total_lines = sum(len(v) for v in result.values())
+            matched = sum(1 for v in result.values() if v)
+            print(f"  [LLM分割] 成功: {matched}/{len(track_names)} 个音轨有内容, 共 {total_lines} 行台词", flush=True)
+            return result, token_stats
 
         if self.verbose:
-            print(f"  [台本分割V3] 全部尝试失败: {last_error}")
+            print(f"  [台本分割V3] 解析失败（模型 {_model}）")
         return {}, {}
 
     # ═════════════════════════════════════════════════════════
@@ -545,40 +494,35 @@ class ScriptbookSplitter:
         if self.verbose:
             print(f"  [预分割清洗] {len(active_files)} 个文件, prompt {len(user_prompt)} 字符")
 
-        self._ensure_client()
+        try:
+            response = self._api.chat(
+                messages=[
+                    {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': user_prompt},
+                ],
+                max_tokens=self.SPLIT_MAX_TOKENS,
+                temperature=0.1,
+                max_retries=max_retries,
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"  [预分割清洗] 全部尝试失败: {e}")
+            return {}
 
-        last_error = None
-        for attempt in range(max_retries):
-            try:
-                response = self._client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
-                        {'role': 'user', 'content': user_prompt},
-                    ],
-                    temperature=0.1,
-                    max_tokens=self.SPLIT_MAX_TOKENS,
-                )
-                content = response.choices[0].message.content or ''
-                result = self._parse_response(content, list(active_files.keys()))
-                if result:
-                    # 补全缺失的音轨
-                    for name in track_files:
-                        if name not in result:
-                            result[name] = []
-                    if self.verbose:
-                        total_lines = sum(len(v) for v in result.values())
-                        print(f"  [预分割清洗] 成功: {len(result)} 个音轨, 共 {total_lines} 行台词")
-                    return result
-            except Exception as e:
-                last_error = e
-                if self.verbose:
-                    print(f"  [预分割清洗] 尝试 {attempt+1}/{max_retries} 失败: {e}")
-                if attempt < max_retries - 1:
-                    _time_mod.sleep(2 ** attempt)
+        content = response.choices[0].message.content or ''
+        result = self._parse_response(content, list(active_files.keys()))
+        if result:
+            # 补全缺失的音轨
+            for name in track_files:
+                if name not in result:
+                    result[name] = []
+            if self.verbose:
+                total_lines = sum(len(v) for v in result.values())
+                print(f"  [预分割清洗] 成功: {len(result)} 个音轨, 共 {total_lines} 行台词")
+            return result
 
         if self.verbose:
-            print(f"  [预分割清洗] 全部尝试失败: {last_error}")
+            print(f"  [预分割清洗] 解析失败（模型 {self._api.current_model}）")
         return {}
 
     @staticmethod

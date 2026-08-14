@@ -126,12 +126,11 @@ class OpenAICompatEngine:
         """
         self.config = config
         self.verbose = verbose
-        self._client = None
         self._system_prompt_file = system_prompt_file
         self._last_raw_response = ''
-        # 供应商识别：仅 DeepSeek 原生接口额外发送 thinking extra_body；
-        # 其余 OpenAI 兼容服务一律用通用参数，避免请求被拒
-        self._is_deepseek = 'deepseek' in (config.get('base_url') or '').lower()
+        # 统一 API 调用层：模型轮换 / 参数剔除 / 重试逻辑全部内聚在 APIClient
+        from engines.api_client import APIClient
+        self._api = APIClient(config, verbose=verbose)
         # 定价：优先使用传入的 pricing，其次从 config 读取
         if pricing:
             self.pricing = pricing
@@ -152,30 +151,6 @@ class OpenAICompatEngine:
                     self._external_system_prompt = sp_path.read_text(encoding='utf-8')
         except Exception:
             pass
-
-    def _ensure_client(self):
-        """延迟初始化 OpenAI 客户端"""
-        if self._client is not None:
-            return
-        from openai import OpenAI
-        import os as _os
-        # 先清理代理环境变量，再创建客户端（避免 httpx 读取代理配置）
-        for _k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
-            _os.environ.pop(_k, None)
-        _os.environ['NO_PROXY'] = '*'
-        # 兼容 config.json 的 "key" 和旧版 "api_key" 字段名
-        api_key = self.config.get('key') or self.config.get('api_key', 'sk-no-key')
-        base_url = self.config.get('base_url', 'http://localhost:8000/v1')
-        timeout = self.config.get('timeout', 120)
-        if self.verbose:
-            print(f"  [API初始化] base_url={base_url}, timeout={timeout}s, key={api_key[:12]}...")
-        self._client = OpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            timeout=timeout,
-            # 禁用代理，避免系统代理干扰 API 直连
-            http_client=None,
-        )
 
     # ---------- Prompt 构建 ----------
 
@@ -391,22 +366,6 @@ class OpenAICompatEngine:
 
     # ---------- 单轮 API 调用 ----------
 
-    @staticmethod
-    def _looks_like_unsupported_param(e: Exception) -> bool:
-        """判断错误是否源于「服务不支持某请求参数」（应剔除可选参数后重试）
-
-        适配各种 OpenAI 兼容网关：按状态码（400/422）或错误消息关键词识别。
-        """
-        status = getattr(e, 'status_code', None)
-        if status in (400, 422):
-            return True
-        msg = str(e).lower()
-        for kw in ('unknown', 'unsupported', 'not support', 'unexpected', 'unrecognized',
-                   'invalid argument', 'extra_input', 'bad_request', 'parameter'):
-            if kw in msg:
-                return True
-        return False
-
     def call_api(
         self,
         system_prompt: str,
@@ -416,29 +375,28 @@ class OpenAICompatEngine:
         override_gen_params: dict | None = None,
     ) -> tuple[str, dict]:
         """
-        调用 API 并返回结果 + token 统计
+        调用 API 并返回结果 + token 统计（委托统一 APIClient，自带模型轮换/重试/参数剔除）
 
         参数:
             system_prompt: 系统提示词
             user_prompt: 用户提示词
-            max_retries: 最大重试次数
+            max_retries: 每个模型的最大重试次数
             override_gen_params: 覆盖全局 generation_params 的参数（仅对本次调用生效）
 
         返回:
             (response_text, token_stats)
-                token_stats: {hit_tokens, miss_tokens, completion_tokens}
+                token_stats: {hit_tokens, miss_tokens, completion_tokens, prompt_tokens}
         """
-        self._ensure_client()
+        from engines.api_client import APIClient
 
+        # 合并 generation_params（调用方 override 优先）
         gen_params = dict(self.config.get('generation_params', {}))
         if override_gen_params:
             gen_params.update(override_gen_params)
-        last_error = None
 
         # DEBUG: 只打印待翻译的日文原文（跳过格式说明和台本参考）
         if self.verbose:
             lines = user_prompt.split('\n')
-            # 找到 <asr> 标签中的实际待翻译内容
             content_start = 0
             for i, l in enumerate(lines):
                 if '<asr>' in l or '<!-- 请翻译以下内容 -->' in l:
@@ -448,122 +406,49 @@ class OpenAICompatEngine:
                 actual = '\n'.join(lines[content_start:content_start + 15])
                 print(f"  [DEBUG] 待翻译日文(前15行):\n{actual}", flush=True)
             else:
-                # 回退：只打印后15行（跳过格式说明部分）
                 actual = '\n'.join(lines[-15:])
                 print(f"  [DEBUG] 待翻译内容(后15行):\n{actual}", flush=True)
 
-        # 部分 OpenAI 兼容服务不接受 reasoning_effort / top_k 等扩展参数，
-        # 首次被拒后自动剔除这些参数重试，保证任意 OpenAI 格式端点可用。
-        _OPTIONAL_PARAMS = ('reasoning_effort', 'top_k')
-        _stripped_optional = False
+        # 翻译使用大 max_tokens，避免输出截断
+        # 优先读 max_tokens_translate（专用），其次 max_tokens（通用），再 fallback 131072
+        _tok = gen_params.get('max_tokens_translate',
+               gen_params.get('max_tokens', 131072))
+        # 兜底：翻译至少需要 16384 token（140 行 JSON 约需 6000-12000 token）
+        if _tok < 16384:
+            _tok = 131072
 
-        for attempt in range(max_retries):
-            try:
-                # 只保留 OpenAI 兼容 API 可接受的参数
-                _allowed = ('temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty',
-                           'stop', 'logit_bias', 'user', 'reasoning_effort')
-                _filtered = {k: v for k, v in gen_params.items() if k in _allowed}
-                # 翻译使用大 max_tokens，避免输出截断
-                # 优先读 max_tokens_translate（专用），其次 max_tokens（通用），再 fallback 131072
-                _tok = gen_params.get('max_tokens_translate',
-                       gen_params.get('max_tokens', 131072))
-                # 兜底：翻译至少需要 16384 token（140 行 JSON 约需 6000-12000 token）
-                if _tok < 16384:
-                    _tok = 131072
-                _filtered['max_tokens'] = _tok
-                # 曾因参数不被支持被拒 → 剔除可选参数重试
-                if _stripped_optional:
-                    for _k in _OPTIONAL_PARAMS:
-                        _filtered.pop(_k, None)
+        response = self._api.chat(
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            max_tokens=_tok,
+            temperature=gen_params.get('temperature'),
+            top_p=gen_params.get('top_p'),
+            reasoning_effort=gen_params.get('reasoning_effort'),
+            max_retries=max_retries,
+        )
 
-                # 心跳线程：长请求时打印等待进度
-                import threading
-                heartbeat_stop = threading.Event()
-                heartbeat_count = [0]
+        msg = response.choices[0].message
+        content = APIClient.extract_content(msg)
+        if self.verbose and not msg.content and content:
+            print(f"  [API] content 为空, 使用 reasoning_content ({len(content)} 字符)", flush=True)
 
-                def _print_heartbeat():
-                    while not heartbeat_stop.is_set():
-                        heartbeat_stop.wait(10)
-                        if not heartbeat_stop.is_set():
-                            heartbeat_count[0] += 10
-                            print(f"    [等待] 已等待 {heartbeat_count[0]} 秒...", flush=True)
+        # DEBUG: 尝试提取翻译结果供预览
+        if self.verbose:
+            parsed = self._extract_json_array(content)
+            if parsed:
+                preview = []
+                for i, t in enumerate(parsed[:10]):
+                    preview.append(f"  [{i+1}] {t}")
+                print(f"  [DEBUG] 译文预览(前10行):\n" + '\n'.join(preview), flush=True)
+            else:
+                resp_preview = '\n'.join(content.split('\n')[:5])
+                print(f"  [DEBUG] 返回内容(前5行):\n{resp_preview}", flush=True)
 
-                heartbeat_thread = threading.Thread(target=_print_heartbeat, daemon=True)
-                heartbeat_thread.start()
-
-                try:
-                    # 思考模式 extra_body：仅 DeepSeek 原生接口使用（其余服务可能拒绝）
-                    # 其他 OpenAI 兼容服务走通用参数即可，无需 extra_body
-                    _extra = {}
-                    if (not _stripped_optional and self._is_deepseek
-                            and 'reasoning_effort' in _filtered):
-                        _extra = {'thinking': {'type': 'enabled'}}
-                    response = self._client.chat.completions.create(
-                        model=self.config.get('model', 'gpt-4o-mini'),
-                        messages=[
-                            {'role': 'system', 'content': system_prompt},
-                            {'role': 'user', 'content': user_prompt},
-                        ],
-                        extra_body=_extra if _extra else None,
-                        **_filtered,
-                    )
-                finally:
-                    heartbeat_stop.set()
-                    heartbeat_thread.join(timeout=1)
-
-                msg = response.choices[0].message
-                content = msg.content or ''
-                # DeepSeek V4 reasoning: content 为空时回退到 reasoning_content
-                if not content and hasattr(msg, 'reasoning_content') and msg.reasoning_content:
-                    if self.verbose:
-                        print(f"  [API] content 为空, 使用 reasoning_content ({len(msg.reasoning_content)} 字符)")
-                    content = msg.reasoning_content
-
-                # DEBUG: 尝试提取翻译结果供预览
-                if self.verbose:
-                    parsed = self._extract_json_array(content)
-                    if parsed:
-                        preview = []
-                        for i, t in enumerate(parsed[:10]):
-                            preview.append(f"  [{i+1}] {t}")
-                        print(f"  [DEBUG] 译文预览(前10行):\n" + '\n'.join(preview), flush=True)
-                    else:
-                        resp_preview = '\n'.join(content.split('\n')[:5])
-                        print(f"  [DEBUG] 返回内容(前5行):\n{resp_preview}", flush=True)
-
-                # 提取 token 统计
-                # DeepSeek 原生: usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
-                # OpenAI 代理层: usage.prompt_tokens_details.cached_tokens
-                usage = response.usage
-                hit = getattr(usage, 'prompt_cache_hit_tokens', None)
-                miss = getattr(usage, 'prompt_cache_miss_tokens', None)
-                if hit is None:
-                    details = getattr(usage, 'prompt_tokens_details', None)
-                    hit = details.cached_tokens if details else 0
-                    miss = usage.prompt_tokens - hit if usage.prompt_tokens else 0
-
-                self._last_raw_response = content
-                return content, {
-                    'hit_tokens': hit,
-                    'miss_tokens': miss,
-                    'completion_tokens': usage.completion_tokens or 0,
-                    'prompt_tokens': usage.prompt_tokens or 0,
-                }
-
-            except Exception as e:
-                last_error = e
-                if self.verbose:
-                    print(f"  [API] 尝试 {attempt+1}/{max_retries} 失败: {type(e).__name__}: {e}")
-                # 服务拒绝某参数（400/422 或提示未知参数）→ 剔除可选参数后立即重试
-                if not _stripped_optional and OpenAICompatEngine._looks_like_unsupported_param(e):
-                    _stripped_optional = True
-                    if self.verbose:
-                        print("  [API] 服务可能不支持 reasoning_effort/top_k/thinking，自动剔除后重试")
-                    continue
-                if attempt < max_retries - 1:
-                    _time_mod.sleep(2 ** attempt)  # 指数退避
-
-        raise RuntimeError(f"API 调用失败（{max_retries}次重试后）: {last_error}")
+        token_stats = APIClient.extract_token_stats(response.usage)
+        self._last_raw_response = content
+        return content, token_stats
 
     # ---------- JSON 翻译结果解析 ----------
 

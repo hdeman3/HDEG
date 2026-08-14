@@ -352,64 +352,37 @@ def _llm_identify_scriptbook_files(
 
     try:
         import json as _json
-        from openai import OpenAI
+        from engines.api_client import APIClient
 
         api_cfg = ctx.api_cfg
         api_key = api_cfg.get('key') or api_cfg.get('api_key', '')
-        base_url = api_cfg.get('base_url', 'https://api.deepseek.com')
-        model = api_cfg.get('model', 'deepseek-v4-flash')
-        # config.json 中的 timeout 字段可能为毫秒或秒；OpenAI 客户端需要秒
-        raw_timeout = api_cfg.get('timeout', 60)
-        if raw_timeout > 300:
-            # 如果值很大（如 2000），很可能是毫秒配置，转换为秒
-            timeout = max(raw_timeout / 1000.0, 30.0)
-        elif raw_timeout < 5:
-            # 如果值太小（如 2），也按秒处理但至少给 30 秒
-            timeout = 30.0
-        else:
-            timeout = float(raw_timeout)
 
         if not api_key:
             _log("  [台本·LLM] 未配置 API Key，回退到正则识别")
             return []  # 失败 → 回退正则
 
-        _log(f"  [台本·LLM] 发送 {len(candidates)} 个备选文件给 LLM 识别 (model={model}, timeout={timeout}s)")
+        _log(f"  [台本·LLM] 发送 {len(candidates)} 个备选文件给 LLM 识别 (model={api_cfg.get('model', 'N/A')})")
 
-        # 清理代理环境变量（避免 httpx 走代理导致连接失败）
-        import os as _os
-        for _k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
-            _os.environ.pop(_k, None)
-        _os.environ['NO_PROXY'] = '*'
-
-        client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
-        response = client.chat.completions.create(
-            model=model,
+        # 统一走 APIClient：模型轮换 / 重试 / 参数剔除全部内聚，此处无需关心
+        _api = APIClient(api_cfg, verbose=ctx.pr.debug)
+        response = _api.chat(
             messages=[
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': user_prompt},
             ],
-            temperature=0.1,
             max_tokens=4096,  # 足够容纳 JSON + reasoning，500 容易截断
+            temperature=0.1,
+            max_retries=3,
         )
+        # 同步局部变量（供后续日志/诊断）
+        model = api_cfg.get('model', 'deepseek-v4-flash')
 
         content = response.choices[0].message.content or ''
         _debug(f"[台本·LLM] 响应: {content[:300]}")
 
         # 统一 token 追踪：记录台本识别 LLM 调用
-        _usage = response.usage
-        if _usage:
-            _hit = getattr(_usage, 'prompt_cache_hit_tokens', None)
-            _miss = getattr(_usage, 'prompt_cache_miss_tokens', None)
-            if _hit is None:
-                _details = getattr(_usage, 'prompt_tokens_details', None)
-                _hit = _details.cached_tokens if _details else 0
-                _miss = _usage.prompt_tokens - _hit if _usage.prompt_tokens else 0
-            _token_stats = {
-                'hit_tokens': _hit or 0,
-                'miss_tokens': _miss or 0,
-                'prompt_tokens': _usage.prompt_tokens or 0,
-                'completion_tokens': _usage.completion_tokens or 0,
-            }
+        _token_stats = APIClient.extract_token_stats(response.usage)
+        if _token_stats.get('prompt_tokens') or _token_stats.get('completion_tokens'):
             _sb_cost = ctx.tracker.compute_cost(
                 _token_stats['hit_tokens'],
                 _token_stats['miss_tokens'],
@@ -1833,6 +1806,9 @@ def run_pipeline(
     gen_params = api_cfg.get('generation_params', {})
     _log("[API 配置]")
     _log(f"  模型: {api_cfg.get('model', 'N/A')}")
+    _fb = api_cfg.get('fallback_models') or []
+    if _fb:
+        _log(f"  备用模型链: {' → '.join([api_cfg.get('model', '')] + list(_fb))}（配额耗尽时自动轮换）")
     _log(f"  Base URL: {api_cfg.get('base_url', 'N/A')}")
     _log(f"  Timeout: {api_cfg.get('timeout', 'N/A')}s")
     _log(f"  temperature: {gen_params.get('temperature', 'N/A')}")

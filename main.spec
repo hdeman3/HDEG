@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
 datas = [('D:\\anaconda_2022\\lib\\site-packages\\fugashi.libs\\.load-order-fugashi-1.5.2', 'fugashi.libs'), ('D:\\anaconda_2022\\lib\\site-packages\\pyopenjtalk\\open_jtalk_dic_utf_8-1.11', 'pyopenjtalk/open_jtalk_dic_utf_8-1.11')]
@@ -12,9 +13,16 @@ datas += collect_data_files('pypdf')
 datas += collect_data_files('pdf2docx')
 datas += collect_data_files('docx')
 datas += collect_data_files('cv2')
+hiddenimports += collect_submodules('pkg_resources')
 tmp_ret = collect_all('fugashi')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('pyopenjtalk')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('jaraco')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('more_itertools')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('zipp')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

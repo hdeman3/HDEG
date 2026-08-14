@@ -136,6 +136,7 @@ cp config.example.json config.json
 
 - `api.key` — 填入你的 OpenAI 兼容 API Key
 - `api.base_url` / `api.model` — API 地址与模型名（默认 DeepSeek，可换任意 OpenAI 兼容服务；翻译与台本分割共用同一模型）
+- `api.fallback_models` — 备用模型链（数组）。主模型在翻译过程中用量/配额耗尽时，自动切换到链中下一个模型继续执行，无需人工干预；切换后回写 `api.model`，整条流水线（翻译/台本分割/台本识别/世界观/术语）自动跟随
 - `transcription.infer_exe` — 转录程序路径
 - `app.delay_translate_to_offpeak` — 转录完成后延迟翻译到空闲时段执行（峰谷定价：高峰 09:00–12:00、14:00–18:00 北京时间，其余空闲，空闲价 = 高峰价 50%）。`true` 时若转录完成正处高峰，程序会倒计时等待到空闲再自动翻译
 

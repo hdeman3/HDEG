@@ -378,7 +378,9 @@ def _analyze_pdf_layout(all_chars: list[dict], api_config: dict) -> dict:
         _os.environ['NO_PROXY'] = '*'
 
         raw_timeout = api_config.get('timeout', 60)
-        timeout = max(raw_timeout / 1000.0, 30.0) if raw_timeout > 300 else (30.0 if raw_timeout < 5 else float(raw_timeout))
+        # config.json 的 timeout 单位是秒（如 2000 = 2000 秒），直接按秒用，
+        # 不做毫秒猜测，避免长文本解析被 30 秒钳住导致超时
+        timeout = float(raw_timeout) if raw_timeout >= 30 else 120.0
         api_key = api_config.get('key') or api_config.get('api_key', '')
         base_url = api_config.get('base_url', 'https://api.deepseek.com')
 

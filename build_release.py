@@ -129,6 +129,13 @@ def run_pyinstaller():
         "--collect-data", "docx",  # python-docx
         # 收集 OpenCV（延迟导入需要显式收集）
         "--collect-data", "cv2",
+        # pkg_resources 运行时钩子需要 jaraco / more_itertools / zipp（新版 setuptools 拆分出的子包）。
+        # 上方已 --exclude-module setuptools，但这些子包必须显式收集，否则
+        # PyInstaller 的 pyi_rth_pkgres.py 运行时会报 ImportError: The 'jaraco' package is required
+        "--collect-all", "jaraco",
+        "--collect-all", "more_itertools",
+        "--collect-all", "zipp",
+        "--collect-submodules", "pkg_resources",
     ]
     
     # 添加 fugashi.libs 目录中的所有文件（DLL 和 .load-order 文件）

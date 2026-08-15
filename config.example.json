@@ -8,7 +8,7 @@
     "generation_params": {
       "temperature": 1,
       "top_p": 0.9,
-      "max_tokens": 131072,
+      "max_tokens": 262144,
       "reasoning_effort": "high"
     }
   },

@@ -433,12 +433,12 @@ class OpenAICompatEngine:
                 _p(f"  [DEBUG] 待翻译内容(后15行):\n{actual}", flush=True)
 
         # 翻译使用大 max_tokens，避免输出截断
-        # 优先读 max_tokens_translate（专用），其次 max_tokens（通用），再 fallback 131072
+        # 优先读 max_tokens_translate（专用），其次 max_tokens（通用），再 fallback 262144
         _tok = gen_params.get('max_tokens_translate',
-               gen_params.get('max_tokens', 131072))
+               gen_params.get('max_tokens', 262144))
         # 兜底：翻译至少需要 16384 token（140 行 JSON 约需 6000-12000 token）
         if _tok < 16384:
-            _tok = 131072
+            _tok = 262144
 
         response = self._api.chat(
             messages=[
@@ -928,6 +928,35 @@ class OpenAICompatEngine:
         call_elapsed = _time_mod.time() - call_start
 
         original_lines, translated_lines = self.parse_json_translation(lines, translated_text)
+
+        # 修复：模型偶尔跑偏输出非 JSON（英文注释/逐行说明），导致解析全空。
+        # 此时自动重试一次，去掉 reasoning_effort 强制模型按 JSON 格式正常输出。
+        _all_empty = len(translated_lines) > 0 and all(not (t or '').strip() for t in translated_lines)
+        if _all_empty:
+            if self.verbose:
+                _p("  [翻译] 首次解析全空（模型可能未按 JSON 输出），去除 reasoning_effort 重试一次", flush=True)
+            _retry_start = _time_mod.time()
+            try:
+                translated_text2, token_stats2 = self.call_api(
+                    system_prompt, user_prompt,
+                    override_gen_params={'reasoning_effort': None},
+                )
+                _call_elapsed2 = _time_mod.time() - _retry_start
+                original_lines2, translated_lines2 = self.parse_json_translation(lines, translated_text2)
+                _retry_nonempty = len(translated_lines2) > 0 and any((t or '').strip() for t in translated_lines2)
+                if _retry_nonempty:
+                    original_lines, translated_lines = original_lines2, translated_lines2
+                    translated_text = translated_text2
+                    token_stats = token_stats2
+                    call_elapsed = call_elapsed2
+                    if self.verbose:
+                        _p(f"  [翻译] 重试成功（用时 {_call_elapsed2:.1f}s）", flush=True)
+                else:
+                    if self.verbose:
+                        _p("  [翻译] 重试仍全空，放弃", flush=True)
+            except Exception as _re:
+                if self.verbose:
+                    _p(f"  [翻译] 重试失败: {_re}", flush=True)
 
         hit = token_stats['hit_tokens']
         miss = token_stats['miss_tokens']

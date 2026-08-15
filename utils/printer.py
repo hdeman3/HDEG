@@ -2,7 +2,7 @@
 """
 统一分级输出工具
 
-项目中唯一的 print() 入口。所有输出统一经过 Printer 实例。
+项目中唯一的 self._logp() 入口。所有输出统一经过 Printer 实例。
 
 层级规范:
   section()   ===== 标题 =====           (顶级分隔)
@@ -30,58 +30,75 @@ class Printer:
     def __init__(self, debug: bool = False):
         self.debug_enabled = debug
 
+    def _logp(self, *args, **kwargs):
+        """带 worker 前缀的 print：worker 线程日志自动加 [W{n}] 前缀，与 _log/_p 一致。"""
+        try:
+            from engines.api_client import log_prefix
+            prefix = log_prefix()
+        except Exception:
+            prefix = ''
+        if prefix and args and isinstance(args[0], str):
+            s = args[0]
+            idx = 0
+            while idx < len(s) and s[idx] == '\n':
+                idx += 1
+            args = (s[:idx] + prefix + s[idx:],) + args[1:]
+        elif prefix:
+            args = (prefix,) + args
+        print(*args, **kwargs)
+
     # ── 顶级结构 ──
 
     def section(self, title: str) -> None:
         """===== 顶级标题 ====="""
         self.blank()
-        print(f"{'='*60}", flush=True)
-        print(f"  {title}", flush=True)
-        print(f"{'='*60}", flush=True)
+        self._logp(f"{'='*60}", flush=True)
+        self._logp(f"  {title}", flush=True)
+        self._logp(f"{'='*60}", flush=True)
 
     def step(self, num: int | str, title: str) -> None:
         """----- 第 N 步: xxx -----"""
         self.blank()
-        print(f"{'-'*60}", flush=True)
-        print(f"  第 {num} 步: {title}", flush=True)
-        print(f"{'-'*60}", flush=True)
+        self._logp(f"{'-'*60}", flush=True)
+        self._logp(f"  第 {num} 步: {title}", flush=True)
+        self._logp(f"{'-'*60}", flush=True)
 
     # ── 用户可见信息 ──
 
     def info(self, msg: str) -> None:
         """普通信息（2空格缩进）"""
-        print(f"  {msg}", flush=True)
+        self._logp(f"  {msg}", flush=True)
 
     def detail(self, msg: str) -> None:
         """子信息（4空格缩进）"""
-        print(f"    {msg}", flush=True)
+        self._logp(f"    {msg}", flush=True)
 
     def fine(self, msg: str) -> None:
         """最细粒度（6空格缩进，token 行等）"""
-        print(f"      {msg}", flush=True)
+        self._logp(f"      {msg}", flush=True)
 
     def ok(self, msg: str = "") -> None:
         """成功"""
         if msg:
-            print(f"    OK  {msg}", flush=True)
+            self._logp(f"    OK  {msg}", flush=True)
         else:
-            print(f"  OK", flush=True)
+            self._logp(f"  OK", flush=True)
 
     def warn(self, msg: str) -> None:
         """警告"""
-        print(f"  WARN  {msg}", flush=True)
+        self._logp(f"  WARN  {msg}", flush=True)
 
     def error(self, msg: str) -> None:
         """错误"""
-        print(f"  ERROR  {msg}", flush=True)
+        self._logp(f"  ERROR  {msg}", flush=True)
 
     def hr(self) -> None:
         """分隔线"""
-        print(f"  {'-'*56}", flush=True)
+        self._logp(f"  {'-'*56}", flush=True)
 
     def blank(self) -> None:
         """空行"""
-        print(flush=True)
+        self._logp(flush=True)
 
     # ── Token 用量（始终输出）──
 
@@ -234,7 +251,7 @@ class Printer:
     def debug(self, msg: str) -> None:
         """调试信息"""
         if self.debug_enabled:
-            print(f"    [DEBUG] {msg}", flush=True)
+            self._logp(f"    [DEBUG] {msg}", flush=True)
 
     def debug_llm_response(self, text: str, max_chars: int = 300) -> None:
         """LLM 原始响应预览"""
@@ -242,7 +259,7 @@ class Printer:
             return
         preview = text[:max_chars]
         suffix = '...' if len(text) > max_chars else ''
-        print(f"    [DEBUG-LLM] ({len(text)}字符) {preview}{suffix}", flush=True)
+        self._logp(f"    [DEBUG-LLM] ({len(text)}字符) {preview}{suffix}", flush=True)
 
     def debug_json_parse(self, success: bool, parsed_count: int, input_count: int,
                          non_empty: int = 0) -> None:
@@ -250,6 +267,6 @@ class Printer:
         if not self.debug_enabled:
             return
         if success:
-            print(f"    [DEBUG-JSON] 解析成功: {parsed_count}条, 非空{non_empty}条 (输入{input_count}行)", flush=True)
+            self._logp(f"    [DEBUG-JSON] 解析成功: {parsed_count}条, 非空{non_empty}条 (输入{input_count}行)", flush=True)
         else:
-            print(f"    [DEBUG-JSON] 解析失败 (输入{input_count}行)", flush=True)
+            self._logp(f"    [DEBUG-JSON] 解析失败 (输入{input_count}行)", flush=True)

@@ -14,6 +14,27 @@ from typing import Protocol, TypedDict
 SB_MIN_CONF = 0.3
 
 
+
+
+def _p(*args, **kwargs):
+    """带 worker 前缀的 print：worker 线程日志自动加 [W{n}] 前缀，便于前端分 tab"""
+    try:
+        from engines.api_client import log_prefix
+        prefix = log_prefix()
+    except Exception:
+        prefix = ''
+    if prefix and args and isinstance(args[0], str):
+        s = args[0]
+        # 前缀加在消息实际内容行首（跳过开头的空行）
+        idx = 0
+        while idx < len(s) and s[idx] == '\n':
+            idx += 1
+        args = (s[:idx] + prefix + s[idx:],) + args[1:]
+    elif prefix:
+        args = (prefix,) + args
+    print(*args, **kwargs)
+
+
 # ==================== 翻译结果类型 ====================
 
 class TranslationResult(TypedDict, total=False):
@@ -404,10 +425,10 @@ class OpenAICompatEngine:
                     break
             if content_start > 0:
                 actual = '\n'.join(lines[content_start:content_start + 15])
-                print(f"  [DEBUG] 待翻译日文(前15行):\n{actual}", flush=True)
+                _p(f"  [DEBUG] 待翻译日文(前15行):\n{actual}", flush=True)
             else:
                 actual = '\n'.join(lines[-15:])
-                print(f"  [DEBUG] 待翻译内容(后15行):\n{actual}", flush=True)
+                _p(f"  [DEBUG] 待翻译内容(后15行):\n{actual}", flush=True)
 
         # 翻译使用大 max_tokens，避免输出截断
         # 优先读 max_tokens_translate（专用），其次 max_tokens（通用），再 fallback 131072
@@ -432,7 +453,7 @@ class OpenAICompatEngine:
         msg = response.choices[0].message
         content = APIClient.extract_content(msg)
         if self.verbose and not msg.content and content:
-            print(f"  [API] content 为空, 使用 reasoning_content ({len(content)} 字符)", flush=True)
+            _p(f"  [API] content 为空, 使用 reasoning_content ({len(content)} 字符)", flush=True)
 
         # DEBUG: 尝试提取翻译结果供预览
         if self.verbose:
@@ -441,10 +462,10 @@ class OpenAICompatEngine:
                 preview = []
                 for i, t in enumerate(parsed[:10]):
                     preview.append(f"  [{i+1}] {t}")
-                print(f"  [DEBUG] 译文预览(前10行):\n" + '\n'.join(preview), flush=True)
+                _p(f"  [DEBUG] 译文预览(前10行):\n" + '\n'.join(preview), flush=True)
             else:
                 resp_preview = '\n'.join(content.split('\n')[:5])
-                print(f"  [DEBUG] 返回内容(前5行):\n{resp_preview}", flush=True)
+                _p(f"  [DEBUG] 返回内容(前5行):\n{resp_preview}", flush=True)
 
         token_stats = APIClient.extract_token_stats(response.usage)
         self._last_raw_response = content
@@ -792,10 +813,10 @@ class OpenAICompatEngine:
             parsed_count = len(json_result)
             non_empty = sum(1 for x in json_result if x and x.strip())
             if self.verbose:
-                print(f"  [JSON解析] 成功: {parsed_count}条, 非空{non_empty}条 (输入{n_input}行)")
+                _p(f"  [JSON解析] 成功: {parsed_count}条, 非空{non_empty}条 (输入{n_input}行)")
                 if non_empty == 0 and parsed_count > 0:
-                    print(f"  [JSON解析] ⚠ 全部为空！LLM原始响应前300字: {translated_text[:300]}")
-                    print(f"  [JSON解析] ⚠ LLM原始响应后200字: {translated_text[-200:]}")
+                    _p(f"  [JSON解析] ⚠ 全部为空！LLM原始响应前300字: {translated_text[:300]}")
+                    _p(f"  [JSON解析] ⚠ LLM原始响应后200字: {translated_text[-200:]}")
 
             # 按索引精确对齐
             translated: list[str] = []
@@ -805,24 +826,24 @@ class OpenAICompatEngine:
                 else:
                     translated.append('')
                     if self.verbose and i == parsed_count:
-                        print(f"  [JSON解析] 翻译行数不足 ({parsed_count} < {n_input}), 第{i+1}行起留空")
+                        _p(f"  [JSON解析] 翻译行数不足 ({parsed_count} < {n_input}), 第{i+1}行起留空")
 
             if parsed_count > n_input and self.verbose:
-                print(f"  [JSON解析] 翻译行数超出 ({parsed_count} > {n_input}), 尾部 {parsed_count - n_input} 行被丢弃")
+                _p(f"  [JSON解析] 翻译行数超出 ({parsed_count} > {n_input}), 尾部 {parsed_count - n_input} 行被丢弃")
 
             return original_lines, translated
 
         # JSON 解析失败 —— 不启用逐行回退，记录错误并返回空
-        print(f"  [JSON解析] 失败！原文{n_input}行全部留空")
-        print(f"  [JSON解析] 响应类型: {type(translated_text).__name__}, 长度: {len(translated_text)}")
-        print(f"  [JSON解析] 响应前100字: {translated_text[:100]}")
-        print(f"  [JSON解析] 响应后100字: {translated_text[-100:]}")
+        _p(f"  [JSON解析] 失败！原文{n_input}行全部留空")
+        _p(f"  [JSON解析] 响应类型: {type(translated_text).__name__}, 长度: {len(translated_text)}")
+        _p(f"  [JSON解析] 响应前100字: {translated_text[:100]}")
+        _p(f"  [JSON解析] 响应后100字: {translated_text[-100:]}")
         # 单独试一下 json.loads 看报什么错
         import json as _json_debug
         try:
             _json_debug.loads(translated_text)
         except Exception as _e:
-            print(f"  [JSON解析] json.loads 报错: {_e}")
+            _p(f"  [JSON解析] json.loads 报错: {_e}")
         return original_lines, [''] * n_input
 
     # ---------- 批量翻译 ----------
@@ -898,7 +919,7 @@ class OpenAICompatEngine:
         )
 
         if self.verbose:
-            print(f"  [翻译] 输入 {len(lines)} 行, prompt {len(user_prompt)} 字符")
+            _p(f"  [翻译] 输入 {len(lines)} 行, prompt {len(user_prompt)} 字符")
 
         call_start = _time_mod.time()
         translated_text, token_stats = self.call_api(system_prompt, user_prompt)
@@ -993,8 +1014,8 @@ class OpenAICompatEngine:
             + full_prompt
         )
 
-        print(f"  [批量翻译] {len(files_data)} 个文件, 总行数: {sum(v for v in expected_counts.values())}", flush=True)
-        print(f"  [批量翻译] 预计耗时较长, timeout={self.config.get('timeout', 2000)}s", flush=True)
+        _p(f"  [批量翻译] {len(files_data)} 个文件, 总行数: {sum(v for v in expected_counts.values())}", flush=True)
+        _p(f"  [批量翻译] 预计耗时较长, timeout={self.config.get('timeout', 2000)}s", flush=True)
 
         translated_text, token_stats = self.call_api(system_prompt, user_prompt)
 
@@ -1028,14 +1049,14 @@ class OpenAICompatEngine:
                     if result:
                         missing = [fd['file_id'] for fd in files_data if fd['file_id'] not in result]
                         if missing and self.verbose:
-                            print(f"    [批量翻译] JSON解析缺少文件: {missing}", flush=True)
+                            _p(f"    [批量翻译] JSON解析缺少文件: {missing}", flush=True)
                         return result
         except Exception as e:
             if self.verbose:
-                print(f"    [批量翻译] JSON解析失败: {e}", flush=True)
+                _p(f"    [批量翻译] JSON解析失败: {e}", flush=True)
 
         # 回退：按文件逐行解析
-        print(f"    [警告] 批量翻译 JSON 解析失败，尝试逐文件解析...", flush=True)
+        _p(f"    [警告] 批量翻译 JSON 解析失败，尝试逐文件解析...", flush=True)
         for fd in files_data:
             file_id = fd['file_id']
             expected = expected_counts.get(file_id, 0)
@@ -1206,7 +1227,7 @@ def filter_asr_hallucination_lines(
         filtered.append(line)
 
     if dropped_count > 0:
-        print(f"  [幻觉过滤] 过滤掉 {dropped_count} 行异常文本（剩余 {len(filtered)} 行）")
+        _p(f"  [幻觉过滤] 过滤掉 {dropped_count} 行异常文本（剩余 {len(filtered)} 行）")
 
     return filtered
 

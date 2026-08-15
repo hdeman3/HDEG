@@ -13,6 +13,19 @@
 
 from __future__ import annotations
 import time as _time_mod
+import threading as _threading_mod
+
+
+# 并行 worker 线程局部变量：worker 线程设置 _worker_id（如 0,1,2...），
+# 该线程内所有日志（含 APIClient 心跳）据此加 [W{n}] 前缀，
+# 便于前端按线程分 tab 查看、后端区分主线程与 worker 日志。
+worker_local = _threading_mod.local()
+
+
+def log_prefix() -> str:
+    """当前线程的 worker 前缀（主线程返回空串）"""
+    wid = getattr(worker_local, '_worker_id', None)
+    return f"[W{wid}] " if wid is not None else ''
 
 
 # OpenAI 兼容 API 可接受的生成参数白名单
@@ -198,7 +211,7 @@ class APIClient:
                 heartbeat_stop.wait(10)
                 if not heartbeat_stop.is_set():
                     secs = int(_time_mod.monotonic() - _hb_start)
-                    print(f"    [等待] 已等待 {secs} 秒...", flush=True)
+                    print(f"{log_prefix()}    [等待] 已等待 {secs} 秒...", flush=True)
 
         heartbeat_thread = threading.Thread(target=_print_heartbeat, daemon=True)
         heartbeat_thread.start()

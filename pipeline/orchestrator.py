@@ -2262,6 +2262,7 @@ def run_pipeline(
                         with ctx.thread_lock:
                             events = ctx.progress_events
                             ctx.progress_events = []
+                        _track_total = len(lrc_files)
                         for ev in events:
                             _wk = f"W{ev['worker']}" if ev['worker'] is not None else '?'
                             if ev['status'] == '翻译中':
@@ -2269,8 +2270,13 @@ def run_pipeline(
                             elif ev['status'] == '完成':
                                 _et = f"（{ev['elapsed']:.1f}s）" if ev['elapsed'] is not None else ''
                                 _log(f"  [并行] {_wk} ✔ {ev['label']}: {ev['detail']}{_et}")
+                                # 完成数 = 已完成 + 已跳过（供后端进度条百分比）
+                                _done_track = ctx.stats.get('translated', 0) + ctx.stats.get('skipped', 0)
+                                _log(f"  [并行进度] 音轨 {_done_track}/{_track_total}")
                             elif ev['status'] == '失败':
                                 _log(f"  [并行] {_wk} ✗ {ev['label']}: {ev['detail']}")
+                                _done_track = ctx.stats.get('translated', 0) + ctx.stats.get('skipped', 0)
+                                _log(f"  [并行进度] 音轨 {_done_track}/{_track_total}")
                     _progress_stop.wait(0.2)
 
             _progress_thread = threading.Thread(target=_print_progress_line, daemon=True)

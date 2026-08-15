@@ -205,8 +205,13 @@ class APIClient:
         import threading
         heartbeat_stop = threading.Event()
         _hb_start = _time_mod.monotonic()
+        # 心跳线程是独立线程，threading.local 不继承父线程的 worker_id；
+        # 这里捕获父线程（当前调用线程）的 worker_id，心跳线程内设置，使 [等待] 日志带正确前缀。
+        _hb_worker_id = getattr(worker_local, '_worker_id', None)
 
         def _print_heartbeat():
+            if _hb_worker_id is not None:
+                worker_local._worker_id = _hb_worker_id
             while not heartbeat_stop.is_set():
                 heartbeat_stop.wait(10)
                 if not heartbeat_stop.is_set():

@@ -65,13 +65,24 @@ _pr: Printer | None = None
 # 进度行状态：并行模式下用 \r 更新单行进度，普通日志前需先换行结束进度行
 _progress_active = False
 
+# 并行 worker 线程局部：worker 线程在此设置 _worker_id（如 0,1,2...），_log 据此加 [W{n}] 前缀，
+# 便于后端区分主线程日志（前端显示）与 worker 详细日志（仅后台记录）
+_worker_local = threading.local()
+
 
 def _log(msg: str = "", *, flush: bool = True):
-    """输出日志并立即刷新 stdout。通过模块级 _pr 统一格式。"""
+    """输出日志并立即刷新 stdout。通过模块级 _pr 统一格式。
+
+    worker 线程（并行翻译的子线程）日志自动加 [W{n}] 前缀；
+    主线程日志不加前缀。前端只显示主线程日志，worker 详细日志由后端写入日志文件但不推前端。
+    """
     global _progress_active
     if _progress_active:
         print()  # 结束当前进度行（进度行用 \r 覆盖，无换行）
         _progress_active = False
+    wid = getattr(_worker_local, '_worker_id', None)
+    if wid is not None:
+        msg = f"[W{wid}] {msg}"
     print(msg, flush=flush)
     sys.stderr.flush()
 
@@ -135,8 +146,11 @@ class PipelineContext:
         # 并行翻译线程锁（保护 stats / tracker 等共享状态）
         import threading
         self.thread_lock = threading.Lock()
-        # 并行翻译线程数：0/1 = 串行；>1 = 并行
-        self.translation_parallel = int(self.app_cfg.get('translation_parallel', 3) or 0)
+        # 并行翻译配置：app.translation_parallel
+        #  - 0 或 1  → 关闭并行，纯串行翻译
+        #  - N (>1)  → 开启并行，同时用 N 个 worker 进程/线程翻译不同作品
+        # 默认 5（开启并行）。需要串行时在 config.json 设 app.translation_parallel = 0
+        self.translation_parallel = int(self.app_cfg.get('translation_parallel', 5) or 0)
         # 并行模式下的进度更新：每个作品的状态字典 {label: '待翻译/翻译中/完成'}, 由主线程汇总打印
         self.parallel_mode = False
         self.work_progress: dict = {}
@@ -2136,77 +2150,91 @@ def run_pipeline(
                 _work_order.append(wkey)
             _work_groups[wkey].append(lrc_path)
 
-        def _translate_work(wkey: str, files: list):
-            """翻译单个作品的全部音轨（内部串行）"""
-            terms = work_terms.get(wkey, {})
-            alias_list = work_alias.get(wkey, [])
-            scriptbook_map = work_scriptbook.get(wkey, None)
-            worldview = work_worldview.get(wkey, None)
-            # 作品短标识：RJ 号或目录名，便于日志区分
+        def _worker_id_label(wkey: str) -> str:
+            """作品目录 → 短标识（RJ 号或目录名）"""
             import re as _re
             _m = _re.search(r'RJ(\d+)', wkey)
-            _label = f"RJ{_m.group(1)}" if _m else str(Path(wkey).name)
-            _log(f"\n  [并行·作品] 开始翻译: {_label}（{len(files)} 个音轨，线程 {threading.current_thread().name}）")
-            ok = 0
-            err = 0
-            for lrc_path in files:
-                try:
-                    if ctx.parallel_mode:
-                        ctx.update_work_progress(_label, '翻译中', lrc_path.name)
-                    _track_sb_lines = None
-                    if scriptbook_map:
-                        _track_sb_lines = scriptbook_map.get(lrc_path.stem, None)
-                        if not _track_sb_lines:
-                            for _sb_name, _sb_lines in scriptbook_map.items():
-                                if _sb_lines and (lrc_path.stem in _sb_name or _sb_name in lrc_path.stem):
-                                    _track_sb_lines = _sb_lines
-                                    break
-                    success = translate_one_lrc(
-                        lrc_path, ctx,
-                        terms=terms,
-                        alias_list=alias_list,
-                        worldview=worldview,
-                        scriptbook_lines=_track_sb_lines,
-                    )
-                    if success:
-                        ok += 1
-                    else:
+            return f"RJ{_m.group(1)}" if _m else str(Path(wkey).name)
+
+        def _translate_work(worker_id: int, work_keys: list):
+            """单个 worker 线程：负责一组作品（内部串行翻译每个作品的所有音轨）。
+
+            该线程的所有日志经 _log 自动加 [W{worker_id}] 前缀（由 _worker_local 标记），
+            后端据此识别为 worker 详细日志：写入日志文件但不推送到前端。
+            开头打印本 worker 负责哪些作品。
+            """
+            _worker_local._worker_id = worker_id
+            _labels = [_worker_id_label(w) for w in work_keys]
+            _log(f"\n  [W{worker_id}] 本 worker 负责作品（{len(work_keys)} 个）: {', '.join(_labels)}")
+            for wkey in work_keys:
+                files = _work_groups[wkey]
+                _label = _worker_id_label(wkey)
+                terms = work_terms.get(wkey, {})
+                alias_list = work_alias.get(wkey, [])
+                scriptbook_map = work_scriptbook.get(wkey, None)
+                worldview = work_worldview.get(wkey, None)
+                _log(f"\n  [W{worker_id}] 开始翻译作品: {_label}（{len(files)} 个音轨）")
+                ok = 0
+                err = 0
+                for lrc_path in files:
+                    try:
+                        if ctx.parallel_mode:
+                            ctx.update_work_progress(_label, '翻译中', lrc_path.name)
+                        _track_sb_lines = None
+                        if scriptbook_map:
+                            _track_sb_lines = scriptbook_map.get(lrc_path.stem, None)
+                            if not _track_sb_lines:
+                                for _sb_name, _sb_lines in scriptbook_map.items():
+                                    if _sb_lines and (lrc_path.stem in _sb_name or _sb_name in lrc_path.stem):
+                                        _track_sb_lines = _sb_lines
+                                        break
+                        success = translate_one_lrc(
+                            lrc_path, ctx,
+                            terms=terms,
+                            alias_list=alias_list,
+                            worldview=worldview,
+                            scriptbook_lines=_track_sb_lines,
+                        )
+                        if success:
+                            ok += 1
+                        else:
+                            with ctx.thread_lock:
+                                ctx.stats['skipped'] += 1
+                            err += 1
+                    except Exception as e:
+                        import traceback
+                        _log(f"\n✗ 文件 {lrc_path.name} 错误: {e}")
+                        _log(f"  堆栈:\n{traceback.format_exc()}")
                         with ctx.thread_lock:
                             ctx.stats['skipped'] += 1
                         err += 1
-                except Exception as e:
-                    import traceback
-                    _log(f"\n✗ 文件 {lrc_path.name} 错误: {e}")
-                    _log(f"  堆栈:\n{traceback.format_exc()}")
-                    with ctx.thread_lock:
-                        ctx.stats['skipped'] += 1
-                    err += 1
-            if ctx.parallel_mode:
-                ctx.update_work_progress(_label, '完成', f'成功 {ok}，失败/跳过 {err}')
-            _log(f"\n  [并行·作品] 完成翻译: {_label}（成功 {ok}，失败/跳过 {err}）")
-            return wkey, ok, err
+                if ctx.parallel_mode:
+                    ctx.update_work_progress(_label, '完成', f'成功 {ok}，失败/跳过 {err}')
+                _log(f"\n  [W{worker_id}] 完成作品: {_label}（成功 {ok}，失败/跳过 {err}）")
+            return work_keys
 
         if _parallel > 1 and len(_work_order) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             _log()
             _sep("并行翻译模式")
-            _log(f"  并行数: {_parallel} 个作品同时翻译")
+            _log(f"  并行数: {_parallel} 个 worker 同时翻译")
             _log(f"  作品总数: {len(_work_order)} 个")
             for _idx, _w in enumerate(_work_order, 1):
-                import re as _re
-                _mm = _re.search(r'RJ(\d+)', _w)
-                _wl = f"RJ{_mm.group(1)}" if _mm else str(Path(_w).name)
-                _log(f"    [{_idx}/{len(_work_order)}] {_wl} — {len(_work_groups[_w])} 个音轨")
-            _log(f"  每个作品内部串行翻译音轨；不同作品并行。进度将显示为实时更新行。")
+                _log(f"    [{_idx}/{len(_work_order)}] {_worker_id_label(_w)} — {len(_work_groups[_w])} 个音轨")
+            _log(f"  每个 worker 负责一组作品，内部串行；worker 间并行。")
+            _log(f"  前端只显示主线程日志；worker 详细日志（带 [W0]/[W1]... 前缀）写入后台日志文件。")
             _sep("开始翻译")
 
             # 进入并行模式：translate_one_lrc 内省略逐文件耗时统计，改由进度行汇总
             ctx.parallel_mode = True
             for _w in _work_order:
-                import re as _re
-                _mm = _re.search(r'RJ(\d+)', _w)
-                _wl = f"RJ{_mm.group(1)}" if _mm else str(Path(_w).name)
-                ctx.work_progress[_wl] = {'status': '等待', 'detail': ''}
+                ctx.work_progress[_worker_id_label(_w)] = {'status': '等待', 'detail': ''}
+
+            # 按 worker 轮询分配作品（作品数可能多于 worker 数）
+            _worker_tasks: dict = {i: [] for i in range(_parallel)}
+            for _idx, _w in enumerate(_work_order):
+                _worker_tasks[_idx % _parallel].append(_w)
+            _nworkers = sum(1 for v in _worker_tasks.values() if v)
 
             _progress_stop = threading.Event()
             _progress_lock = threading.Lock()
@@ -2230,12 +2258,11 @@ def run_pipeline(
 
             _done = 0
             try:
-                with ThreadPoolExecutor(max_workers=_parallel) as _ex:
-                    _futures = {_ex.submit(_translate_work, w, f): w for w, f in _work_groups.items()}
+                with ThreadPoolExecutor(max_workers=_nworkers) as _ex:
+                    _futures = {_ex.submit(_translate_work, i, wl): i for i, wl in _worker_tasks.items() if wl}
                     for _fut in as_completed(_futures):
-                        wkey, ok, err = _fut.result()
                         _done += 1
-                        _log(f"\n✓ 作品 [{_done}/{len(_work_order)}] 处理完成: {wkey}（成功 {ok}，失败/跳过 {err}）")
+                        _log(f"\n✓ worker [{_done}/{_nworkers}] 全部完成")
             finally:
                 _progress_stop.set()
                 _progress_thread.join(timeout=1)

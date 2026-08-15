@@ -53,6 +53,7 @@ def load_config(path: Path = None) -> dict[str, Any]:
         "app": {
             "translation_mode": "per_track",
             "translation_parallel": 5,
+            "print_worker_detail": False,
             "scriptbook_mode": "full",
             "export_ja_lrc": True,
             "retry_count": 4,

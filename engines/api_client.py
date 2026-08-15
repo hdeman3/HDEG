@@ -21,6 +21,27 @@ import threading as _threading_mod
 # 便于前端按线程分 tab 查看、后端区分主线程与 worker 日志。
 worker_local = _threading_mod.local()
 
+# 是否打印 worker 详细日志：
+# - False（默认，.bat 直跑单窗口场景）：worker 线程的心跳/详细日志静默，只保留主线程内容
+# - True（前端触发，后端在临时 config 设 print_worker_detail=true）：worker 日志输出供前端分 tab
+worker_silent = False
+
+
+def set_worker_silent(silent: bool) -> None:
+    """设置 worker 详细日志是否静默（全局）。"""
+    global worker_silent
+    worker_silent = bool(silent)
+
+
+def is_worker() -> bool:
+    """当前线程是否为并行 worker 线程"""
+    return getattr(worker_local, '_worker_id', None) is not None
+
+
+def should_print_worker() -> bool:
+    """当前线程的日志是否应打印到 stdout（worker 且静默时返回 False）"""
+    return not (is_worker() and worker_silent)
+
 
 def log_prefix() -> str:
     """当前线程的 worker 前缀（主线程返回空串）"""
@@ -216,7 +237,9 @@ class APIClient:
                 heartbeat_stop.wait(10)
                 if not heartbeat_stop.is_set():
                     secs = int(_time_mod.monotonic() - _hb_start)
-                    print(f"{log_prefix()}    [等待] 已等待 {secs} 秒...", flush=True)
+                    # worker 静默模式下心跳不打印（只保留主线程内容）
+                    if should_print_worker():
+                        print(f"{log_prefix()}    [等待] 已等待 {secs} 秒...", flush=True)
 
         heartbeat_thread = threading.Thread(target=_print_heartbeat, daemon=True)
         heartbeat_thread.start()
@@ -231,7 +254,7 @@ class APIClient:
                 # 回写当前激活模型，保证所有外部读取 config['model'] 的路径同步
                 self.config['model'] = _current_model
                 self._model_idx = _model_idx
-                if _model_idx > 0:
+                if _model_idx > 0 and should_print_worker():
                     print(f"  [API] 切换模型 → {_current_model}（第 {_model_idx+1}/{len(_model_chain)} 个）", flush=True)
 
                 for attempt in range(max_retries):
@@ -260,13 +283,13 @@ class APIClient:
 
                     except Exception as e:
                         last_error = e
-                        if self.verbose:
+                        if self.verbose and should_print_worker():
                             print(f"  [API] 模型 {_current_model} 尝试 {attempt+1}/{max_retries} 失败: "
                                   f"{type(e).__name__}: {e}", flush=True)
                         # 参数不支持 → 剔除可选参数后立即重试（同一模型）
                         if not _stripped_optional and self._looks_like_unsupported_param(e):
                             _stripped_optional = True
-                            if self.verbose:
+                            if self.verbose and should_print_worker():
                                 print("  [API] 服务可能不支持 reasoning_effort/top_k/thinking，自动剔除后重试", flush=True)
                             continue
                         # 配额耗尽 → 切换到下一个模型继续同一批次

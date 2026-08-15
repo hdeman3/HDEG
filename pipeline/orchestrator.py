@@ -68,9 +68,12 @@ def _log(msg: str = "", *, flush: bool = True):
     worker 线程（并行翻译的子线程）日志自动加 [W{n}] 前缀（前缀源统一取自
     engines.api_client.log_prefix，与 translate_engine._p / APIClient 心跳一致）；
     主线程日志不加前缀。前端只显示主线程日志，worker 详细日志由后端写入日志文件。
+    worker_silent 模式下（.bat 直跑单窗口），worker 线程日志静默，只保留主线程内容。
     """
     try:
-        from engines.api_client import log_prefix
+        from engines.api_client import log_prefix, should_print_worker
+        if not should_print_worker():
+            return  # worker 静默模式：不打印 worker 详细日志
         prefix = log_prefix()
     except Exception:
         prefix = ''
@@ -2219,6 +2222,14 @@ def run_pipeline(
 
             # 进入并行模式：translate_one_lrc 内省略逐文件耗时统计，改由进度行汇总
             ctx.parallel_mode = True
+
+            # worker 详细日志开关：app.print_worker_detail=false（默认，.bat 直跑单窗口）时，
+            # worker 线程的心跳/详细日志静默，只保留主线程内容；前端触发时后端在临时 config 设 true。
+            try:
+                from engines.api_client import set_worker_silent
+                set_worker_silent(not bool(ctx.config.get('app', {}).get('print_worker_detail', False)))
+            except Exception:
+                pass
 
             # 主线程预取每个音轨的上下文（术语/台本/世界观 + 该音轨匹配的台本行）
             _tasks = []

@@ -19,7 +19,9 @@ SB_MIN_CONF = 0.3
 def _p(*args, **kwargs):
     """带 worker 前缀的 print：worker 线程日志自动加 [W{n}] 前缀，便于前端分 tab"""
     try:
-        from engines.api_client import log_prefix
+        from engines.api_client import log_prefix, should_print_worker
+        if not should_print_worker():
+            return  # worker 静默模式：不打印 worker 详细日志
         prefix = log_prefix()
     except Exception:
         prefix = ''

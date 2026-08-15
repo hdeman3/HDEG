@@ -52,6 +52,7 @@ def load_config(path: Path = None) -> dict[str, Any]:
         "api": {"timeout": 2000},
         "app": {
             "translation_mode": "per_track",
+            "translation_parallel": 3,
             "scriptbook_mode": "full",
             "export_ja_lrc": True,
             "retry_count": 4,

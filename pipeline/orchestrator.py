@@ -115,6 +115,11 @@ class PipelineContext:
         self._translate_engine: TranslateEngine | None = None
         # 按目录的详细报告
         self.dir_reports: list[dict] = []
+        # 并行翻译线程锁（保护 stats / tracker 等共享状态）
+        import threading
+        self.thread_lock = threading.Lock()
+        # 并行翻译线程数：0/1 = 串行；>1 = 并行
+        self.translation_parallel = int(self.app_cfg.get('translation_parallel', 3) or 0)
 
     @property
     def translate_engine(self) -> TranslateEngine:
@@ -1282,14 +1287,16 @@ def translate_one_lrc(
                 _log(f"  [恢复] 重新解析: {len(texts)} 行, {total_chars} 字符")
         if total_chars == 0:
             _log(f"  [跳过] 原文内容为空（仅有时间戳），跳过翻译")
-            ctx.stats["skipped"] += 1
+            with ctx.thread_lock:
+                ctx.stats["skipped"] += 1
             return False
 
     # 检测是否已是中文（启发式：若大部分字符在 CJK 范围则跳过）
     lang = detect_subtitle_language(lrc_path)
     if lang == "chinese":
         _log(f"  [跳过] 已是中文，保留原文件")
-        ctx.stats["kept"] += 1
+        with ctx.thread_lock:
+            ctx.stats["kept"] += 1
         return False
 
     _log(f"  [待翻译] {len(texts)} 行文本")
@@ -1411,16 +1418,17 @@ def translate_one_lrc(
         cost=cost,
         elapsed=elapsed,
     )
-    ctx.tracker.record(usage)
-    ctx.pr.token_inline(usage)
+    with ctx.thread_lock:
+        ctx.tracker.record(usage)
+        ctx.pr.token_inline(usage)
 
-    ctx.stats['success_lines'] += len(translated_batch)
-    ctx.stats['total_lines'] += len(translated_batch)
-    ctx.stats['api_calls'] += 1
-    ctx.stats['total_cost'] += cost
-    ctx.stats['total_hit_tokens'] += hit
-    ctx.stats['total_miss_tokens'] += miss
-    ctx.stats['total_completion_tokens'] += comp
+        ctx.stats['success_lines'] += len(translated_batch)
+        ctx.stats['total_lines'] += len(translated_batch)
+        ctx.stats['api_calls'] += 1
+        ctx.stats['total_cost'] += cost
+        ctx.stats['total_hit_tokens'] += hit
+        ctx.stats['total_miss_tokens'] += miss
+        ctx.stats['total_completion_tokens'] += comp
 
     # 补齐不足的行（翻译失败的回退）
     shortage = 0
@@ -1440,7 +1448,8 @@ def translate_one_lrc(
             try:
                 shutil.copy2(lrc_path, ja_path)
                 _log(f"  [留档] {lrc_path.name} -> {ja_path.name}")
-                ctx.stats['archived'] = ctx.stats.get('archived', 0) + 1
+                with ctx.thread_lock:
+                    ctx.stats['archived'] = ctx.stats.get('archived', 0) + 1
             except Exception as e:
                 _log(f"  [留档失败] {lrc_path.name}: {e}")
 
@@ -1448,14 +1457,16 @@ def translate_one_lrc(
     trans_chars = sum(len(t) for t in translated_texts if t)
     if trans_chars == 0 and total_chars > 0:
         _log(f"  [跳过写入] 翻译结果全空，保留原文件不覆盖")
-        ctx.stats["skipped"] += 1
+        with ctx.thread_lock:
+            ctx.stats["skipped"] += 1
         return False
 
     # 写回翻译结果（通用字幕格式）
     write_subtitle_file(sub_file, translated_texts, lrc_path)
     _log(f"\n[写入] -> {abs_path}")
     _log(f"  -> 翻译完成: {len(translated_texts)} 行中文")
-    ctx.stats['translated'] += 1
+    with ctx.thread_lock:
+        ctx.stats['translated'] += 1
 
     # 同步中文到同目录的 SRT/VTT
     sync_lrc_to_srt_vtt(lrc_path, translated_texts)
@@ -2074,79 +2085,142 @@ def run_pipeline(
                         sync_lrc_to_srt_vtt(fpath, translated)
 
     else:
-        # 跟踪当前 RJ 作品目录（而非 LRC 文件的直接父目录）
-        _current_dir = None
-        _current_rj = None
-        _dir_start_translated = 0
-        _dir_start_lines = 0
-        _dir_start_time = 0.0
-
         # 方案 B：逐文件翻译（利用缓存）
-        for i, lrc_path in enumerate(lrc_files):
-            # 找到该文件所属的 RJ 作品根目录
-            rj_root, rj_number = find_rj_work_root(lrc_path)
-            _effective_dir = rj_root if rj_root else lrc_path.parent
+        # 并行模式：按「作品」分组并行（不同作品各自独立线程，作品内音轨仍串行，
+        # 保证每个作品有自己的术语/台本/世界观上下文，不交叉）。translation_parallel=0/1 时串行。
+        _parallel = getattr(ctx, 'translation_parallel', 0) or 0
 
-            # RJ 作品切换时记录上一作品的报告
-            if _current_rj is not None and rj_number != _current_rj:
+        # ── 主线程：按作品根目录分组 ──
+        # 作品分组 key = RJ 作品根目录（或其父目录），value = 该作品的音轨文件列表
+        _work_groups: dict = {}
+        _work_order: list = []
+        for lrc_path in lrc_files:
+            rj_root, _rj_number = find_rj_work_root(lrc_path)
+            wkey = str(rj_root) if rj_root else str(lrc_path.parent)
+            if wkey not in _work_groups:
+                _work_groups[wkey] = []
+                _work_order.append(wkey)
+            _work_groups[wkey].append(lrc_path)
+
+        def _translate_work(wkey: str, files: list):
+            """翻译单个作品的全部音轨（内部串行）"""
+            terms = work_terms.get(wkey, {})
+            alias_list = work_alias.get(wkey, [])
+            scriptbook_map = work_scriptbook.get(wkey, None)
+            worldview = work_worldview.get(wkey, None)
+            ok = 0
+            err = 0
+            for lrc_path in files:
+                try:
+                    _track_sb_lines = None
+                    if scriptbook_map:
+                        _track_sb_lines = scriptbook_map.get(lrc_path.stem, None)
+                        if not _track_sb_lines:
+                            for _sb_name, _sb_lines in scriptbook_map.items():
+                                if _sb_lines and (lrc_path.stem in _sb_name or _sb_name in lrc_path.stem):
+                                    _track_sb_lines = _sb_lines
+                                    break
+                    success = translate_one_lrc(
+                        lrc_path, ctx,
+                        terms=terms,
+                        alias_list=alias_list,
+                        worldview=worldview,
+                        scriptbook_lines=_track_sb_lines,
+                    )
+                    if success:
+                        ok += 1
+                    else:
+                        with ctx.thread_lock:
+                            ctx.stats['skipped'] += 1
+                        err += 1
+                except Exception as e:
+                    import traceback
+                    _log(f"\n✗ 文件 {lrc_path.name} 错误: {e}")
+                    _log(f"  堆栈:\n{traceback.format_exc()}")
+                    with ctx.thread_lock:
+                        ctx.stats['skipped'] += 1
+                    err += 1
+            return wkey, ok, err
+
+        if _parallel > 1 and len(_work_order) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            _log(f"  [并行翻译] 使用 {_parallel} 个线程并发处理 {len(_work_order)} 个作品")
+            _done = 0
+            with ThreadPoolExecutor(max_workers=_parallel) as _ex:
+                _futures = {_ex.submit(_translate_work, w, f): w for w, f in _work_groups.items()}
+                for _fut in as_completed(_futures):
+                    wkey, ok, err = _fut.result()
+                    _done += 1
+                    _log(f"\n✓ 作品 [{_done}/{len(_work_order)}] 处理完成: {wkey}（成功 {ok}，失败/跳过 {err}）")
+        else:
+            # 串行（或作品很少）—— 保持原逻辑
+            _current_dir = None
+            _current_rj = None
+            _dir_start_translated = 0
+            _dir_start_lines = 0
+            _dir_start_time = 0.0
+            for i, lrc_path in enumerate(lrc_files):
+                rj_root, rj_number = find_rj_work_root(lrc_path)
+                _effective_dir = rj_root if rj_root else lrc_path.parent
+
+                if _current_rj is not None and rj_number != _current_rj:
+                    _record_dir_report(ctx, _current_dir, _dir_start_translated,
+                                       _dir_start_lines, _dir_start_time)
+                if rj_number != _current_rj:
+                    _current_rj = rj_number
+                    _current_dir = _effective_dir
+                    _dir_start_translated = ctx.stats['translated']
+                    _dir_start_lines = ctx.stats['total_lines']
+                    _dir_start_time = time.time()
+                _log(f"\n{'#'*60}")
+                _log(f"# 文件 [{i+1}/{len(lrc_files)}] — 进度: {(i+1)/len(lrc_files)*100:.0f}%")
+                _log(f"# {lrc_path.absolute()}")
+                _log(f"{'#'*60}")
+
+                try:
+                    _dir_key = str(_effective_dir)
+                    _dir_terms = work_terms.get(_dir_key, {})
+                    _dir_alias = work_alias.get(_dir_key, [])
+                    _dir_scriptbook_map = work_scriptbook.get(_dir_key, None)
+                    _dir_worldview = work_worldview.get(_dir_key, None)
+                    _track_sb_lines = None
+                    if _dir_scriptbook_map:
+                        _track_sb_lines = _dir_scriptbook_map.get(lrc_path.stem, None)
+                        if not _track_sb_lines:
+                            for _sb_name, _sb_lines in _dir_scriptbook_map.items():
+                                if _sb_lines and (lrc_path.stem in _sb_name or _sb_name in lrc_path.stem):
+                                    _track_sb_lines = _sb_lines
+                                    break
+                    success = translate_one_lrc(
+                        lrc_path, ctx,
+                        terms=_dir_terms,
+                        alias_list=_dir_alias,
+                        worldview=_dir_worldview,
+                        scriptbook_lines=_track_sb_lines,
+                    )
+                    if success:
+                        _log(f"\n✓ 文件 [{i+1}/{len(lrc_files)}] 翻译成功: {lrc_path.name}")
+                    else:
+                        with ctx.thread_lock:
+                            ctx.stats['skipped'] += 1
+                        _log(f"\n○ 文件 [{i+1}/{len(lrc_files)}] 跳过: {lrc_path.name}")
+
+                        _log(f"\n  已耗时: {ctx.elapsed:.1f}s | "
+                          f"已完成: {ctx.stats['translated']}/{len(lrc_files)} | "
+                          f"API调用: {ctx.stats['api_calls']} 次")
+
+                except Exception as e:
+                    _log(f"\n✗ 文件 [{i+1}/{len(lrc_files)}] 错误: {lrc_path.name}")
+                    _log(f"  异常: {e}")
+                    import traceback
+                    _log(f"  堆栈:\n{traceback.format_exc()}")
+                    with ctx.thread_lock:
+                        ctx.stats['skipped'] += 1
+
+            # 记录最后一个目录
+            if _current_dir is not None:
                 _record_dir_report(ctx, _current_dir, _dir_start_translated,
                                    _dir_start_lines, _dir_start_time)
-            if rj_number != _current_rj:
-                _current_rj = rj_number
-                _current_dir = _effective_dir
-                _dir_start_translated = ctx.stats['translated']
-                _dir_start_lines = ctx.stats['total_lines']
-                _dir_start_time = time.time()
-            _log(f"\n{'#'*60}")
-            _log(f"# 文件 [{i+1}/{len(lrc_files)}] — 进度: {(i+1)/len(lrc_files)*100:.0f}%")
-            _log(f"# {lrc_path.absolute()}")
-            _log(f"{'#'*60}")
-
-            try:
-                # 获取当前文件所属 RJ 目录的术语/台本/世界观（不跨作品）
-                _dir_key = str(_effective_dir)
-                _dir_terms = work_terms.get(_dir_key, {})
-                _dir_alias = work_alias.get(_dir_key, [])
-                _dir_scriptbook_map = work_scriptbook.get(_dir_key, None)
-                _dir_worldview = work_worldview.get(_dir_key, None)
-                # 按 LRC 文件名查找对应音轨的台本
-                _track_sb_lines = None
-                if _dir_scriptbook_map:
-                    _track_sb_lines = _dir_scriptbook_map.get(lrc_path.stem, None)
-                    # 精确匹配为空（None 或 []）→ 模糊匹配
-                    if not _track_sb_lines:
-                        for _sb_name, _sb_lines in _dir_scriptbook_map.items():
-                            if _sb_lines and (lrc_path.stem in _sb_name or _sb_name in lrc_path.stem):
-                                _track_sb_lines = _sb_lines
-                                break
-                success = translate_one_lrc(
-                    lrc_path, ctx,
-                    terms=_dir_terms,
-                    alias_list=_dir_alias,
-                    worldview=_dir_worldview,
-                    scriptbook_lines=_track_sb_lines,
-                )
-                if success:
-                    _log(f"\n✓ 文件 [{i+1}/{len(lrc_files)}] 翻译成功: {lrc_path.name}")
-                else:
-                    ctx.stats['skipped'] += 1
-                    _log(f"\n○ 文件 [{i+1}/{len(lrc_files)}] 跳过: {lrc_path.name}")
-
-                    _log(f"\n  已耗时: {ctx.elapsed:.1f}s | "
-                      f"已完成: {ctx.stats['translated']}/{len(lrc_files)} | "
-                      f"API调用: {ctx.stats['api_calls']} 次")
-
-            except Exception as e:
-                _log(f"\n✗ 文件 [{i+1}/{len(lrc_files)}] 错误: {lrc_path.name}")
-                _log(f"  异常: {e}")
-                import traceback
-                _log(f"  堆栈:\n{traceback.format_exc()}")
-                ctx.stats['skipped'] += 1
-
-        # 记录最后一个目录
-        if _current_dir is not None:
-            _record_dir_report(ctx, _current_dir, _dir_start_translated,
-                               _dir_start_lines, _dir_start_time)
 
     # ──── 第 6 步: 打印报告 ────
     _sep("处理完成")

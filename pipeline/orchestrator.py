@@ -144,6 +144,7 @@ class PipelineContext:
         self.parallel_mode = False
         self.work_progress: dict = {}
         self._last_progress_print = 0.0
+        self._progress_dirty = False
 
     @property
     def translate_engine(self) -> TranslateEngine:
@@ -163,12 +164,14 @@ class PipelineContext:
         self.stats.update(kwargs)
 
     def update_work_progress(self, label: str, status: str, detail: str = '', worker: int = None):
-        """并行模式下更新某个作品的翻译状态（线程安全），由主线程定期汇总打印。"""
+        """并行模式下更新某个作品的翻译状态（线程安全），由主线程汇总打印。
+
+        设置 _progress_dirty = True，进度打印线程检测到有变化才打印，避免固定刷新刷屏。
+        """
         with self.thread_lock:
             self.work_progress[label] = {'status': status, 'detail': detail, 'worker': worker}
-            now = time.time()
-            # 主线程会定期刷新，这里只在需要时标记
-            self._last_progress_print = now
+            self._progress_dirty = True
+            self._last_progress_print = time.time()
 
     @property
     def elapsed(self) -> float:
@@ -2161,6 +2164,8 @@ def run_pipeline(
             lrc_path = task['lrc_path']
             label = task['label']
             _log(f"\n  [W{wid}] ▶ 开始音轨: {label} | {lrc_path.name}")
+            if ctx.parallel_mode:
+                ctx.update_work_progress(label, '翻译中', lrc_path.name, wid)
             try:
                 success = translate_one_lrc(
                     lrc_path, ctx,
@@ -2239,13 +2244,18 @@ def run_pipeline(
             _progress_lock = threading.Lock()
 
             def _print_progress_line():
-                """定期打印汇总进度（每行独立换行）。
+                """进度汇总（只在状态变化时打印，避免固定刷新刷屏）。
 
-                按 worker 分组展示：每个 worker 一行，显示其当前翻译的音轨（含所属作品）。
+                状态更新（update_work_progress）会置 _progress_dirty；本线程每 0.5s 检查，
+                有变化才打印一行新进度，打印后清除 dirty。
                 """
                 while not _progress_stop.is_set():
+                    _progress_stop.wait(0.5)
                     with _progress_lock:
                         with ctx.thread_lock:
+                            if not ctx._progress_dirty:
+                                continue
+                            ctx._progress_dirty = False
                             groups: dict = {}
                             for _lbl, _st in ctx.work_progress.items():
                                 wkey = f"W{_st['worker']}" if _st.get('worker') is not None else 'wait'
@@ -2262,7 +2272,7 @@ def run_pipeline(
                                         _ic = '○'
                                     items.append(f"{_ic} {_lbl}: {_st['detail'] or _st['status']}")
                                 _log(f"  [并行进度]   [{_wk}] " + ' | '.join(items))
-                    _progress_stop.wait(5)
+                    _progress_stop.wait(0.5)
 
             _progress_thread = threading.Thread(target=_print_progress_line, daemon=True)
             _progress_thread.start()
@@ -2276,13 +2286,11 @@ def run_pipeline(
                         _done += 1
                         if _fut.result():
                             _ok += 1
-                        if _done % 5 == 0 or _done == len(_tasks):
-                            _log(f"  [进度] 音轨 {_done}/{len(_tasks)}（成功 {_ok}）")
             finally:
                 _progress_stop.set()
                 _progress_thread.join(timeout=1)
                 ctx.parallel_mode = False
-                _log()  # 进度行之后换行，避免覆盖
+                _log(f"  [并行完成] 音轨 {_done}/{len(_tasks)}，成功 {_ok}")
         else:
             # 串行（或作品很少）—— 保持原逻辑
             _current_dir = None

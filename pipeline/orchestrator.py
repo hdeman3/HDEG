@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -61,10 +62,26 @@ from io_adapter.lrc_handler import (
 _pr: Printer | None = None
 
 
+# 进度行状态：并行模式下用 \r 更新单行进度，普通日志前需先换行结束进度行
+_progress_active = False
+
+
 def _log(msg: str = "", *, flush: bool = True):
     """输出日志并立即刷新 stdout。通过模块级 _pr 统一格式。"""
+    global _progress_active
+    if _progress_active:
+        print()  # 结束当前进度行（进度行用 \r 覆盖，无换行）
+        _progress_active = False
     print(msg, flush=flush)
     sys.stderr.flush()
+
+
+def _log_progress_line(msg: str):
+    """用回车符覆盖当前行打印，实现单行原地更新（不刷屏）。"""
+    global _progress_active
+    sys.stdout.write('\r' + msg.ljust(120))
+    sys.stdout.flush()
+    _progress_active = True
 
 
 def _sep(title: str = ""):
@@ -120,6 +137,10 @@ class PipelineContext:
         self.thread_lock = threading.Lock()
         # 并行翻译线程数：0/1 = 串行；>1 = 并行
         self.translation_parallel = int(self.app_cfg.get('translation_parallel', 3) or 0)
+        # 并行模式下的进度更新：每个作品的状态字典 {label: '待翻译/翻译中/完成'}, 由主线程汇总打印
+        self.parallel_mode = False
+        self.work_progress: dict = {}
+        self._last_progress_print = 0.0
 
     @property
     def translate_engine(self) -> TranslateEngine:
@@ -137,6 +158,14 @@ class PipelineContext:
 
     def update_stats(self, **kwargs):
         self.stats.update(kwargs)
+
+    def update_work_progress(self, label: str, status: str, detail: str = ''):
+        """并行模式下更新某个作品的翻译状态（线程安全），由主线程定期汇总打印。"""
+        with self.thread_lock:
+            self.work_progress[label] = {'status': status, 'detail': detail}
+            now = time.time()
+            # 主线程会定期刷新，这里只在需要时标记
+            self._last_progress_print = now
 
     @property
     def elapsed(self) -> float:
@@ -1387,9 +1416,14 @@ def translate_one_lrc(
             if raw_resp and raw_resp != 'NOT_FOUND' and len(raw_resp) > 500:
                 _log(f"  [DEBUG] ...末尾: {raw_resp[-300:]}")
 
-    _log(f"  ← 响应: {len(translated_batch)} 行, 耗时 {call_elapsed:.1f}s")
+    if getattr(ctx, 'parallel_mode', False):
+        # 并行模式下省略逐文件耗时统计，避免刷屏（由进度行汇总）
+        pass
+    else:
+        _log(f"  ← 响应: {len(translated_batch)} 行, 耗时 {call_elapsed:.1f}s")
     non_empty = [t for t in translated_texts if t and t.strip()]
-    _log(f"    有效行: {len(non_empty)}/{len(translated_texts)}")
+    if not getattr(ctx, 'parallel_mode', False):
+        _log(f"    有效行: {len(non_empty)}/{len(translated_texts)}")
     if not non_empty:
         _log(f"  WARN: 所有行为空！首3行原文: {[t[:40] for t in texts[:3]]}")
     elif ctx.pr.debug:
@@ -2108,10 +2142,17 @@ def run_pipeline(
             alias_list = work_alias.get(wkey, [])
             scriptbook_map = work_scriptbook.get(wkey, None)
             worldview = work_worldview.get(wkey, None)
+            # 作品短标识：RJ 号或目录名，便于日志区分
+            import re as _re
+            _m = _re.search(r'RJ(\d+)', wkey)
+            _label = f"RJ{_m.group(1)}" if _m else str(Path(wkey).name)
+            _log(f"\n  [并行·作品] 开始翻译: {_label}（{len(files)} 个音轨，线程 {threading.current_thread().name}）")
             ok = 0
             err = 0
             for lrc_path in files:
                 try:
+                    if ctx.parallel_mode:
+                        ctx.update_work_progress(_label, '翻译中', lrc_path.name)
                     _track_sb_lines = None
                     if scriptbook_map:
                         _track_sb_lines = scriptbook_map.get(lrc_path.stem, None)
@@ -2140,18 +2181,66 @@ def run_pipeline(
                     with ctx.thread_lock:
                         ctx.stats['skipped'] += 1
                     err += 1
+            if ctx.parallel_mode:
+                ctx.update_work_progress(_label, '完成', f'成功 {ok}，失败/跳过 {err}')
+            _log(f"\n  [并行·作品] 完成翻译: {_label}（成功 {ok}，失败/跳过 {err}）")
             return wkey, ok, err
 
         if _parallel > 1 and len(_work_order) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            _log(f"  [并行翻译] 使用 {_parallel} 个线程并发处理 {len(_work_order)} 个作品")
+            _log()
+            _sep("并行翻译模式")
+            _log(f"  并行数: {_parallel} 个作品同时翻译")
+            _log(f"  作品总数: {len(_work_order)} 个")
+            for _idx, _w in enumerate(_work_order, 1):
+                import re as _re
+                _mm = _re.search(r'RJ(\d+)', _w)
+                _wl = f"RJ{_mm.group(1)}" if _mm else str(Path(_w).name)
+                _log(f"    [{_idx}/{len(_work_order)}] {_wl} — {len(_work_groups[_w])} 个音轨")
+            _log(f"  每个作品内部串行翻译音轨；不同作品并行。进度将显示为实时更新行。")
+            _sep("开始翻译")
+
+            # 进入并行模式：translate_one_lrc 内省略逐文件耗时统计，改由进度行汇总
+            ctx.parallel_mode = True
+            for _w in _work_order:
+                import re as _re
+                _mm = _re.search(r'RJ(\d+)', _w)
+                _wl = f"RJ{_mm.group(1)}" if _mm else str(Path(_w).name)
+                ctx.work_progress[_wl] = {'status': '等待', 'detail': ''}
+
+            _progress_stop = threading.Event()
+            _progress_lock = threading.Lock()
+
+            def _print_progress_line():
+                """定期用 \r 刷新一行汇总进度，避免刷屏"""
+                while not _progress_stop.is_set():
+                    with _progress_lock:
+                        with ctx.thread_lock:
+                            parts = []
+                            for _lbl, _st in ctx.work_progress.items():
+                                _ic = '🔄' if _st['status'] == '翻译中' else ('✅' if _st['status'] == '完成' else '⏳')
+                                parts.append(f"{_ic}{_lbl}({_st['detail'] or _st['status']})")
+                            _line = f"  [并行进度] 已用 {ctx.elapsed:.0f}s | " + ' '.join(parts)
+                        # 用回车覆盖当前行，实现原地更新（不产生新行刷屏）
+                        _log_progress_line(_line)
+                    _progress_stop.wait(5)
+
+            _progress_thread = threading.Thread(target=_print_progress_line, daemon=True)
+            _progress_thread.start()
+
             _done = 0
-            with ThreadPoolExecutor(max_workers=_parallel) as _ex:
-                _futures = {_ex.submit(_translate_work, w, f): w for w, f in _work_groups.items()}
-                for _fut in as_completed(_futures):
-                    wkey, ok, err = _fut.result()
-                    _done += 1
-                    _log(f"\n✓ 作品 [{_done}/{len(_work_order)}] 处理完成: {wkey}（成功 {ok}，失败/跳过 {err}）")
+            try:
+                with ThreadPoolExecutor(max_workers=_parallel) as _ex:
+                    _futures = {_ex.submit(_translate_work, w, f): w for w, f in _work_groups.items()}
+                    for _fut in as_completed(_futures):
+                        wkey, ok, err = _fut.result()
+                        _done += 1
+                        _log(f"\n✓ 作品 [{_done}/{len(_work_order)}] 处理完成: {wkey}（成功 {ok}，失败/跳过 {err}）")
+            finally:
+                _progress_stop.set()
+                _progress_thread.join(timeout=1)
+                ctx.parallel_mode = False
+                _log()  # 进度行之后换行，避免覆盖
         else:
             # 串行（或作品很少）—— 保持原逻辑
             _current_dir = None

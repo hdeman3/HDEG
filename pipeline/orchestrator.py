@@ -143,6 +143,7 @@ class PipelineContext:
         # 并行模式下的进度更新：每个作品的状态字典 {label: '待翻译/翻译中/完成'}, 由主线程汇总打印
         self.parallel_mode = False
         self.work_progress: dict = {}
+        self.progress_events: list = []
         self._last_progress_print = 0.0
         self._progress_dirty = False
 
@@ -163,13 +164,22 @@ class PipelineContext:
     def update_stats(self, **kwargs):
         self.stats.update(kwargs)
 
-    def update_work_progress(self, label: str, status: str, detail: str = '', worker: int = None):
-        """并行模式下更新某个作品的翻译状态（线程安全），由主线程汇总打印。
+    def update_work_progress(self, label: str, status: str, detail: str = '', worker: int = None,
+                             start_time: float = None, elapsed: float = None):
+        """并行模式下更新某个音轨的翻译状态（线程安全）。
 
-        设置 _progress_dirty = True，进度打印线程检测到有变化才打印，避免固定刷新刷屏。
+        status: '翻译中' / '完成' / '失败'
+        事件驱动：将事件追加到 progress_events，主线程进度线程消费并打印开始/结束（含用时）。
         """
         with self.thread_lock:
             self.work_progress[label] = {'status': status, 'detail': detail, 'worker': worker}
+            self.progress_events.append({
+                'label': label,
+                'status': status,
+                'detail': detail,
+                'worker': worker,
+                'elapsed': elapsed,
+            })
             self._progress_dirty = True
             self._last_progress_print = time.time()
 
@@ -2163,9 +2173,10 @@ def run_pipeline(
 
             lrc_path = task['lrc_path']
             label = task['label']
+            _start = time.time()
             _log(f"\n  [W{wid}] ▶ 开始音轨: {label} | {lrc_path.name}")
             if ctx.parallel_mode:
-                ctx.update_work_progress(label, '翻译中', lrc_path.name, wid)
+                ctx.update_work_progress(label, '翻译中', lrc_path.name, wid, _start)
             try:
                 success = translate_one_lrc(
                     lrc_path, ctx,
@@ -2174,10 +2185,11 @@ def run_pipeline(
                     worldview=task['worldview'],
                     scriptbook_lines=task['scriptbook_lines'],
                 )
+                _elapsed = time.time() - _start
                 if ctx.parallel_mode:
-                    ctx.update_work_progress(label, '完成', lrc_path.name, wid)
+                    ctx.update_work_progress(label, '完成', lrc_path.name, wid, _start, _elapsed)
                 if success:
-                    _log(f"  [W{wid}] ✔ 完成音轨: {label} | {lrc_path.name}")
+                    _log(f"  [W{wid}] ✔ 完成音轨: {label} | {lrc_path.name}（用时 {_elapsed:.1f}s）")
                     return True
                 else:
                     with ctx.thread_lock:
@@ -2186,6 +2198,9 @@ def run_pipeline(
                     return False
             except Exception as e:
                 import traceback
+                _elapsed = time.time() - _start
+                if ctx.parallel_mode:
+                    ctx.update_work_progress(label, '失败', lrc_path.name, wid, _start, _elapsed)
                 _log(f"\n✗ 音轨 {lrc_path.name} 错误: {e}")
                 _log(f"  堆栈:\n{traceback.format_exc()}")
                 with ctx.thread_lock:
@@ -2232,47 +2247,31 @@ def run_pipeline(
                     'scriptbook_lines': sb_lines,
                 })
 
-            # 初始化进度状态：按作品展示，但状态由 worker 更新（音轨级）
-            for lrc_path in lrc_files:
-                rj_root, _rj = find_rj_work_root(lrc_path)
-                wkey = str(rj_root) if rj_root else str(lrc_path.parent)
-                _lbl = _worker_id_label(wkey)
-                if _lbl not in ctx.work_progress:
-                    ctx.work_progress[_lbl] = {'status': '等待', 'detail': '', 'worker': None}
-
             _progress_stop = threading.Event()
             _progress_lock = threading.Lock()
 
             def _print_progress_line():
-                """进度汇总（只在状态变化时打印，避免固定刷新刷屏）。
+                """主线程日志：只打印音轨开始/结束事件（哪个 worker 翻译哪个音轨，结束含一次用时）。
 
-                状态更新（update_work_progress）会置 _progress_dirty；本线程每 0.5s 检查，
-                有变化才打印一行新进度，打印后清除 dirty。
+                消费 ctx.progress_events 队列（worker 状态变化时入队），
+                避免输出心跳/token 等子线程中间细节。
                 """
                 while not _progress_stop.is_set():
-                    _progress_stop.wait(0.5)
+                    _progress_stop.wait(0.2)
                     with _progress_lock:
                         with ctx.thread_lock:
-                            if not ctx._progress_dirty:
-                                continue
-                            ctx._progress_dirty = False
-                            groups: dict = {}
-                            for _lbl, _st in ctx.work_progress.items():
-                                wkey = f"W{_st['worker']}" if _st.get('worker') is not None else 'wait'
-                                groups.setdefault(wkey, []).append((_lbl, _st))
-                            _log(f"  [并行进度] 已用 {ctx.elapsed:.0f}s | 音轨 {ctx.stats['translated']+ctx.stats['skipped']}/{len(lrc_files)}")
-                            for _wk in sorted(groups.keys()):
-                                items = []
-                                for _lbl, _st in groups[_wk]:
-                                    if _st['status'] == '翻译中':
-                                        _ic = '▶'
-                                    elif _st['status'] == '完成':
-                                        _ic = '✔'
-                                    else:
-                                        _ic = '○'
-                                    items.append(f"{_ic} {_lbl}: {_st['detail'] or _st['status']}")
-                                _log(f"  [并行进度]   [{_wk}] " + ' | '.join(items))
-                    _progress_stop.wait(0.5)
+                            events = ctx.progress_events
+                            ctx.progress_events = []
+                        for ev in events:
+                            _wk = f"W{ev['worker']}" if ev['worker'] is not None else '?'
+                            if ev['status'] == '翻译中':
+                                _log(f"  [并行] {_wk} ▶ {ev['label']}: {ev['detail']}")
+                            elif ev['status'] == '完成':
+                                _et = f"（{ev['elapsed']:.1f}s）" if ev['elapsed'] is not None else ''
+                                _log(f"  [并行] {_wk} ✔ {ev['label']}: {ev['detail']}{_et}")
+                            elif ev['status'] == '失败':
+                                _log(f"  [并行] {_wk} ✗ {ev['label']}: {ev['detail']}")
+                    _progress_stop.wait(0.2)
 
             _progress_thread = threading.Thread(target=_print_progress_line, daemon=True)
             _progress_thread.start()

@@ -3,7 +3,6 @@
     "key": "your-api-key-here",
     "base_url": "https://opencode.ai/zen/go/v1",
     "model": "deepseek-v4-flash",
-    "fallback_models": ["glm-5.2", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3", "hy3"],
     "timeout": 2000,
     "generation_params": {
       "temperature": 1,

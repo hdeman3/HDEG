@@ -141,8 +141,8 @@ class PipelineContext:
         # 并行翻译配置：app.translation_parallel
         #  - 0 或 1  → 关闭并行，纯串行翻译
         #  - N (>1)  → 开启并行，同时用 N 个 worker 进程/线程翻译不同作品
-        # 默认 5（开启并行）。需要串行时在 config.json 设 app.translation_parallel = 0
-        self.translation_parallel = int(self.app_cfg.get('translation_parallel', 5) or 0)
+        # 默认 8（开启并行）。需要串行时在 config.json 设 app.translation_parallel = 0
+        self.translation_parallel = int(self.app_cfg.get('translation_parallel', 8) or 0)
         # 并行模式下的进度更新：每个作品的状态字典 {label: '待翻译/翻译中/完成'}, 由主线程汇总打印
         self.parallel_mode = False
         self.work_progress: dict = {}

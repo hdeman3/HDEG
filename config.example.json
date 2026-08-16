@@ -24,7 +24,7 @@
   "app": {
     "lrc_max_lines_per_request": 100,
     "translation_mode": "per_track",
-    "translation_parallel": 5,
+    "translation_parallel": 8,
     "print_worker_detail": false,
     "delay_translate_to_offpeak": false,
     "scriptbook_mode": "full",

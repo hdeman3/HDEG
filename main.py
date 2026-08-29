@@ -26,10 +26,9 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
 
-# 清理网络代理（无条件清除，避免代理干扰 API 直连）
-for _key in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
-    os.environ.pop(_key, None)
-os.environ['NO_PROXY'] = '*'
+# 代理处理：默认保留系统代理（中转若需走本地代理才能连通）。
+# 仅当 config.network.clear_proxy_on_startup=true 时清除代理环境变量（直连不需要代理的中转）。
+# 这里先不清理，等 config 加载后（main() 内）按配置决定。
 
 # ==================== unidic_lite 字典配置（与 translate.py 兼容） ====================
 # 此部分保留在 main.py 因为它需要在任何 import 之前设置环境变量
@@ -166,6 +165,22 @@ if __name__ == '__main__':
             root = Path(args.root)
 
         config_path = Path(args.config) if args.config else None
+
+        # 代理策略：默认保留系统代理（部分模型如 claude、muse 需走本地代理才能连通中转）。
+        # 仅当 api.clear_proxy=true 或 network.clear_proxy_on_startup=true 时清除代理直连
+        # （用于 opencode/deepseek 官方直连等确实不需要代理的场景）。
+        try:
+            from io_adapter.config_loader import load_config as _load_cfg
+            _cfg = _load_cfg(config_path)
+            _api_clear = bool(_cfg.get('api', {}).get('clear_proxy', False))
+            _net_clear = bool(_cfg.get('network', {}).get('clear_proxy_on_startup', False))
+            if _api_clear or _net_clear:
+                for _k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+                    os.environ.pop(_k, None)
+                os.environ['NO_PROXY'] = '*'
+            # 否则保留系统代理（默认）
+        except Exception as _pe:
+            print(f'[入口] 代理配置读取失败（保留系统代理）: {_pe}')
 
         run_pipeline(
             root,

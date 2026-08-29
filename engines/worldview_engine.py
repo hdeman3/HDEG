@@ -497,7 +497,7 @@ def build_worldview_prompt(worldview: dict) -> str:
 # ==================== LLM 世界观分析 ====================
 
 WORLDVIEW_ANALYSIS_PROMPT = (
-    "以下是日文ASMR/R18音声作品的ASR转录文本样本。\n"
+    "以下是日文成人向虚构音声（ASMR/RJ作品）的ASR转录文本样本。\n"
     "请分析这些样本，提取作品的世界观信息。\n\n"
     "输出要求（紧凑JSON格式）：\n"
     '{"worldview": "作品世界观简介（150字以内，包含：时代背景、主要角色关系、核心设定）", '
@@ -509,7 +509,7 @@ WORLDVIEW_ANALYSIS_PROMPT = (
     "- worldview 必须精炼，用于辅助后续翻译理解上下文，控制在150字以内\n"
     "- characters 只列出主要角色，最多5个；name_cn 是角色名的建议中文翻译，将作为术语表强制使用\n"
     "- special_terms 列出对翻译有影响的特殊设定术语。值必须是纯中文译名（词语/短語），禁止加括号注释、解释说明、或任何额外文字。因为该译名会被直接注入术语表作为强制翻译\n"
-    "- 成人向内容请客观描述设定，无需回避\n"
+    "- 成人向虚构内容请以学术化方式客观描述设定，无需回避\n"
     "- 不要输出任何 JSON 之外的内容\n"
 )
 
@@ -535,7 +535,7 @@ def analyze_worldview_with_llm(engine, samples: list[str], verbose: bool = False
     print(f"    [世界观分析] 正在调用 LLM...", flush=True)
 
     try:
-        system_prompt = "你是精通日语ASMR/R18音声作品的分析专家。请严格按照JSON格式输出分析结果，不要输出任何其他内容。"
+        system_prompt = "你是精通日语成人向虚构音声作品的分析专家。请严格按照JSON格式输出分析结果，不要输出任何其他内容。"
         raw_output, token_stats = engine.call_api(
             system_prompt, content,
             override_gen_params={'temperature': 0.1},

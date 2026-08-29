@@ -258,17 +258,19 @@ def is_scriptbook_file(file_path: Path) -> bool:
 
 # ==================== 台本加载 ====================
 
-def load_scriptbook_content(file_path: Path, api_config: dict = None) -> Optional[str]:
+def load_scriptbook_content(file_path: Path, api_config: dict = None, layout: dict = None) -> Optional[str]:
     """加载台本文件内容
 
     支持 .txt 和 .pdf 格式。
     PDF 使用 fitz (PyMuPDF) 提取，若提供 api_config 则先过 LLM 分析排版参数。
+    layout 为已分析的排版参数（同一作品所有 PDF 排版一致时由调用方整组复用，
+    传入后跳过本文件的 LLM 分析）。
     TXT 尝试多种编码（UTF-8, Shift-JIS, CP932, EUC-JP）。
 
     返回: 文本内容，失败返回 None
     """
     if file_path.suffix.lower() == '.pdf':
-        return _load_pdf_scriptbook(file_path, api_config=api_config)
+        return _load_pdf_scriptbook(file_path, api_config=api_config, layout=layout)
     else:
         # 尝试多种编码，日文 Windows 上常见 Shift-JIS
         for encoding in ('utf-8', 'shift-jis', 'cp932', 'euc-jp', 'iso-2022-jp'):
@@ -281,13 +283,15 @@ def load_scriptbook_content(file_path: Path, api_config: dict = None) -> Optiona
         return None
 
 
-def _load_pdf_scriptbook(file_path: Path, api_config: dict = None) -> Optional[str]:
+def _load_pdf_scriptbook(file_path: Path, api_config: dict = None, layout: dict = None) -> Optional[str]:
     """从 PDF 加载台本内容
 
     全链路 fitz (PyMuPDF)：采样 → LLM 分析 → 文本提取 → 逐字重排回退。
     若提供 api_config，LLM 分析排版参数提升精度。
+    layout 为整组复用的排版参数（由调用方预先分析代表 PDF 得到），
+    传入时跳过本文件的 LLM 分析。
     """
-    text = _extract_pdf_text(file_path, api_config=api_config)
+    text = _extract_pdf_text(file_path, api_config=api_config, layout=layout)
     if text and len(text) > 100:
         import re
         japanese_chars = len(re.findall(r'[぀-ゟ゠-ヺ一-鿿]', text))
@@ -325,6 +329,8 @@ def _analyze_pdf_layout(all_chars: list[dict], api_config: dict) -> dict:
         return {"orientation": "vertical", "col_gap": 24.0, "reading_order": "right-to-left"}
 
     # 格式化：X 分布 + Y 分布 + 抽样字符
+    # 关键：字符最多的那一页发送全量字符（不抽样），保证 LLM 能看到完整的
+    # 连续文本，从而可靠判断阅读方向/阅读顺序；其余页保持分布+抽样控制 prompt 大小。
     parts = []
     for i, chars in enumerate(sample_pages):
         pw = chars[0].get('page_w', 842)
@@ -341,58 +347,66 @@ def _analyze_pdf_layout(all_chars: list[dict], api_config: dict) -> dict:
             y_buckets[int(c['y']) // 30 * 30] += 1
         y_dist = '  '.join('y≈{}:{}字'.format(k, y_buckets[k])
                           for k in sorted(y_buckets.keys()))
-        # 抽样（带 X,Y 坐标）
-        step = max(1, len(chars) // 150)
-        sampled = chars[::step][:150]
-        segs = ['[{:.0f},{:.0f}]{}'.format(c['x'], c['y'], c['text']) for c in sampled]
-        parts.append('=== 样本页{} ({:.0f}x{:.0f}, {}字) ===\nX分布:\n{}\nY分布:\n{}\n抽样({}个,步长{}):\n{}'.format(
-            i + 1, pw, ph, len(chars), x_dist, y_dist, len(sampled), step, ' '.join(segs)))
+        if i == 0 and len(chars) <= 2500:
+            # 完整页：全量字符带坐标，用于判断阅读顺序（只对最丰富的一页做）
+            segs = ['[{:.0f},{:.0f}]{}'.format(c['x'], c['y'], c['text']) for c in chars]
+            parts.append('=== 完整内容页{} ({:.0f}x{:.0f}, 全量{}字, 用于判断阅读顺序) ===\nX分布:\n{}\nY分布:\n{}\n全量字符(按原始提取顺序):\n{}'.format(
+                i + 1, pw, ph, len(chars), x_dist, y_dist, ' '.join(segs)))
+        else:
+            # 其余页：均匀抽样（带 X,Y 坐标）
+            step = max(1, len(chars) // 150)
+            sampled = chars[::step][:150]
+            segs = ['[{:.0f},{:.0f}]{}'.format(c['x'], c['y'], c['text']) for c in sampled]
+            parts.append('=== 样本页{} ({:.0f}x{:.0f}, {}字) ===\nX分布:\n{}\nY分布:\n{}\n抽样({}个,步长{}):\n{}'.format(
+                i + 1, pw, ph, len(chars), x_dist, y_dist, len(sampled), step, ' '.join(segs)))
 
     prompt = '\n\n'.join(parts) + '''
 
-基于以上坐标数据和抽样字符内容，输出JSON（不要其他内容）：
+基于以上坐标数据和字符内容，输出JSON（不要其他内容）：
 {"orientation":"horizontal或vertical","reading_order":"right-to-left或left-to-right或top-to-bottom","col_gap":0,"body_y_min":0,"body_y_max":0}
 
-各参数由你根据坐标数据和抽样字符内容独立判断，填入实际数值：
+各参数由你根据坐标数据和字符内容独立判断，填入实际数值：
 - orientation: 横排(horizontal)或竖排(vertical)
 - reading_order: 竖排时填列阅读方向（right-to-left=右列→左列，left-to-right=左列→右列），横排时填top-to-bottom
 - col_gap: 一个完整视觉列的宽度(px)，不是字符间距。
   同一视觉列内字符的X坐标有一定散布，不同视觉列之间有明显的X间隔。
   col_gap应大于列内散布、小于列间间隔。
 - body_y_min: 正文顶部Y坐标。过滤此坐标以上的内容（页眉、页码、行号等非正文元素）。
-  观察Y分布和抽样字符：顶部Y值最小的少量字符通常就是页码/行号，正文从Y分布开始密集的地方开始。
+  观察Y分布和字符内容：顶部Y值最小的少量字符通常就是页码/行号，正文从Y分布开始密集的地方开始。
   必须填入实际值，不要填0。
 - body_y_max: 正文底部Y坐标。过滤此坐标以下的内容（底部页码等）。
   观察Y分布尾部：底部Y值最大的少量字符通常是页码，正文到Y分布密集区结束为止。
   如果底部无明显页码，填入页面高度。
+
+阅读顺序判断（重点）：
+- 「完整内容页」包含该页的全量字符（每字带[x,y]坐标），不是抽样，是连续完整文本。
+  请通读完整内容页的实际文本内容：如果读到的是通顺连续的日文句子/台词，按文本本身的
+  连贯性判断该页真实的阅读方向（竖排右→左列 / 竖排左→右列 / 横排上→下）。
+  判断依据优先看完整页的连续文本，其次参考坐标分布。
+- 若完整页字符超过2500字未提供（页面过大），则只能依据坐标分布推断，仍尽力给出最合理值。
 
 判断横排/竖排的关键：
 - 竖排：X分布有多个密集峰值（多列），Y范围覆盖页面大部分高度
 - 横排：Y分布只有少量峰值（少数行），字符Y接近但X跨度大，抽样中同一行的字符Y坐标几乎相同'''
 
     try:
-        from openai import OpenAI
-        import os as _os
-        for k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
-            _os.environ.pop(k, None)
-        _os.environ['NO_PROXY'] = '*'
-
-        raw_timeout = api_config.get('timeout', 60)
-        # config.json 的 timeout 单位是秒（如 2000 = 2000 秒），直接按秒用，
-        # 不做毫秒猜测，避免长文本解析被 30 秒钳住导致超时
-        timeout = float(raw_timeout) if raw_timeout >= 30 else 120.0
-        api_key = api_config.get('key') or api_config.get('api_key', '')
-        base_url = api_config.get('base_url', 'https://api.deepseek.com')
-
-        client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
-        response = client.chat.completions.create(
-            model='deepseek-v4-pro',
+        # 统一 API 调用层：模型/协议/重试/参数剔除全部内聚，与翻译同一模型
+        from engines.api_client import APIClient
+        _api = APIClient(api_config, verbose=False)
+        # max_tokens 从 config 的 generation_params.max_tokens 读取（muse 等模型思考消耗大，
+        # 硬编码小值会导致输出被思考耗尽截断为空）；未配置时兜底 16384。
+        _lay_max_tokens = int((api_config.get('generation_params') or {}).get('max_tokens', 0) or 0)
+        if _lay_max_tokens <= 0:
+            _lay_max_tokens = 16384
+        response = _api.chat(
             messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.1, max_tokens=262140, timeout=300,
+            max_tokens=_lay_max_tokens,
+            temperature=0.1,
+            max_retries=2,
         )
         content = response.choices[0].message.content or ''
         if not content:
-            content = getattr(response.choices[0].message, 'reasoning_content', '') or ''
+            content = APIClient.extract_content(response.choices[0].message) or ''
     except Exception as e:
         print(f'  [PDF排版] LLM 分析失败: {e}，用默认参数')
         return {"orientation": "vertical", "col_gap": 24.0, "reading_order": "right-to-left"}
@@ -415,6 +429,53 @@ def _analyze_pdf_layout(all_chars: list[dict], api_config: dict) -> dict:
 
     print(f'  [PDF排版] LLM 返回非JSON，用默认参数')
     return {"orientation": "vertical", "col_gap": 24.0, "reading_order": "right-to-left"}
+
+
+def compute_group_pdf_layout(scriptbook_files: list, api_config: dict) -> dict | None:
+    """分析一组台本中代表 PDF 的排版参数，供整组复用。
+
+    同一作品的所有台本排版方式一致，只需挑一个代表 PDF 做一次 LLM 分析，
+    得到普适的 {orientation, col_gap, reading_order, body_y_min, body_y_max}，
+    其余 PDF 直接复用，避免对每个 PDF 都发起一次 LLM 排版分析。
+
+    代表选择：采样字符数最多的 PDF（内容最丰富，最能反映正文排版）。
+
+    参数:
+        scriptbook_files: 台本文件列表（txt/pdf 混合）
+        api_config: API 配置（无 key 时返回 None，走本地默认参数）
+
+    返回:
+        layout 字典，或 None（无 PDF / 无 API key / 采样失败）
+    """
+    pdfs = [f for f in scriptbook_files if f.suffix.lower() == '.pdf']
+    if not pdfs or not api_config or not (api_config.get('key') or api_config.get('api_key')):
+        return None
+
+    best_chars: list = []
+    best_file = None
+    for f in pdfs:
+        try:
+            chars = _sample_chars_fitz(f, max_pages=6, start_page=4)
+        except Exception:
+            continue
+        if len(chars) > len(best_chars):
+            best_chars = chars
+            best_file = f
+
+    if not best_chars:
+        return None
+
+    try:
+        layout = _analyze_pdf_layout(best_chars, api_config)
+    except Exception as e:
+        print(f'  [PDF排版] 代表 PDF 分析失败: {e}，用默认参数')
+        return None
+
+    if best_file is not None:
+        print(f'  [PDF排版] 整组复用代表 PDF 参数: {best_file.name} '
+              f'(orientation={layout.get("orientation")}, col_gap={layout.get("col_gap")}, '
+              f'reading={layout.get("reading_order")})')
+    return layout
 
 
 # ── 孤儿列/行合并阈值 ──
@@ -624,18 +685,20 @@ def _merge_same_flow_columns(columns: dict, max_gap: float) -> dict:
 
 # ==================== 主提取函数 ====================
 
-def _extract_pdf_text(file_path: Path, api_config: dict = None) -> Optional[str]:
+def _extract_pdf_text(file_path: Path, api_config: dict = None, layout: dict = None) -> Optional[str]:
     """从 PDF 提取文本（全链路 fitz）
 
     1. fitz rawdict 逐字符采样 → LLM 分析 {orientation, col_gap, body_y, reading_order}
     2. fitz 文本提取 + body_y 过滤 → 优先返回
     3. fitz 质量不够 → fitz 逐字重排 + LLM 参数回退
+
+    layout 为已分析的排版参数：传入时直接复用，跳过本文件的 LLM 分析
+    （同一作品多个 PDF 排版一致，由 compute_group_pdf_layout 预分析一次整组复用）。
     """
     import re as _re_q
 
-    # ── 第一步：LLM 排版分析（有 api_config 时必过，用 fitz 采样）──
-    layout = None
-    if api_config:
+    # ── 第一步：LLM 排版分析（layout 未提供且 api_config 存在时，用 fitz 采样）──
+    if layout is None and api_config:
         sample_chars = _sample_chars_fitz(file_path, max_pages=6, start_page=4)
         if sample_chars:
             layout = _analyze_pdf_layout(sample_chars, api_config)
@@ -1133,11 +1196,16 @@ def build_raw_scriptbook_map(
     返回:
         {track_num: [raw_line1, raw_line2, ...]}
     """
+    # 同一作品所有 PDF 台本排版一致：只分析一次代表 PDF，整组复用参数，
+    # 避免对每个 PDF 都发起一次 LLM 排版分析。
+    group_layout = compute_group_pdf_layout(scriptbook_files, api_config) \
+        if any(f.suffix.lower() == '.pdf' for f in scriptbook_files) else None
+
     track_map: dict[int, list[str]] = {}
 
     for idx, sb_file in enumerate(scriptbook_files):
         track_num = idx + 1
-        content = load_scriptbook_content(sb_file, api_config=api_config)
+        content = load_scriptbook_content(sb_file, api_config=api_config, layout=group_layout)
         if not content:
             continue
 

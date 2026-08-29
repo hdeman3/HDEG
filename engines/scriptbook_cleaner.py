@@ -250,7 +250,8 @@ class ScriptbookSplitter:
             track_names: 音轨名列表（LRC 文件 stem）
             raw_scriptbook: 原始台本全文
             track_samples: 每条音轨的前几句 ASR 台词样本
-
+            max_retries: 每个模型的最大重试次数
+        
         返回:
             {track_name: [clean_lines]}
         """

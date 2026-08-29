@@ -77,8 +77,21 @@ def _log(msg: str = "", *, flush: bool = True):
         prefix = log_prefix()
     except Exception:
         prefix = ''
-    if prefix:
-        # 前缀加在消息实际内容行首（跳过开头的空行 \n），避免 [W0] 单独落在空行
+    if prefix and isinstance(msg, str) and '\n' in msg:
+        # 多行内容：跳过开头的空行，其余每行都加前缀，
+        # 避免裸 JSON 等后续行被后端误判为主线程（main）日志
+        lines = msg.split('\n')
+        started = False
+        for _li, _line in enumerate(lines):
+            if _line == '' and not started:
+                continue
+            if not started:
+                started = True
+                if _line == '':
+                    continue
+            lines[_li] = prefix + _line
+        msg = '\n'.join(lines)
+    elif prefix and isinstance(msg, str):
         idx = 0
         while idx < len(msg) and msg[idx] == '\n':
             idx += 1
@@ -149,6 +162,13 @@ class PipelineContext:
         self.progress_events: list = []
         self._last_progress_print = 0.0
         self._progress_dirty = False
+        # 异常翻译重试队列：翻译结果大量留空（解析失败/截断）的音轨任务，
+        # 第一轮并行全部完成后统一重试一次；元素结构同 _tasks（含 lrc_path/terms/.../scriptbook_lines）
+        self.retry_queue: list = []
+        # 重试结果汇总：{label: '失败原因' or '重试成功'}
+        self.retry_results: dict = {}
+        # 异常翻译累计次数（供统计）
+        self.abnormal_count = 0
 
     @property
     def translate_engine(self) -> TranslateEngine:
@@ -309,6 +329,28 @@ def sync_lrc_to_srt_vtt(lrc_path: Path, translated_texts: list[str]) -> int:
 
 # ==================== 台本加载 ====================
 
+def _repair_json_backslashes(text: str) -> str:
+    """修复 LLM 输出 JSON 中未转义的反斜杠（Windows 路径常见）。
+
+    JSON 中合法的转义仅限 \\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX，
+    但 LLM 常把 Windows 路径直接写成 C:\\dir\\file（单个反斜杠），
+    或日文文件名前的 \\■ \\購 等——这些不是合法 JSON 转义，会导致 json.loads 报
+    "Invalid \\escape"。
+
+    修复策略（保证不破坏合法的 \\\\ 与 \\uXXXX）：
+    - 以"反斜杠运行(run)"为单位处理：N 个连续反斜杠中，成对出现的 \\ 是合法转义。
+    - 只有"奇数长度 run 且其后跟非法转义字符"时，才在 run 末尾补一个反斜杠，
+      使该反斜杠被转义为字面反斜杠。
+    """
+    import re as _re
+    # (?<!\\)            该 run 前面不能是反斜杠（避免从偶数 run 中间误判）
+    # \\(?:\\\\\\\\)*   匹配奇数个反斜杠（1,3,5...）
+    # (?=[^"\\/bfnrtu]|$)  其后跟非法转义字符（或字符串结尾）
+    def _fix(m: _re.Match) -> str:
+        return m.group(0) + '\\'
+    return _re.sub(r'(?<!\\)\\(?:\\\\\\\\)*(?=[^"\\/bfnrtu]|$)', _fix, text)
+
+
 def _llm_identify_scriptbook_files(
     candidates: list[Path],
     work_dir: Path,
@@ -324,7 +366,7 @@ def _llm_identify_scriptbook_files(
         track_names: 音轨名列表
 
     返回:
-        - (list[Path], bool, dict): (台本文件, 是否预分割, {文件索引→音轨名})
+        - (list[Path], bool, dict, dict): (台本文件, 是否预分割, {文件索引→音轨名}, {文件名→[音轨名...]}多轨分组)
         - None: LLM 确认无台本（不回退正则）
         - []: LLM 调用失败（回退正则）
     """
@@ -346,13 +388,11 @@ def _llm_identify_scriptbook_files(
     # 提取作品名（work_dir 最后一级目录名）
     work_name = work_dir.name
 
-    # 音轨名列表（截断防止 prompt 过长）
+    # 音轨名列表（完整发送，确保 LLM 能匹配到所有音轨；
+    # 截断会导致部分音轨名未发送，LLM 无法识别对应台本分组）
     track_names_hint = ""
     if track_names:
-        shown = track_names[:20]
-        track_names_hint = "\n".join(f"  - {n}" for n in shown)
-        if len(track_names) > 20:
-            track_names_hint += f"\n  ... 还有 {len(track_names) - 20} 个"
+        track_names_hint = "\n".join(f"  - {n}" for n in track_names)
 
     system_prompt = (
         "你是一位日语ASMR音声作品台本识别专家。"
@@ -382,12 +422,27 @@ def _llm_identify_scriptbook_files(
 
 【txt 优先规则】（重要，必须遵守）
 - 若同一台本同时存在 .txt 和 .pdf 两个版本（同名或内容相同），scriptbook_indices **只选择 .txt 版本**，忽略 .pdf
-- is_pre_split=true 时，file_track_mapping 的 value 必须指向被选中的台本文件；若该台本有 txt+pdf 两个版本，必须指向 .txt
+- 预分割/is_pre_split=true 时，file_track_mapping 的 value 必须指向被选中的台本文件；若该台本有 txt+pdf 两个版本，必须指向 .txt
 
 【预分割判断】（is_pre_split）
 - true: 台本已按音轨拆分为独立文件，每个文件对应一个音轨
 - false: 台本是整体文件（单个PDF或txt），需程序再分割
 - **重要**: 文件名以纯数字或编号开头（1, 01, １, #1, トラック1 等）且数量与音轨数接近 → 判定为预分割
+
+【一文件多音轨】（file_track_groups，重要——务必识别）
+- 存在某些台本文件，**一个文件内含多个音轨的内容**（如「第一章.txt」内含音轨 1-1、1-2；「第二章.txt」内含 2-1、2-2）。这类文件不能算 is_pre_split=true（因为文件与音轨非一一对应），需要对该文件内部再分割。
+- 若识别到这类文件，用 file_track_groups 描述：格式 {{文件名: [音轨名1, 音轨名2]}}
+- 此时 is_pre_split 仍应判断为 false（因为不是每个文件恰好一个音轨），但 file_track_groups 提供精确的文件→音轨分组信息。
+- 若所有台本文件都是"一文件一音轨"（真正的预分割），则 file_track_groups 留空对象 {{}}，走 is_pre_split=true 路径。
+
+【PDF 台本 + 视角变体音轨】（常见形式，务必识别）
+- 常见于 PDF 台本按「トラック」分文件（如 トラック1.pdf ~ トラック7.pdf），每个 PDF 对应一个章节/トラック的场景。
+- 而音轨文件（LRC/MP3 名）常含**视角变体**：同一场景有多个视角，如「_主人公視点」「_他人棒視点」「_主人公集中Ver」「_他人棒集中Ver」「（おまけ）」等后缀。
+- 这类**一个 PDF 通常包含多个视角音轨的共用台词**（同一段剧情，从不同视角演绎，台词内容相同/高度重叠）。
+- 识别方法：先剥离音轨名中的视角后缀（主人公視点/他人棒視点/集中Ver/おまけ 等），找到基础场景名（如 トラック1_二人のはずが…_），再与 PDF 文件名（如 トラック1.pdf）按编号/名称匹配。
+- 若每个 PDF 恰好对应一组同场景的多个视角音轨，则用 file_track_groups 表示：{{"トラック1.pdf": ["トラック1_二人のはずが…_他人棒視点", "トラック1_二人のはずが…_主人公視点"]}}
+- 此场景下 is_pre_split 填 false（文件与音轨非一一对应），file_track_groups 描述分组；程序会对每个 PDF 内部按视角音轨定位共用台词。
+- 同组内多个视角音轨共用同一 PDF 台本，不必重复拆分台词。
 
 【文件→音轨匹配】（仅 is_pre_split=true 时需要 file_track_mapping）
 ⚠ file_track_mapping 格式: {{音轨名称: 台本文件名}}
@@ -399,9 +454,11 @@ def _llm_identify_scriptbook_files(
 {file_list_text}
 
 返回JSON（仅JSON）：
-{{"scriptbook_indices": [1, 2], "is_pre_split": true, "file_track_mapping": {{"音轨名1": "文件名1", "音轨名2": "文件名2"}}, "reasoning": "简短依据"}}
+{{"scriptbook_indices": [1, 2], "is_pre_split": true, "file_track_mapping": {{"音轨名1": "文件名1", "音轨名2": "文件名2"}}, "file_track_groups": {{"第一章.txt": ["音轨1-1名", "音轨1-2名"]}}, "reasoning": "简短依据"}}
 
-无台本时: {{"scriptbook_indices": [], "is_pre_split": false, "file_track_mapping": {{}}, "reasoning": "无"}}"""
+- 一文件一音轨的纯预分割时：file_track_groups 填 {{}}
+- 存在一文件多音轨时：is_pre_split 填 false，file_track_groups 填对应分组
+- 无台本时: {{"scriptbook_indices": [], "is_pre_split": false, "file_track_mapping": {{}}, "file_track_groups": {{}}, "reasoning": "无"}}"""
 
     try:
         import json as _json
@@ -418,12 +475,17 @@ def _llm_identify_scriptbook_files(
 
         # 统一走 APIClient：模型轮换 / 重试 / 参数剔除全部内聚，此处无需关心
         _api = APIClient(api_cfg, verbose=ctx.pr.debug)
+        # max_tokens 从 config 的 generation_params.max_tokens 读取（muse 等模型思考消耗大，
+        # 硬编码小值会导致输出被思考耗尽截断为空）；未配置时兜底 16384。
+        _id_max_tokens = int((api_cfg.get('generation_params') or {}).get('max_tokens', 0) or 0)
+        if _id_max_tokens <= 0:
+            _id_max_tokens = 16384
         response = _api.chat(
             messages=[
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': user_prompt},
             ],
-            max_tokens=4096,  # 足够容纳 JSON + reasoning，500 容易截断
+            max_tokens=_id_max_tokens,
             temperature=0.1,
             max_retries=3,
         )
@@ -475,18 +537,27 @@ def _llm_identify_scriptbook_files(
         try:
             result = _json.loads(result_text)
         except _json.JSONDecodeError as e:
-            _log(f"  [台本·LLM] JSON 解析失败: {e}")
-            _log(f"  [台本·LLM] 原始响应 (前500字符): {content[:500]}")
-            _log(f"  [台本·LLM] 提取的 JSON 文本 (前300字符): {result_text[:300]}")
-            return []  # API JSON 格式异常 → 回退正则
+            # 尝试修复：LLM 常把 Windows 路径/日文文件名中的反斜杠写成未转义形式
+            _repaired = _repair_json_backslashes(result_text)
+            try:
+                result = _json.loads(_repaired)
+                result_text = _repaired
+                _log(f"  [台本·LLM] 反斜杠修复成功（原报错: {e}）")
+            except _json.JSONDecodeError as e2:
+                _log(f"  [台本·LLM] JSON 解析失败: {e}")
+                _log(f"  [台本·LLM] 原始响应 (前500字符): {content[:500]}")
+                _log(f"  [台本·LLM] 提取的 JSON 文本 (前300字符): {result_text[:300]}")
+                return []  # API JSON 格式异常 → 回退正则
         indices = result.get('scriptbook_indices', [])
         is_pre_split = result.get('is_pre_split', False)
         file_track_mapping = result.get('file_track_mapping', {})
+        file_track_groups = result.get('file_track_groups', {}) or {}
         reasoning = result.get('reasoning', '')
 
         _log(f"  [台本·LLM] 识别结果: {len(indices)} 个台本, "
              f"预分割={'是' if is_pre_split else '否'}, "
-             f"匹配{len(file_track_mapping)}个音轨 — {reasoning}")
+             f"匹配{len(file_track_mapping)}个音轨, "
+             f"多轨分组{len(file_track_groups)}个文件 — {reasoning}")
 
         # LLM 明确返回空列表 → 确认无台本（与 API 失败区分）
         if not indices:
@@ -507,7 +578,7 @@ def _llm_identify_scriptbook_files(
                     _log(f"    ✓ {f.relative_to(work_dir)}")
                 except ValueError:
                     _log(f"    ✓ {f}")
-        return (confirmed, is_pre_split, file_track_mapping)
+        return (confirmed, is_pre_split, file_track_mapping, file_track_groups)
 
     except Exception as e:
         _log(f"  [台本·LLM] 识别失败: {e}，回退到正则识别")
@@ -541,6 +612,12 @@ def _try_load_cached_scriptbook(work_dir: Path, track_names: list[str]) -> dict[
                     matched = sum(1 for tn in track_names if tn in cached)
                     if matched == 0:
                         continue  # 可能是其他作品的缓存
+                # 全空缓存（所有音轨都无内容）视为无效，继续重新分割——
+                # 避免上次失败分割留下的空缓存被当作有效结果跳过分割
+                _has_content = any(v for v in cached.values() if isinstance(v, list) and v)
+                if not _has_content:
+                    _log(f"  [台本] 缓存 {cache_file.name} 为空（无任何音轨内容），忽略并重新分割")
+                    continue
                 # 加载成功，匹配到当前 track_names
                 result: dict[str, list[str]] = {}
                 for tn in track_names:
@@ -674,6 +751,7 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     scriptbook_files: list[Path] = []
     is_pre_split: bool = False          # LLM 判断台本是否已按音轨预分割
     file_track_mapping: dict = {}       # LLM 返回的 {文件索引字符串: 音轨名}
+    file_track_groups: dict = {}        # LLM 返回的 {文件名: [音轨名...]}（一文件多音轨分组）
 
     # ── 阶段一: 收集所有备选 + LLM 识别 ──
     all_candidates = collect_all_scriptbook_candidates(work_dir)
@@ -696,8 +774,12 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
             _log(f"\n[台本] LLM 确认无台本文件，跳过台本加载")
             return None
         if isinstance(llm_result, tuple):
-            # 成功: (files, is_pre_split, file_track_mapping)
-            scriptbook_files, is_pre_split, file_track_mapping = llm_result
+            # 成功: (files, is_pre_split, file_track_mapping, file_track_groups)
+            _tup = llm_result
+            scriptbook_files = _tup[0]
+            is_pre_split = _tup[1] if len(_tup) > 1 else False
+            file_track_mapping = _tup[2] if len(_tup) > 2 else {}
+            file_track_groups = _tup[3] if len(_tup) > 3 else {}
         else:
             # 失败: [] (空列表)
             scriptbook_files = llm_result
@@ -798,6 +880,108 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     export_scriptbook = ctx.config.get('app', {}).get('export_scriptbook_content', False)
 
     # ═══════════════════════════════════════════════════════════
+    # 一文件多音轨路径: LLM 已返回 file_track_groups {文件名: [音轨名...]}
+    # 每个台本文件内含多个音轨（如 第一章.txt → 1-1、1-2；第二章.txt → 2-1、2-2）。
+    # 方案：不做逐文件 Flash 分割（省时），而是把该文件的完整台本直接赋给文件内所有音轨，
+    # 翻译时靠 align_asr_scriptbook 的 sb 对齐自动把每行 ASR 匹配到台本对应台词。
+    # ═══════════════════════════════════════════════════════════
+    if file_track_groups:
+        _log(f"  [台本] LLM 识别到 {len(file_track_groups)} 个多音轨台本文件，共用完整台本（靠 sb 对齐）")
+        from engines.scriptbook_cleaner import _conservative_pre_clean
+        from core.scriptbook_parser import load_scriptbook_content
+        import unicodedata as _uni
+
+        # 建立文件路径索引（文件名 → Path）
+        _file_index = {f.name: f for f in scriptbook_files}
+        # 真实音轨名索引（归一化 → 原名），用于把 LLM 返回的音轨名匹配到真实音轨
+        _real_index = {}
+        if track_names:
+            for _tn in track_names:
+                _k = _uni.normalize('NFC', _tn)
+                _k = re.sub(r'[\s_\-・·\.\,\#]', '', _k).lower()
+                _real_index[_k] = _tn
+
+        def _norm_key(s: str) -> str:
+            s = _uni.normalize('NFC', s)
+            return re.sub(r'[\s_\-・·\.\,\#]', '', s).lower()
+
+        track_map: dict[str, list[str]] = {}
+        if track_names:
+            for name in track_names:
+                track_map[name] = []
+
+        # 整组 PDF 排版复用：同一作品所有 PDF 排版一致，只分析一次代表 PDF，其余复用，
+        # 避免每个 PDF 都触发一次 LLM 排版分析（非常耗时）。
+        _group_pdf_layout = None
+        if any(f.suffix.lower() == '.pdf' for f in scriptbook_files):
+            try:
+                from core.scriptbook_parser import compute_group_pdf_layout
+                _group_pdf_layout = compute_group_pdf_layout(scriptbook_files, ctx.api_cfg)
+            except Exception as _le:
+                _log(f"  [台本·多轨] PDF 排版分析失败: {_le}")
+
+        for _fname, _track_names_in_file in file_track_groups.items():
+            _f = _file_index.get(_fname)
+            if _f is None:
+                # 模糊匹配文件名
+                for _fn, _fp in _file_index.items():
+                    if _norm_key(_fname) in _norm_key(_fn) or _norm_key(_fn) in _norm_key(_fname):
+                        _f = _fp
+                        break
+            if _f is None:
+                _log(f"  [台本·多轨] 找不到文件: {_fname}，跳过")
+                continue
+
+            content = load_scriptbook_content(_f, api_config=ctx.api_cfg, layout=_group_pdf_layout)
+            if not content:
+                _log(f"  [台本·多轨] 加载失败: {_fname}")
+                continue
+            cleaned = _conservative_pre_clean(content)
+            full_lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
+
+            # 把 LLM 返回的音轨名匹配到真实音轨名
+            _file_tracks_real: list[str] = []
+            for _tn in _track_names_in_file:
+                _matched = None
+                _nk = _norm_key(str(_tn))
+                _matched = _real_index.get(_nk)
+                if _matched is None and track_names:
+                    for _rn in track_names:
+                        if _nk in _norm_key(_rn) or _norm_key(_rn) in _nk:
+                            _matched = _rn
+                            break
+                if _matched is not None:
+                    _file_tracks_real.append(_matched)
+            if not _file_tracks_real:
+                _log(f"  [台本·多轨] {_f.name} 音轨名无法匹配真实音轨，跳过")
+                continue
+
+            # 完整台本直接赋给该文件的所有音轨（靠 sb 对齐在翻译时匹配）
+            for _t in _file_tracks_real:
+                track_map[_t] = full_lines
+            _log(f"  [台本·多轨] {_f.name}: 完整台本 {len(full_lines)} 行，赋给 {len(_file_tracks_real)} 个音轨共用")
+
+        total_clean = sum(len(v) for v in track_map.values())
+        _log(f"  → 多轨文件共用完整台本: {len(track_map)} 个音轨, 每音轨 {total_clean // max(len(track_map),1)} 行（靠 sb 对齐）")
+
+        # 导出
+        if export_scriptbook and track_map:
+            import json as _json
+            export_dir = scriptbook_files[0].parent if scriptbook_files else work_dir
+            (export_dir / '_scriptbook_clean.json').write_text(
+                _json.dumps(track_map, ensure_ascii=False, indent=2), encoding='utf-8')
+            split_dir = export_dir / '_split_tracks'
+            split_dir.mkdir(exist_ok=True)
+            for name, lines in track_map.items():
+                if lines:
+                    safe_name = name.replace('/', '_').replace('\\', '_')
+                    (split_dir / f'{safe_name}.txt').write_text('\n'.join(lines), encoding='utf-8')
+            _log(f"  → 导出: {export_dir / '_scriptbook_clean.json'}")
+            _log(f"  → 导出: {split_dir.absolute()} ({total_clean} 行)")
+
+        return track_map
+
+    # ═══════════════════════════════════════════════════════════
     # 预分割路径: LLM 已返回 file_track_mapping {文件索引→音轨名}
     # 直接用 LLM 映射加载文件，再将 LLM 音轨名模糊匹配到真实音轨名
     # ═══════════════════════════════════════════════════════════
@@ -848,7 +1032,13 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
                 _debug(f"预分割: LLM文件名\"{llm_filename}\"找不到, 跳过")
                 continue
 
-            content = load_scriptbook_content(f, api_config=ctx.api_cfg)
+            # 同一作品所有 PDF 台本排版一致：整组只分析一次代表 PDF，其余复用参数
+            from core.scriptbook_parser import compute_group_pdf_layout
+            if getattr(ctx, '_group_pdf_layout', None) is None:
+                ctx._group_pdf_layout = compute_group_pdf_layout(scriptbook_files, ctx.api_cfg)
+
+            content = load_scriptbook_content(f, api_config=ctx.api_cfg,
+                                              layout=getattr(ctx, '_group_pdf_layout', None))
             if content:
                 cleaned = _conservative_pre_clean(content)
                 lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
@@ -1031,15 +1221,18 @@ def _apply_keyword_filter(lines: list[str]) -> list[str]:
 
 # ==================== 自动术语/世界观分析（LLM驱动） ====================
 
-def _sample_ja_lrc_for_worldview(work_dir: Path, lines_per_file: int = 40) -> list[str]:
+def _sample_ja_lrc_for_worldview(work_dir: Path, lines_per_file: int = 40, max_total_chars: int = 5000) -> list[str]:
     """抽样 .ja.lrc 文件内容，用于世界观 LLM 分析
 
     从 work_dir 递归搜索所有 .ja.lrc 文件，每个文件均匀抽样若干行。
+    总字符数控制在 max_total_chars 以内（默认 5000），避免发送过多内容浪费 token、
+    导致窗口溢出或响应异常。
 
     返回: ["=== 文件: xxx.ja.lrc ===\\nline1\\nline2\\n...", ...]
     """
     samples: list[str] = []
     ja_files = sorted(work_dir.rglob('*.ja.lrc'))
+    total_chars = 0
 
     for ja_path in ja_files:
         # 排除 bug 收集目录
@@ -1062,7 +1255,13 @@ def _sample_ja_lrc_for_worldview(work_dir: Path, lines_per_file: int = 40) -> li
                 sampled.append(texts[i])
 
             if sampled:
-                samples.append(f"=== 文件: {ja_path.name} ===\n" + "\n".join(sampled))
+                block = f"=== 文件: {ja_path.name} ===\n" + "\n".join(sampled)
+                # 若超过总上限，截断后停止
+                if total_chars + len(block) > max_total_chars:
+                    # 尽量保留已有内容，停止继续添加
+                    break
+                samples.append(block)
+                total_chars += len(block)
         except Exception:
             continue
 
@@ -1400,40 +1599,134 @@ def translate_one_lrc(
             _log(f"  [台本·对齐] 失败，跳过: {_e}")
             scriptbook_aligned = None
 
-    # 编号（整文件一次性翻译，不分块；每行附 sb 作含义参考）
-    numbered = [f"{i+1:04d}: {t}" for i, t in enumerate(texts)]
-    _log(f"\n[翻译] 整文件翻译: {len(texts)} 行, {sum(len(t) for t in texts)} 字符")
+    # 过滤空行：翻译前剔除无内容的空行（仅时间戳无文本），避免浪费 token。
+    # 记录原始索引映射，写回时同样只保留非空行（删除空行）。
+    _nonempty_idx = [i for i, t in enumerate(texts) if t and t.strip()]
+    _texts_eff = [texts[i] for i in _nonempty_idx]
+    # scriptbook_aligned 键从原始行索引重映射到过滤后的新索引
+    if scriptbook_aligned:
+        scriptbook_aligned = {
+            _new_i: scriptbook_aligned[_old_i]
+            for _new_i, _old_i in enumerate(_nonempty_idx)
+            if _old_i in scriptbook_aligned
+        }
+
+    # 编号（整文件一次性翻译，每行附 sb 作含义参考）
+    numbered = [f"{i+1:04d}: {t}" for i, t in enumerate(_texts_eff)]
+
+    # 分块翻译：app.lrc_max_lines_per_request > 0 时按该行数分块发送，避免长文本请求超时。
+    # 每块独立调用 translate_batch，合并结果；scriptbook_aligned 按子块内新索引重映射。
+    _chunk_size = int(ctx.config.get('app', {}).get('lrc_max_lines_per_request', 0) or 0)
+    _use_chunk = _chunk_size > 0 and len(_texts_eff) > _chunk_size
+
+    if _use_chunk:
+        _n_chunks = (len(_texts_eff) + _chunk_size - 1) // _chunk_size
+        _log(f"\n[翻译] 分块翻译: {len(_texts_eff)} 行(已滤空行), 每块 {_chunk_size} 行, 共 {_n_chunks} 块")
+    else:
+        _log(f"\n[翻译] 整文件翻译: {len(_texts_eff)} 行(已滤空行), {sum(len(t) for t in _texts_eff)} 字符")
 
     translated_texts: list[str] = []
+    _chunk_start_t = time.time()
+    _total_hit = 0
+    _total_miss = 0
+    _total_prompt = 0
+    _total_comp = 0
+    _total_cost = 0.0
 
-    _log(f"  → 时间: {time.strftime('%H:%M:%S')}, 发送请求...")
-    call_start = time.time()
-    result = ctx.translate_engine.translate_batch(
-        numbered, terms=terms,
-        alias_list=alias_list,
-        worldview=worldview,
-        scriptbook_lines=scriptbook_lines,
-        scriptbook_aligned=scriptbook_aligned,
-        skip_hallucination_check=True,
-    )
-    call_elapsed = time.time() - call_start
+    # 构造分块列表
+    _chunks: list[list[int]] = []  # 每块 = 行索引列表
+    if _use_chunk:
+        for _b in range(0, len(_texts_eff), _chunk_size):
+            _chunks.append(list(range(_b, min(_b + _chunk_size, len(_texts_eff)))))
+    else:
+        _chunks.append(list(range(len(_texts_eff))))
 
-    translated_batch = result.get('translated_lines', [])
-    for t_line in translated_batch:
-        if ': ' in t_line:
-            t_line = t_line.split(': ', 1)[1]
-        if t_line == '[EMPTY_LINE]':
-            t_line = ''
-        translated_texts.append(t_line)
-    # 诊断：翻译全空时打印 LLM 原始响应（仅 debug 模式详细输出）
-    if len(translated_batch) > 0 and all(not (t or '').strip() for t in translated_batch):
-        _log(f"  WARN: 翻译结果全空 ({len(translated_batch)}行)")
-        if ctx.pr.debug:
-            _log(f"  [DEBUG] translated_batch前3=[{str(translated_batch[:3])[:200]}]")
-            raw_resp = getattr(ctx.translate_engine, '_last_raw_response', 'NOT_FOUND')
-            _log(f"  [DEBUG] LLM原始响应 ({len(raw_resp) if raw_resp != 'NOT_FOUND' else 'N/A'}字符): {(raw_resp or '')[:500]}")
-            if raw_resp and raw_resp != 'NOT_FOUND' and len(raw_resp) > 500:
-                _log(f"  [DEBUG] ...末尾: {raw_resp[-300:]}")
+    _all_ok = True
+    for _ci, _chunk_idx in enumerate(_chunks):
+        _chunk_numbered = [numbered[i] for i in _chunk_idx]
+        # 分块内 scriptbook_aligned：把原始行索引 i 映射为子块内索引 (i - 块起点)
+        _chunk_sb = None
+        if scriptbook_aligned:
+            _chunk_sb = {}
+            _base = _chunk_idx[0]
+            for _i in _chunk_idx:
+                if _i in scriptbook_aligned:
+                    _chunk_sb[_i - _base] = scriptbook_aligned[_i]
+
+        if _use_chunk:
+            _log(f"  [块 {_ci+1}/{len(_chunks)}] 行 {_chunk_idx[0]+1}-{_chunk_idx[-1]+1}，发送请求...")
+        else:
+            _log(f"  → 时间: {time.strftime('%H:%M:%S')}, 发送请求...")
+        call_start = time.time()
+        result = ctx.translate_engine.translate_batch(
+            _chunk_numbered, terms=terms,
+            alias_list=alias_list,
+            worldview=worldview,
+            scriptbook_lines=scriptbook_lines,
+            scriptbook_aligned=_chunk_sb,
+            skip_hallucination_check=True,
+        )
+        call_elapsed = time.time() - call_start
+
+        translated_batch = result.get('translated_lines', [])
+        # 若分块翻译失败（全空/异常），记 _all_ok=False，仍继续后续块
+        _parsed_count_block = result.get('parsed_count', 0)
+        if _parsed_count_block == 0 and len(_chunk_idx) >= 5:
+            _all_ok = False
+        # 累加 token / 费用统计
+        _total_hit += result.get('hit_tokens', 0)
+        _total_miss += result.get('miss_tokens', 0)
+        _total_comp += result.get('completion_tokens', 0)
+        _total_cost += result.get('cost', 0.0)
+        _total_prompt += result.get('prompt_tokens', 0) or 0
+
+        # 块内解析出的行数可能少于块行数，补齐为空
+        while len(translated_batch) < len(_chunk_idx):
+            translated_batch.append('')
+        for t_line in translated_batch[:len(_chunk_idx)]:
+            if ': ' in t_line:
+                t_line = t_line.split(': ', 1)[1]
+            if t_line == '[EMPTY_LINE]':
+                t_line = ''
+            translated_texts.append(t_line)
+        if _use_chunk:
+            _n_empty = sum(1 for t in translated_batch[:len(_chunk_idx)] if not (t or '').strip())
+            _log(f"  [块 {_ci+1}/{len(_chunks)}] 完成: 解析 {len(translated_batch[:len(_chunk_idx)])} 行, "
+                 f"非空 {len(_chunk_idx)-_n_empty} 行, 耗时 {call_elapsed:.1f}s")
+
+    call_elapsed_total = time.time() - _chunk_start_t
+
+    # ═══════════════════════════════════════════════════════════
+    # 异常翻译判定：整文件翻译时仅当解析失败（parsed_count==0）判定失败；
+    # 分块翻译时，若有任一整块解析失败（全空）则判定失败。
+    # 判定为失败：不写文件、不入统计，加入重试队列，待其他音轨全部完成后统一重试一次。
+    # 主线程只打印一行简洁失败提示（详细 JSON 诊断已在 worker 日志输出）。
+    # ═══════════════════════════════════════════════════════════
+    _n_input = len(_texts_eff)
+    _abnormal_reason = ''
+    if _use_chunk:
+        if not _all_ok:
+            _abnormal_reason = f"[分块翻译] 存在整块解析失败（原文{_n_input}行）"
+    elif _n_input >= 5:
+        # 整文件翻译：取最后一块的 parsed_count（无分块时即唯一块）
+        _parsed_count = result.get('parsed_count', 0)
+        if _parsed_count == 0:
+            _abnormal_reason = f"[JSON解析] 失败！原文{_n_input}行全部留空"
+    if _abnormal_reason:
+        _log(f"  [异常翻译] {lrc_path.name}: {_abnormal_reason}")
+        _log(f"  [异常翻译] 标记为翻译失败，不写入文件，待其他音轨全部完成后重试一次")
+        with ctx.thread_lock:
+            ctx.abnormal_count += 1
+            ctx.retry_results[lrc_path.name] = f'失败: {_abnormal_reason}'
+            if getattr(ctx, 'retry_queue', None) is not None:
+                ctx.retry_queue.append({
+                    'lrc_path': lrc_path,
+                    'terms': terms,
+                    'alias_list': alias_list,
+                    'worldview': worldview,
+                    'scriptbook_lines': scriptbook_lines,
+                })
+        return False
 
     if getattr(ctx, 'parallel_mode', False):
         # 并行模式下省略逐文件耗时统计，避免刷屏（由进度行汇总）
@@ -1448,12 +1741,22 @@ def translate_one_lrc(
     elif ctx.pr.debug:
         for i, t in enumerate(non_empty[:3]):
             _log(f"      [{i+1}] {t[:80]}")
-    hit = result.get('hit_tokens', 0)
-    miss = result.get('miss_tokens', 0)
-    prompt = result.get('prompt_tokens', hit + miss)
-    comp = result.get('completion_tokens', 0)
-    elapsed = result.get('elapsed', call_elapsed)
-    cost = result.get('cost', 0)
+    # token 统计：分块时累加所有块的 token；整文件时用单块 result
+    if _use_chunk:
+        # 聚合循环中累加的 token
+        hit = _total_hit
+        miss = _total_miss
+        prompt = _total_prompt
+        comp = _total_comp
+        cost = _total_cost
+        elapsed = call_elapsed_total
+    else:
+        hit = result.get('hit_tokens', 0)
+        miss = result.get('miss_tokens', 0)
+        prompt = result.get('prompt_tokens', hit + miss)
+        comp = result.get('completion_tokens', 0)
+        elapsed = result.get('elapsed', call_elapsed)
+        cost = result.get('cost', 0)
 
     # 统一 token 追踪：记录 + 打印
     # work_key 使用 RJ 作品根目录，确保同一作品的翻译/台本/世界观合并统计
@@ -1485,12 +1788,32 @@ def translate_one_lrc(
 
     # 补齐不足的行（翻译失败的回退）
     shortage = 0
-    while len(translated_texts) < len(texts):
+    while len(translated_texts) < len(_texts_eff):
         idx = len(translated_texts)
-        translated_texts.append(texts[idx])
+        translated_texts.append(_texts_eff[idx])
         shortage += 1
     if shortage > 0:
         _log(f"  [补齐] 翻译缺失 {shortage} 行，已用原文回退")
+
+    # 润色（Post-editing）：config app.polish_after_translate=true 时启用。
+    # 只返回需要润色的行并写回，术语表/世界观一并发送以保护既定译名。
+    if ctx.config.get('app', {}).get('polish_after_translate', False):
+        try:
+            _polish_map = ctx.translate_engine.polish_batch(
+                translated_texts, terms=terms, worldview=worldview, alias_list=alias_list)
+            if _polish_map:
+                _changed = 0
+                for _idx, _new_txt in _polish_map.items():
+                    _pos = _idx - 1
+                    if 0 <= _pos < len(translated_texts) and _new_txt.strip():
+                        if translated_texts[_pos].strip() != _new_txt.strip():
+                            translated_texts[_pos] = _new_txt
+                            _changed += 1
+                _log(f"  [润色] 更新 {_changed} 行（需润色 {len(_polish_map)} 行）")
+            else:
+                _log(f"  [润色] 无需润色或未返回")
+        except Exception as _pe:
+            _log(f"  [润色] 失败: {_pe}")
 
     # 创建 .ja.* 留档（翻译前保留日文原版）
     export_ja = ctx.config.get('app', {}).get('export_ja_lrc', True)
@@ -1514,10 +1837,11 @@ def translate_one_lrc(
             ctx.stats["skipped"] += 1
         return False
 
-    # 写回翻译结果（通用字幕格式）
-    write_subtitle_file(sub_file, translated_texts, lrc_path)
+    # 写回翻译结果（通用字幕格式；过滤空行，只保留非空歌词行）
+    from io_adapter.lrc_handler import write_subtitle_file_nonempty
+    write_subtitle_file_nonempty(sub_file, translated_texts, lrc_path)
     _log(f"\n[写入] -> {abs_path}")
-    _log(f"  -> 翻译完成: {len(translated_texts)} 行中文")
+    _log(f"  -> 翻译完成: {len(translated_texts)} 行中文（已去除空行）")
     with ctx.thread_lock:
         ctx.stats['translated'] += 1
 
@@ -1879,6 +2203,8 @@ def run_pipeline(
     _log(f"  top_p: {gen_params.get('top_p', 'N/A')}")
     _log(f"  max_tokens: {gen_params.get('max_tokens', 'N/A')}")
     _log(f"  reasoning_effort: {gen_params.get('reasoning_effort', 'N/A')}  (思考强度)")
+    _polish_on = bool(ctx.config.get('app', {}).get('polish_after_translate', False))
+    _log(f"  翻译后润色(Post-editing): {'开' if _polish_on else '关'}")
     _log()
 
     # 峰谷调度预期提示
@@ -2189,15 +2515,23 @@ def run_pipeline(
                     scriptbook_lines=task['scriptbook_lines'],
                 )
                 _elapsed = time.time() - _start
+                # 异常翻译（解析失败/截断/大量留空）→ 主线程进度标记为"失败"并提示待重试
+                _abnormal = lrc_path.name in ctx.retry_results and ctx.retry_results[lrc_path.name].startswith('失败')
                 if ctx.parallel_mode:
-                    ctx.update_work_progress(label, '完成', lrc_path.name, wid, _start, _elapsed)
+                    if _abnormal:
+                        ctx.update_work_progress(label, '失败', lrc_path.name + '（翻译失败，待重试）', wid, _start, _elapsed)
+                    else:
+                        ctx.update_work_progress(label, '完成', lrc_path.name, wid, _start, _elapsed)
                 if success:
                     _log(f"  [W{wid}] ✔ 完成音轨: {label} | {lrc_path.name}（用时 {_elapsed:.1f}s）")
                     return True
                 else:
                     with ctx.thread_lock:
                         ctx.stats['skipped'] += 1
-                    _log(f"  [W{wid}] ○ 跳过音轨: {lrc_path.name}")
+                    if _abnormal:
+                        _log(f"  [W{wid}] ✗ 翻译失败（待重试）: {lrc_path.name}")
+                    else:
+                        _log(f"  [W{wid}] ○ 跳过音轨: {lrc_path.name}")
                     return False
             except Exception as e:
                 import traceback
@@ -2302,11 +2636,52 @@ def run_pipeline(
                         _done += 1
                         if _fut.result():
                             _ok += 1
+
+                # ── 第一轮全部完成后：重试异常翻译的音轨一次 ──
+                with ctx.thread_lock:
+                    _retry_tasks = list(ctx.retry_queue)
+                    ctx.retry_queue = []
+                if _retry_tasks:
+                    _log()
+                    _sep(f"重试异常翻译（{len(_retry_tasks)} 个音轨）")
+                    _log(f"  以下音轨第一轮翻译失败（JSON解析失败/截断/大量留空），待全部完成后重试一次：")
+                    for _rt in _retry_tasks:
+                        _log(f"    - {_rt['lrc_path'].name}")
+                    _log()
+                    _retry_ok = 0
+                    with ThreadPoolExecutor(max_workers=min(_parallel, len(_retry_tasks))) as _rex:
+                        _rfutures = {_rex.submit(_translate_task, t): t for t in _retry_tasks}
+                        for _rfut in as_completed(_rfutures):
+                            _rt_task = _rfutures[_rfut]
+                            if _rfut.result():
+                                _retry_ok += 1
+                                # 第一轮失败时已计入 skipped，重试成功回退，避免进度超总数
+                                with ctx.thread_lock:
+                                    ctx.stats['skipped'] = max(0, ctx.stats.get('skipped', 0) - 1)
+                                    ctx.retry_results[_rt_task['lrc_path'].name] = '重试成功'
+                    _ok += _retry_ok
+                    # 重试后仍未成功（再次异常）的 → 记录最终结果
+                    with ctx.thread_lock:
+                        _still_failed = list(ctx.retry_queue)
+                        ctx.retry_queue = []
+                    if _still_failed:
+                        _log(f"  [重试] 仍有 {len(_still_failed)} 个音轨翻译失败：")
+                        for _sf in _still_failed:
+                            _log(f"    ✗ {_sf['lrc_path'].name}（重试后仍失败，请手动处理）")
+                    else:
+                        _log(f"  [重试] 全部重试成功 ✓")
             finally:
                 _progress_stop.set()
                 _progress_thread.join(timeout=1)
                 ctx.parallel_mode = False
                 _log(f"  [并行完成] 音轨 {_done}/{len(_tasks)}，成功 {_ok}")
+                # 总结：异常翻译重试说明（供日志/前端查看）
+                if ctx.abnormal_count > 0:
+                    _log()
+                    _sep("异常翻译重试总结")
+                    _log(f"  第一轮出现异常翻译的音轨: {ctx.abnormal_count} 个")
+                    for _name, _rst in ctx.retry_results.items():
+                        _log(f"    - {_name}: {_rst}")
         else:
             # 串行（或作品很少）—— 保持原逻辑
             _current_dir = None
@@ -2358,7 +2733,10 @@ def run_pipeline(
                     else:
                         with ctx.thread_lock:
                             ctx.stats['skipped'] += 1
-                        _log(f"\n○ 文件 [{i+1}/{len(lrc_files)}] 跳过: {lrc_path.name}")
+                        if lrc_path.name in ctx.retry_results:
+                            _log(f"\n✗ 文件 [{i+1}/{len(lrc_files)}] 翻译失败（待重试）: {lrc_path.name}")
+                        else:
+                            _log(f"\n○ 文件 [{i+1}/{len(lrc_files)}] 跳过: {lrc_path.name}")
 
                         _log(f"\n  已耗时: {ctx.elapsed:.1f}s | "
                           f"已完成: {ctx.stats['translated']}/{len(lrc_files)} | "
@@ -2376,6 +2754,50 @@ def run_pipeline(
             if _current_dir is not None:
                 _record_dir_report(ctx, _current_dir, _dir_start_translated,
                                    _dir_start_lines, _dir_start_time)
+
+            # ── 串行模式：全部完成后重试异常翻译的音轨一次 ──
+            with ctx.thread_lock:
+                _retry_tasks = list(ctx.retry_queue)
+                ctx.retry_queue = []
+            if _retry_tasks:
+                _log()
+                _sep(f"重试异常翻译（{len(_retry_tasks)} 个音轨）")
+                _log(f"  以下音轨第一轮翻译失败（JSON解析失败/截断/大量留空），待全部完成后重试一次：")
+                for _rt in _retry_tasks:
+                    _log(f"    - {_rt['lrc_path'].name}")
+                _log()
+                _retry_ok = 0
+                for _rt in _retry_tasks:
+                    try:
+                        _rsuccess = translate_one_lrc(
+                            _rt['lrc_path'], ctx,
+                            terms=_rt['terms'],
+                            alias_list=_rt['alias_list'],
+                            worldview=_rt['worldview'],
+                            scriptbook_lines=_rt['scriptbook_lines'],
+                        )
+                        if _rsuccess:
+                            _retry_ok += 1
+                            with ctx.thread_lock:
+                                ctx.stats['skipped'] = max(0, ctx.stats.get('skipped', 0) - 1)
+                                ctx.retry_results[_rt['lrc_path'].name] = '重试成功'
+                    except Exception as _re:
+                        _log(f"  [重试] {_rt['lrc_path'].name} 异常: {_re}")
+                _still_failed = [t['lrc_path'].name for t in ctx.retry_queue]
+                with ctx.thread_lock:
+                    ctx.retry_queue = []
+                if _still_failed:
+                    _log(f"  [重试] 仍有 {len(_still_failed)} 个音轨翻译失败：")
+                    for _sn in _still_failed:
+                        _log(f"    ✗ {_sn}（重试后仍失败，请手动处理）")
+                else:
+                    _log(f"  [重试] 全部重试成功 ✓（成功 {_retry_ok} 个）")
+                if ctx.abnormal_count > 0:
+                    _log()
+                    _sep("异常翻译重试总结")
+                    _log(f"  第一轮出现异常翻译的音轨: {ctx.abnormal_count} 个")
+                    for _name, _rst in ctx.retry_results.items():
+                        _log(f"    - {_name}: {_rst}")
 
     # ──── 第 6 步: 打印报告 ────
     _sep("处理完成")

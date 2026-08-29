@@ -467,6 +467,43 @@ def write_subtitle_file(sub_file: SubtitleFile, translated_lyrics: list[str], ta
         f.writelines(final_lines)
 
 
+def write_subtitle_file_nonempty(sub_file: SubtitleFile, translated_lyrics: list[str], target_path: Path) -> None:
+    """将翻译结果写回字幕文件，仅保留非空歌词行（删除空行/无内容行）。
+
+    与 write_subtitle_file 的区别：原文中空行（仅时间戳无文本）的歌词行被整体删除，
+    translated_lyrics 只与原文非空歌词行一一对应（长度 = 非空行数）。
+
+    参数:
+        sub_file: parse_subtitle_file 的解析结果
+        translated_lyrics: 翻译后的文本行（仅对应非空歌词行，顺序与原文非空行一致）
+        target_path: 输出路径
+    """
+    final_lines: list[str | None] = list(sub_file.final_lines)
+
+    # 遍历所有歌词行：非空行写入翻译文本，空行（None）保留待删除
+    _trans_i = 0
+    for oi, fi in enumerate(sub_file.lyric_indices):
+        is_nonempty = oi < len(sub_file.original_lyrics) and sub_file.original_lyrics[oi] and sub_file.original_lyrics[oi].strip()
+        if is_nonempty:
+            tags = sub_file.time_tags[oi]
+            new_lyric = translated_lyrics[_trans_i] if _trans_i < len(translated_lyrics) else ''
+            if sub_file.ext == '.lrc':
+                final_lines[fi] = f"{tags}{new_lyric}\n" if new_lyric else f"{tags}\n"
+            else:
+                final_lines[fi] = f"{new_lyric}\n" if new_lyric else '\n'
+            _trans_i += 1
+        # else: 空歌词行保持 None，最后删除
+
+    # 删除空歌词行（final_lines 中仍为 None 的行）
+    out_lines = [l if l is not None else '\n' for l in final_lines if l is not None]
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(target_path, 'w', encoding='utf-8') as f:
+        f.writelines(out_lines)
+
+
+
+
 # ==================== 语言检测 ====================
 
 def extract_subtitle_texts(content: str, ext: str) -> list[str]:

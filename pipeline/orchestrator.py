@@ -61,6 +61,10 @@ from io_adapter.lrc_handler import (
 # 模块级 printer 引用（run_pipeline 启动时设置）
 _pr: Printer | None = None
 
+# 前置流程并行 worker ID 计数器（每组一个 ID，内层台本/术语线程继承相同 ID）
+_preprocess_id_counter = [0]
+_preprocess_id_lock = threading.Lock()
+
 
 def _log(msg: str = "", *, flush: bool = True):
     """输出日志并立即刷新 stdout。通过模块级 _pr 统一格式。
@@ -1005,6 +1009,16 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
         # 文件名 → Path 索引
         file_index = {f.name: f for f in scriptbook_files}
 
+        # 整组 PDF 排版复用：同一作品所有 PDF 台本排版一致，只分析一次代表 PDF，其余复用，
+        # 避免每个 PDF 都触发一次 LLM 排版分析（非常耗时）。
+        _group_pdf_layout = None
+        if any(f.suffix.lower() == '.pdf' for f in scriptbook_files):
+            try:
+                from core.scriptbook_parser import compute_group_pdf_layout
+                _group_pdf_layout = compute_group_pdf_layout(scriptbook_files, ctx.api_cfg)
+            except Exception as _le:
+                _log(f"  [台本] PDF 排版分析失败: {_le}")
+
         for llm_track_name, llm_filename in file_track_mapping.items():
             # 匹配真实音轨名
             real_name = None
@@ -1032,13 +1046,8 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
                 _debug(f"预分割: LLM文件名\"{llm_filename}\"找不到, 跳过")
                 continue
 
-            # 同一作品所有 PDF 台本排版一致：整组只分析一次代表 PDF，其余复用参数
-            from core.scriptbook_parser import compute_group_pdf_layout
-            if getattr(ctx, '_group_pdf_layout', None) is None:
-                ctx._group_pdf_layout = compute_group_pdf_layout(scriptbook_files, ctx.api_cfg)
-
             content = load_scriptbook_content(f, api_config=ctx.api_cfg,
-                                              layout=getattr(ctx, '_group_pdf_layout', None))
+                                              layout=_group_pdf_layout)
             if content:
                 cleaned = _conservative_pre_clean(content)
                 lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
@@ -1383,18 +1392,19 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
                                 wv_token_stats.get('miss_tokens', 0),
                                 wv_token_stats.get('completion_tokens', 0),
                             )
-                            ctx.tracker.record(TokenUsage(
-                                request_type='worldview',
-                                label=f'{len(samples)}个样本',
-                                work_key=str(work_dir),
-                                prompt_tokens=wv_token_stats.get('prompt_tokens', 0),
-                                hit_tokens=wv_token_stats.get('hit_tokens', 0),
-                                miss_tokens=wv_token_stats.get('miss_tokens', 0),
-                                completion_tokens=wv_token_stats.get('completion_tokens', 0),
-                                cost=_wv_cost,
-                                elapsed=0,
-                            ))
-                            ctx.pr.token_inline(ctx.tracker.records[-1])
+                            with ctx.thread_lock:
+                                ctx.tracker.record(TokenUsage(
+                                    request_type='worldview',
+                                    label=f'{len(samples)}个样本',
+                                    work_key=str(work_dir),
+                                    prompt_tokens=wv_token_stats.get('prompt_tokens', 0),
+                                    hit_tokens=wv_token_stats.get('hit_tokens', 0),
+                                    miss_tokens=wv_token_stats.get('miss_tokens', 0),
+                                    completion_tokens=wv_token_stats.get('completion_tokens', 0),
+                                    cost=_wv_cost,
+                                    elapsed=0,
+                                ))
+                                ctx.pr.token_inline(ctx.tracker.records[-1])
                         if worldview:
                             save_worldview(work_dir, worldview)
                             chars = worldview.get('characters', [])
@@ -2182,6 +2192,10 @@ def run_pipeline(
     global _pr
     _pr = ctx.pr
 
+    # 重置前置 worker ID 计数器
+    with _preprocess_id_lock:
+        _preprocess_id_counter[0] = 0
+
     # 打印启动信息
     _sep("字幕翻译管道启动")
     _log(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -2282,21 +2296,24 @@ def run_pipeline(
     # ──── 第 2 步: 加载台本 + 世界观 + 术语 ────
     _sep("第 2 步: 加载台本 / 世界观 / 术语")
 
+    from concurrent.futures import ThreadPoolExecutor as _PrePool, as_completed as _as_completed
+
     # 按 RJ 根目录归组分析（同一 RJ 号的子目录共享术语/世界观/台本）
     from io_adapter.file_scanner import find_rj_work_root
     work_terms: dict = {}        # group_key -> {jp: zh}
     work_alias: dict = {}        # group_key -> [alias_items]
     work_scriptbook: dict = {}   # group_key -> {track_name: [clean_lines]}
     work_worldview: dict = {}    # group_key -> worldview_dict
-    analyzed_dirs: set = set()
 
     # 收集 LRC 文件名（仅 .lrc，不含 .ja.lrc 留档），用于台本分割匹配
-    # 直接使用 fpath.stem 全名；.ja.lrc 已被过滤不会重复
     all_track_names: list[str] = []
     for fpath in lrc_files:
         if fpath.suffix == '.lrc' and not fpath.name.endswith('.ja.lrc'):
             all_track_names.append(fpath.stem)
 
+    # ── 阶段 A: 收集所有待分析的 RJ 分组（去重）──
+    _groups_to_analyze: list[tuple] = []
+    analyzed_dirs: set = set()
     for fpath in lrc_files:
         rj_root, rj_number = find_rj_work_root(fpath)
         group_key = rj_root if rj_root else fpath.parent
@@ -2304,53 +2321,96 @@ def run_pipeline(
             continue
         analyzed_dirs.add(group_key)
 
-        _log(f"\n  分析目录: {group_key.absolute()}" + (f" (RJ{rj_number})" if rj_number else ""))
         _dir_key = str(group_key)
-
-        # 加载该目录的台本（只在该 RJ 目录内搜索，不跨作品）
-        # 传入该目录的 LRC 音轨名列表，用于台本分割匹配
-        from io_adapter.file_scanner import find_rj_work_root as _find_rj
         _dir_track_names = []
         for _fp in lrc_files:
             if _fp.suffix == '.lrc' and not _fp.name.endswith('.ja.lrc'):
-                _rj_root, _ = _find_rj(_fp)
+                _rj_root, _ = find_rj_work_root(_fp)
                 _gk = _rj_root if _rj_root else _fp.parent
                 if str(_gk) == _dir_key:
                     _dir_track_names.append(_fp.stem)
-        # 提取每条音轨的前几句 ASR 台词，辅助 LLM 定位台本段落
         _dir_track_samples = _extract_track_asr_samples(group_key, _dir_track_names)
-        if _dir_track_samples:
-            _log(f"  [台本] 提取 ASR 样本: {len(_dir_track_samples)}/{len(_dir_track_names)} 条音轨有 .ja.lrc")
-        dir_scriptbook = _load_scriptbook(group_key, ctx, track_names=_dir_track_names,
-                                          track_samples=_dir_track_samples if _dir_track_samples else None)
-        if dir_scriptbook:
-            work_scriptbook[_dir_key] = dir_scriptbook
-            _total_sb_lines = sum(len(v) for v in dir_scriptbook.values())
-            _log(f"  -> 台本: {len(dir_scriptbook)} 个音轨, 共 {_total_sb_lines} 行")
+        _groups_to_analyze.append((group_key, rj_number, _dir_track_names, _dir_track_samples))
 
-        # 分析/加载该目录的术语、alias 和世界观（只在该 RJ 目录内）
-        dir_terms, dir_alias, dir_worldview = _analyze_work_terms(group_key, ctx)
+    # ── 阶段 B: 单组分析函数（组内台本 + 术语并行）──
+    def _analyze_one_group(group_key, rj_number, dir_track_names, dir_track_samples):
+        """分析单个 RJ 分组的台本 + 术语 + 世界观（组内台本与术语并行）"""
+        from engines.api_client import worker_local as _wl
 
-        # 合并从文件加载的已有世界观（如果有的话，已被 _analyze_work_terms 加载）
-        if dir_worldview:
-            work_worldview[_dir_key] = dir_worldview
-            if isinstance(dir_worldview.get('characters'), dict):
-                dir_worldview['characters'] = [
+        # 分配组级 worker ID
+        with _preprocess_id_lock:
+            _preprocess_id_counter[0] += 1
+            _worker_id = _preprocess_id_counter[0]
+
+        def _set_id_and_call(fn, *args, **kwargs):
+            """内层线程 wrapper：设置 worker ID 后调用实际函数"""
+            _wl._worker_id = _worker_id
+            return fn(*args, **kwargs)
+
+        # 主线程日志（无前缀）
+        _log(f"\n  分析目录: {group_key.absolute()}" + (f" (RJ{rj_number})" if rj_number else ""))
+
+        # 内层并行：台本 + 术语
+        with _PrePool(max_workers=2) as _inner:
+            _sb = _inner.submit(_set_id_and_call, _load_scriptbook,
+                                group_key, ctx, dir_track_names, dir_track_samples or None)
+            _wt = _inner.submit(_set_id_and_call, _analyze_work_terms,
+                                group_key, ctx)
+            scriptbook = _sb.result()
+            terms, alias_list, worldview = _wt.result()
+
+        # 主线程日志（无前缀）
+        if dir_track_samples:
+            _log(f"  [台本] 提取 ASR 样本: {len(dir_track_samples)}/{len(dir_track_names)} 条音轨有 .ja.lrc")
+        if scriptbook:
+            _total = sum(len(v) for v in scriptbook.values())
+            _log(f"  -> 台本: {len(scriptbook)} 个音轨, 共 {_total} 行")
+        if worldview:
+            if isinstance(worldview.get('characters'), dict):
+                worldview['characters'] = [
                     {'name': k, 'personality': str(v)}
-                    for k, v in dir_worldview['characters'].items()
+                    for k, v in worldview['characters'].items()
                 ]
-            wv_text = dir_worldview.get('worldview', '')
-            _log(f"  -> 世界观: {'有' if wv_text else '无'} ({len(wv_text)} 字符), 角色: {len(dir_worldview.get('characters', {}))} 个")
+            wv = worldview.get('worldview', '')
+            _log(f"  -> 世界观: {'有' if wv else '无'} ({len(wv)} 字符), 角色: {len(worldview.get('characters', {}))} 个")
+        _log(f"  -> 术语: {len(terms)} 个, alias: {len(alias_list)} 个")
 
-        # 从 config.json 合并全局术语到该目录
-        config_terms = load_terms_from_config(ctx.config)
+        return group_key, scriptbook, terms, alias_list, worldview
+
+    # ── 阶段 C: 并行执行（translation_parallel 控制并发数）──
+    _parallel = ctx.translation_parallel
+
+    if _parallel > 1 and len(_groups_to_analyze) > 1:
+        _log(f"\n  并行分析: {len(_groups_to_analyze)} 个作品, {min(_parallel, len(_groups_to_analyze))} 并发")
+        with _PrePool(max_workers=min(_parallel, len(_groups_to_analyze))) as _pool:
+            _futures = {_pool.submit(_analyze_one_group, *g): g for g in _groups_to_analyze}
+            for _fut in _as_completed(_futures):
+                _gk, _sb, _terms, _alias, _wv = _fut.result()
+                _dk = str(_gk)
+                if _sb:
+                    work_scriptbook[_dk] = _sb
+                if _wv:
+                    work_worldview[_dk] = _wv
+                work_terms[_dk] = _terms
+                work_alias[_dk] = _alias
+    else:
+        # 串行回退
+        for g in _groups_to_analyze:
+            _gk, _sb, _terms, _alias, _wv = _analyze_one_group(*g)
+            _dk = str(_gk)
+            if _sb:
+                work_scriptbook[_dk] = _sb
+            if _wv:
+                work_worldview[_dk] = _wv
+            work_terms[_dk] = _terms
+            work_alias[_dk] = _alias
+
+    # 从 config.json 合并全局术语到各目录
+    config_terms = load_terms_from_config(ctx.config)
+    for _dk in work_terms:
         for jp, zh in config_terms.items():
-            if jp not in dir_terms:
-                dir_terms[jp] = zh
-
-        work_terms[_dir_key] = dir_terms
-        work_alias[_dir_key] = dir_alias
-        _log(f"  -> 术语: {len(dir_terms)} 个, alias: {len(dir_alias)} 个")
+            if jp not in work_terms[_dk]:
+                work_terms[_dk][jp] = zh
     _log()
 
     # ──── 第 5 步: 翻译 ────

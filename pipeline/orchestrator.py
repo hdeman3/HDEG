@@ -2334,7 +2334,10 @@ def run_pipeline(
 
     # ── 阶段 B: 单组分析函数（组内台本 + 术语并行）──
     def _analyze_one_group(group_key, rj_number, dir_track_names, dir_track_samples):
-        """分析单个 RJ 分组的台本 + 术语 + 世界观（组内台本与术语并行）"""
+        """分析单个 RJ 分组的台本 + 术语 + 世界观（组内台本与术语并行）
+
+        优化：台本缓存命中时跳过线程池，直接加载缓存 + 单独跑术语分析。
+        """
         from engines.api_client import worker_local as _wl
 
         # 分配组级 worker ID
@@ -2350,14 +2353,23 @@ def run_pipeline(
         # 主线程日志（无前缀）
         _log(f"\n  分析目录: {group_key.absolute()}" + (f" (RJ{rj_number})" if rj_number else ""))
 
-        # 内层并行：台本 + 术语
-        with _PrePool(max_workers=2) as _inner:
-            _sb = _inner.submit(_set_id_and_call, _load_scriptbook,
-                                group_key, ctx, dir_track_names, dir_track_samples or None)
-            _wt = _inner.submit(_set_id_and_call, _analyze_work_terms,
-                                group_key, ctx)
-            scriptbook = _sb.result()
-            terms, alias_list, worldview = _wt.result()
+        # ── 快速路径：台本缓存命中 → 跳过 LLM 识别，只跑术语 ──
+        _cached_sb = _try_load_cached_scriptbook(group_key, dir_track_names or [])
+        if _cached_sb is not None:
+            scriptbook = _cached_sb
+            _total = sum(len(v) for v in scriptbook.values())
+            _matched = sum(1 for v in scriptbook.values() if v)
+            _log(f"  [台本] 缓存命中 ({_matched}/{len(scriptbook)} 个音轨有内容, {_total} 行)，跳过 LLM 识别")
+            terms, alias_list, worldview = _set_id_and_call(_analyze_work_terms, group_key, ctx)
+        else:
+            # ── 标准路径：台本 + 术语并行 ──
+            with _PrePool(max_workers=2) as _inner:
+                _sb = _inner.submit(_set_id_and_call, _load_scriptbook,
+                                    group_key, ctx, dir_track_names, dir_track_samples or None)
+                _wt = _inner.submit(_set_id_and_call, _analyze_work_terms,
+                                    group_key, ctx)
+                scriptbook = _sb.result()
+                terms, alias_list, worldview = _wt.result()
 
         # 主线程日志（无前缀）
         if dir_track_samples:

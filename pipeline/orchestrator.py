@@ -2356,10 +2356,18 @@ def run_pipeline(
         # ── 快速路径：台本缓存命中 → 跳过 LLM 识别，只跑术语 ──
         _cached_sb = _try_load_cached_scriptbook(group_key, dir_track_names or [])
         if _cached_sb is not None:
+            _total = sum(len(v) for v in _cached_sb.values())
+            _matched = sum(1 for v in _cached_sb.values() if v)
+            _total_tracks = len(_cached_sb)
+            # 缓存内容为空或大部分音轨为空 → 忽略缓存，重新分割
+            if _total == 0 or (_total_tracks > 0 and _matched / _total_tracks < 0.3):
+                _log(f"  [台本] 缓存内容不足 ({_matched}/{_total_tracks} 个音轨有内容, {_total} 行)，重新识别")
+                _cached_sb = None
+            else:
+                _log(f"  [台本] 缓存命中 ({_matched}/{_total_tracks} 个音轨有内容, {_total} 行)，跳过 LLM 识别")
+
+        if _cached_sb is not None:
             scriptbook = _cached_sb
-            _total = sum(len(v) for v in scriptbook.values())
-            _matched = sum(1 for v in scriptbook.values() if v)
-            _log(f"  [台本] 缓存命中 ({_matched}/{len(scriptbook)} 个音轨有内容, {_total} 行)，跳过 LLM 识别")
             terms, alias_list, worldview = _set_id_and_call(_analyze_work_terms, group_key, ctx)
         else:
             # ── 标准路径：台本 + 术语并行 ──

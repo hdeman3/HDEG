@@ -1153,7 +1153,9 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     _log(f"  → 分割清洗后: {len(track_map)} 个音轨, 共 {total_clean} 行台词")
 
     # ── 导出（由 export_scriptbook_content 统一控制）──
-    if export_scriptbook and track_map:
+    # 仅当 Flash 分割成功且有实质内容时才导出缓存，避免空结果污染缓存
+    _has_any_content = total_clean > 0
+    if export_scriptbook and track_map and _has_any_content:
         import json as _json
         export_dir = scriptbook_files[0].parent
 
@@ -1172,6 +1174,8 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
         _log(f"  → 导出: {export_dir / '_scriptbook_export.txt'}")
         _log(f"  → 导出: {export_dir / '_scriptbook_clean.json'}")
         _log(f"  → 导出: {split_dir.absolute()} ({total_clean} 行)")
+    elif total_clean == 0:
+        _log(f"  [台本] 分割结果为空，跳过缓存导出（下次将重新分割）")
 
     return track_map
 

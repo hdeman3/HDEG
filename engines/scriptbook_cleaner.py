@@ -633,7 +633,13 @@ class ScriptbookSplitter:
             if is_range_format and original_lines is not None:
                 # V3 格式: [start, end] → 本地提取+清洗
                 start, end = int(value[0]), int(value[1])
-                clean_lines = self._extract_lines_by_range(original_lines, start, end)
+                # 校验行号范围：越界时警告并跳过
+                if start < 1 or end < start or start > len(original_lines):
+                    if self.verbose:
+                        print(f"  [台本分割] 跳过越界范围: {matched_name} [{start}, {end}] (台本共 {len(original_lines)} 行)")
+                    clean_lines = []
+                else:
+                    clean_lines = self._extract_lines_by_range(original_lines, start, end)
             else:
                 # V2/V1 格式: list[str] → 直接过滤
                 clean_lines = [

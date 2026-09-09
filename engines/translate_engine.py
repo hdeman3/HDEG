@@ -622,7 +622,7 @@ class OpenAICompatEngine:
         return None
 
     @staticmethod
-    def _extract_json_array(text: str) -> list[str] | None:
+    def _extract_json_array(text: str, _brace_fixed: bool = False) -> list[str] | None:
         """从 LLM 响应中提取 JSON 翻译结果
 
         支持四种格式（按优先级）：
@@ -634,7 +634,8 @@ class OpenAICompatEngine:
         尝试多种策略提取 JSON：
         1. 直接解析整个文本（支持对象和数组）
         2. 查找 { ... } 或 [ ... ] 包裹的内容
-        3. 修复常见 JSON 错误后重试
+        3. 修复常见 JSON 错误后重试（含多余右括号，如 ..."}},{"index"... 中的杂散 }）
+        4. 兜底打捞见 parse_json_translation._salvage_indexed_items（需原文做回声剔除）
 
         返回:
             解析成功返回字符串列表（按 index 或位置排序），失败返回 None
@@ -774,6 +775,14 @@ class OpenAICompatEngine:
             except (_json.JSONDecodeError, Exception):
                 pass
 
+        # 策略4: 修复多余右括号后整体重试（模型偶发 ..."}}, {"index"...）。
+        # 只在以上全部失败后执行，避免误伤正文以 } 结尾的合法条目。
+        if not _brace_fixed:
+            import re as _re2
+            _debracket = _re2.sub(r'\}\s*\}(?=\s*[,}\]])', '}', text)
+            if _debracket != text:
+                return OpenAICompatEngine._extract_json_array(_debracket, True)
+
         return None
 
     @staticmethod
@@ -872,6 +881,61 @@ class OpenAICompatEngine:
         except Exception:
             return None
 
+    @staticmethod
+    def _norm_echo_text(s: str) -> str:
+        """回声比对归一化：去空白及常见标点（中日文），抓复读输入的实质相同。"""
+        import re as _re3
+        s = s or ''
+        s = _re3.sub(r'[\s　、。。？?！!「」『』…—―～~♡♪・，．\.，,\(\)（）\[\]【】:：;"\'“”‘’]', '', s)
+        return s
+
+    @staticmethod
+    def _strip_number_prefix(line: str) -> str:
+        """去掉 '0001: ' 这类行号前缀，取纯文本。"""
+        import re as _re4
+        return _re4.sub(r'^\d+:\s*', '', line or '').strip()
+
+    @staticmethod
+    def _salvage_indexed_items(text: str, original_lines: list[str]) -> dict[int, str]:
+        """按条打捞 {index, text}（最终兜底）。
+
+        用 raw_decode 逐个扫描合法 JSON 对象（跳过杂散文本/多余括号），
+        只收 1..N 范围内的 index。回声剔除：打捞文本与同 index 输入原文
+        去标点后一致 → 视为复读输入（如模型原样回显输入行），丢弃，
+        防止日文混进中文译文。重复 index 取首次。
+        """
+        import json as _json5
+        found: dict[int, str] = {}
+        n = len(original_lines or [])
+        if not text or n <= 0:
+            return found
+        decoder = _json5.JSONDecoder()
+        pos = 0
+        total = len(text)
+        while pos < total:
+            start = text.find('{', pos)
+            if start == -1:
+                break
+            try:
+                val, end = decoder.raw_decode(text, start)
+            except Exception:
+                pos = start + 1
+                continue
+            consumed = False
+            if isinstance(val, dict):
+                idx = val.get('index')
+                t = val.get('text')
+                if isinstance(idx, int) and isinstance(t, str) and 1 <= idx <= n:
+                    if idx not in found:
+                        _in_text = OpenAICompatEngine._strip_number_prefix(
+                            original_lines[idx - 1])
+                        if OpenAICompatEngine._norm_echo_text(t) != \
+                           OpenAICompatEngine._norm_echo_text(_in_text):
+                            found[idx] = t
+                    consumed = True
+            pos = end if (consumed and end > start) else start + 1
+        return found
+
     def parse_json_translation(
         self,
         original_lines: list[str],
@@ -921,6 +985,20 @@ class OpenAICompatEngine:
                 _p(f"  [JSON解析] 翻译行数超出 ({parsed_count} > {n_input}), 尾部 {parsed_count - n_input} 行被丢弃")
 
             return original_lines, translated
+
+        # 最终打捞：常规策略全灭时，按条扫描合法 {index, text}（容忍杂散文本/
+        # 多余括号/前后废话），回声剔除防复读输入。覆盖率 ≥50% 才接受写文件，
+        # 否则仍判失败走重试队列（重试可能拿满）。
+        salvaged = OpenAICompatEngine._salvage_indexed_items(translated_text, original_lines)
+        if salvaged and len(salvaged) * 2 >= n_input:
+            self._last_parsed_count = len(salvaged)
+            _p(f"  [JSON解析] 打捞成功: {len(salvaged)}/{n_input} 条有效"
+               f"（缺 {n_input - len(salvaged)} 行留空）")
+            return original_lines, [
+                salvaged.get(i + 1, '') for i in range(n_input)
+            ]
+        if salvaged:
+            _p(f"  [JSON解析] 打捞不足: {len(salvaged)}/{n_input} 条，仍判失败走重试")
 
         # JSON 解析失败 —— 不启用逐行回退，记录错误并返回空。
         # 失败时打印原始返回全文（上限 30000 字，超出截断并注明），不再只看前后 100 字。

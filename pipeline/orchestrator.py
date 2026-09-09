@@ -1919,17 +1919,6 @@ def translate_one_lrc(
     # 分块翻译：app.lrc_max_lines_per_request > 0 时按该行数分块发送，避免长文本请求超时。
     # 每块独立调用 translate_batch，合并结果；scriptbook_aligned 按子块内新索引重映射。
     _chunk_size = int(ctx.config.get('app', {}).get('lrc_max_lines_per_request', 0) or 0)
-    # 思考开启时思维链与正文共享输出配额（实测 15 行能想 2 万字），大块正文必被
-    # 截断；强制小块（app.thinking_chunk_lines，默认 30），保证正文挤得下。
-    try:
-        from engines.api_client import is_thinking_active as _is_think
-        if _is_think(ctx.api_cfg):
-            _think_chunk = int(ctx.config.get('app', {}).get('thinking_chunk_lines', 30) or 30)
-            if _chunk_size <= 0 or _chunk_size > _think_chunk:
-                _chunk_size = _think_chunk
-                _log(f"  [思考] 已开启，分块收紧到每块 {_think_chunk} 行（防思考挤占输出配额）")
-    except Exception:
-        pass
     _use_chunk = _chunk_size > 0 and len(_texts_eff) > _chunk_size
 
     if _use_chunk:

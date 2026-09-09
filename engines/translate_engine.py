@@ -530,12 +530,12 @@ class OpenAICompatEngine:
         if _fr in ('length', 'incomplete'):
             _p(f"  [API] finish_reason={_fr}：输出被截断，结果可能不完整", flush=True)
         if not content:
+            # 只陈述事实：思考长度和输出上限仅供参考，是否超限看停因是否为 length。
+            # DeepSeek JSON 模式已知概率性返回空 content（官方文档确认）。
             _reason_len = len(getattr(msg, 'reasoning_content', '') or '')
-            if _reason_len:
-                _p(f"  [API] content 为空（思考 {_reason_len} 字吃掉了输出配额），"
-                   f"按失败处理", flush=True)
-            elif self.verbose:
-                _p(f"  [API] content 为空，按失败处理", flush=True)
+            _p(f"  [API] content 为空"
+               f"（思考 {_reason_len} 字，输出上限 {_tok}，停因 {_fr}），按失败处理",
+               flush=True)
 
         # DEBUG: 尝试提取翻译结果供预览
         if self.verbose:
@@ -922,12 +922,16 @@ class OpenAICompatEngine:
 
             return original_lines, translated
 
-        # JSON 解析失败 —— 不启用逐行回退，记录错误并返回空
+        # JSON 解析失败 —— 不启用逐行回退，记录错误并返回空。
+        # 失败时打印原始返回全文（上限 30000 字，超出截断并注明），不再只看前后 100 字。
         self._last_parsed_count = 0
         _p(f"  [JSON解析] 失败！原文{n_input}行全部留空")
         _p(f"  [JSON解析] 响应类型: {type(translated_text).__name__}, 长度: {len(translated_text)}")
-        _p(f"  [JSON解析] 响应前100字: {translated_text[:100]}")
-        _p(f"  [JSON解析] 响应后100字: {translated_text[-100:]}")
+        _RAW_CAP = 30000
+        _raw_show = translated_text if len(translated_text) <= _RAW_CAP else (
+            translated_text[:_RAW_CAP]
+            + f"\n  [JSON解析] （原始返回共 {len(translated_text)} 字，仅显示前 {_RAW_CAP} 字）")
+        _p(f"  [JSON解析] 原始返回全文:\n{_raw_show}")
         # 单独试一下 json.loads 看报什么错
         import json as _json_debug
         try:

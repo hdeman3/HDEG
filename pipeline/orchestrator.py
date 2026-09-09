@@ -759,6 +759,7 @@ def _llm_identify_scriptbook_files(
                 hit_tokens=_token_stats['hit_tokens'],
                 miss_tokens=_token_stats['miss_tokens'],
                 completion_tokens=_token_stats['completion_tokens'],
+                reasoning_tokens=_token_stats.get('reasoning_tokens', 0) or 0,
                 cost=_sb_cost,
                 elapsed=0,
             ))
@@ -1364,6 +1365,7 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
                     hit_tokens=sb_token_stats.get('hit_tokens', 0),
                     miss_tokens=sb_token_stats.get('miss_tokens', 0),
                     completion_tokens=sb_token_stats.get('completion_tokens', 0),
+                    reasoning_tokens=sb_token_stats.get('reasoning_tokens', 0) or 0,
                     cost=_sb_cost,
                     elapsed=0,
                 ))
@@ -1649,6 +1651,7 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
                                     hit_tokens=wv_token_stats.get('hit_tokens', 0),
                                     miss_tokens=wv_token_stats.get('miss_tokens', 0),
                                     completion_tokens=wv_token_stats.get('completion_tokens', 0),
+                                    reasoning_tokens=wv_token_stats.get('reasoning_tokens', 0) or 0,
                                     cost=_wv_cost,
                                     elapsed=0,
                                 ))
@@ -1916,6 +1919,17 @@ def translate_one_lrc(
     # 分块翻译：app.lrc_max_lines_per_request > 0 时按该行数分块发送，避免长文本请求超时。
     # 每块独立调用 translate_batch，合并结果；scriptbook_aligned 按子块内新索引重映射。
     _chunk_size = int(ctx.config.get('app', {}).get('lrc_max_lines_per_request', 0) or 0)
+    # 思考开启时思维链与正文共享输出配额（实测 15 行能想 2 万字），大块正文必被
+    # 截断；强制小块（app.thinking_chunk_lines，默认 30），保证正文挤得下。
+    try:
+        from engines.api_client import is_thinking_active as _is_think
+        if _is_think(ctx.api_cfg):
+            _think_chunk = int(ctx.config.get('app', {}).get('thinking_chunk_lines', 30) or 30)
+            if _chunk_size <= 0 or _chunk_size > _think_chunk:
+                _chunk_size = _think_chunk
+                _log(f"  [思考] 已开启，分块收紧到每块 {_think_chunk} 行（防思考挤占输出配额）")
+    except Exception:
+        pass
     _use_chunk = _chunk_size > 0 and len(_texts_eff) > _chunk_size
 
     if _use_chunk:
@@ -1931,6 +1945,7 @@ def translate_one_lrc(
     _total_prompt = 0
     _total_comp = 0
     _total_cost = 0.0
+    _total_reasoning = 0
 
     # 构造分块列表
     _chunks: list[list[int]] = []  # 每块 = 行索引列表
@@ -1941,6 +1956,7 @@ def translate_one_lrc(
         _chunks.append(list(range(len(_texts_eff))))
 
     _all_ok = True
+    _fr_list: list = []  # 各块 finish_reason（诊断空内容失败用）
     for _ci, _chunk_idx in enumerate(_chunks):
         _chunk_numbered = [numbered[i] for i in _chunk_idx]
         # 分块内 scriptbook_aligned：把原始行索引 i 映射为子块内索引 (i - 块起点)
@@ -1985,6 +2001,10 @@ def translate_one_lrc(
             }, _tx_reason)
             return False
         call_elapsed = time.time() - call_start
+        try:
+            _fr_list.append(result.get('finish_reason'))
+        except Exception:
+            pass
 
         translated_batch = result.get('translated_lines', [])
         # 若分块翻译失败（全空/异常），记 _all_ok=False，仍继续后续块
@@ -1997,6 +2017,7 @@ def translate_one_lrc(
         _total_comp += result.get('completion_tokens', 0)
         _total_cost += result.get('cost', 0.0)
         _total_prompt += result.get('prompt_tokens', 0) or 0
+        _total_reasoning += result.get('reasoning_tokens', 0) or 0
 
         # 块内解析出的行数可能少于块行数，补齐为空
         while len(translated_batch) < len(_chunk_idx):
@@ -2034,8 +2055,14 @@ def translate_one_lrc(
     if _abnormal_reason:
         _max_r = getattr(ctx, 'max_failed_retries', 3)
         _log(f"  [异常翻译] {lrc_path.name}: {_abnormal_reason}", console=True)
+        try:
+            _fr_show = sorted({str(_f) for _f in _fr_list if _f})
+        except Exception:
+            _fr_show = []
         _log(f"  [异常翻译] 标记为翻译失败，不写入文件，待其他音轨全部完成后重试"
-             f"（已尝试 {attempts} 次，最多重试 {_max_r} 次）")
+             f"（已尝试 {attempts} 次，最多重试 {_max_r} 次）"
+             f"（停因:{','.join(_fr_show) if _fr_show else '?'}"
+             f" 思考{_total_reasoning}tok/输出{_total_comp}tok）")
         _enqueue_failed_track(ctx, {
             'lrc_path': lrc_path,
             'label': label,
@@ -2070,6 +2097,7 @@ def translate_one_lrc(
         comp = _total_comp
         cost = _total_cost
         elapsed = call_elapsed_total
+        reasoning = _total_reasoning
     else:
         hit = result.get('hit_tokens', 0)
         miss = result.get('miss_tokens', 0)
@@ -2077,6 +2105,7 @@ def translate_one_lrc(
         comp = result.get('completion_tokens', 0)
         elapsed = result.get('elapsed', call_elapsed)
         cost = result.get('cost', 0)
+        reasoning = result.get('reasoning_tokens', 0) or 0
 
     # 统一 token 追踪：记录 + 打印
     # work_key 使用 RJ 作品根目录，确保同一作品的翻译/台本/世界观合并统计
@@ -2091,6 +2120,7 @@ def translate_one_lrc(
         hit_tokens=hit,
         miss_tokens=miss,
         completion_tokens=comp,
+        reasoning_tokens=reasoning,
         cost=cost,
         elapsed=elapsed,
     )
@@ -2550,10 +2580,25 @@ def run_pipeline(
         from engines.api_client import APIClient as _APIClient_Info
         _info_api = _APIClient_Info(dict(api_cfg))  # 轻量实例，仅做协议判定，无网络调用
         _log(f"  协议: {_info_api.protocol_name} ({_info_api.protocol_endpoint})"
-             f"  ← {_APIClient_Info.protocol_source(api_cfg)}")
+             f"  ← {_APIClient_Info.protocol_source(api_cfg, api_cfg.get('model', ''))}")
         _proxy_on, _proxy_detail = _APIClient_Info.detect_proxy(
             api_cfg, ctx.config.get('network', {}))
         _log(f"  代理: {_proxy_detail}")
+        try:
+            _re_cfg = gen_params.get('reasoning_effort', '未配置')
+            _re_spec = (_info_api._model_spec or {}).get('reasoning') or {}
+            _re_style = str(_re_spec.get('style') or 'effort')
+            _re_vals = _re_spec.get('values') or []
+            _re_vals_s = f"档位{_re_vals}" if _re_vals else ""
+            _re_think = "＋thinking开关" if _re_spec.get('thinking_switch') is True else ""
+            if _re_style == 'off':
+                _log(f"  思考强度: {_re_cfg}（本模型 style=off，请求中不发送）")
+            elif _re_style == 'budget':
+                _log(f"  思考强度: {_re_cfg}（style=budget，按 budgets 换算 token 发送）")
+            else:
+                _log(f"  思考强度: {_re_cfg}（style=effort{_re_vals_s}{_re_think}，随请求发送）")
+        except Exception:
+            pass
     except Exception as _pie:
         _log(f"  协议/代理探测失败: {_pie}")
     _log(f"  Timeout: {api_cfg.get('timeout', 'N/A')}s")

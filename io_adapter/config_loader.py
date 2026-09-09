@@ -49,7 +49,7 @@ def load_config(path: Path = None) -> dict[str, Any]:
 
     # 默认配置（当 config.json 不存在或缺少字段时使用）
     default_config = {
-        "api": {"timeout": 2000},
+        "api": {"timeout": 2000, "protocol": "", "models": {}},
         "app": {
             "translation_mode": "per_track",
             "translation_parallel": 10,

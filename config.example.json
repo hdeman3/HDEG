@@ -3,11 +3,23 @@
     "key": "your-api-key-here",
     "base_url": "https://opencode.ai/zen/go/v1",
     "model": "deepseek-v4-flash",
+    "protocol": "",
+    "models": {
+      "muse-spark": {"protocol": "responses", "note": "Zen网关仅支持responses",
+        "reasoning": {"style": "effort", "param": "reasoning.effort", "values": ["low", "high"]}},
+      "deepseek-v4-flash": {"protocol": "openai", "note": "chat/completions",
+        "json_mode": true,
+        "reasoning": {"style": "effort", "values": ["low", "high", "max"],
+          "thinking_switch": true, "strip_sampling_params": true,
+          "effort_param": {"anthropic": "output_config.effort"}}}
+    },
+    "anthropic_auth": "bearer",
     "timeout": 2000,
     "generation_params": {
       "temperature": 1,
       "top_p": 0.9,
       "max_tokens": 262144,
+      "max_tokens_cap": 0,
       "reasoning_effort": "high"
     }
   },

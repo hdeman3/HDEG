@@ -87,14 +87,18 @@ def buffer_active() -> bool:
 
 
 def buffer_line(text: str) -> None:
-    """向当前线程的逐轨 buffer 追加一行（行级原子，文件内不穿插）。"""
+    """向当前线程的逐轨 buffer 追加行（行级原子，文件内不穿插）。
+
+    含换行的消息按行拆分逐行加时间戳，避免文件里出现空行断裂。
+    """
     buf = getattr(worker_local, '_log_buffer', None)
     if buf is None:
         return
     try:
         elapsed = _time_mod.monotonic() - buf.get('t0', _time_mod.monotonic())
         with _BUF_LOCK:
-            buf['lines'].append(f"[+{elapsed:7.1f}s] {text}")
+            for _ln in str(text).split('\n'):
+                buf['lines'].append(f"[+{elapsed:7.1f}s] {_ln}")
     except Exception:
         pass
 
@@ -125,8 +129,13 @@ def wlog(text: str = '', *, force_console: bool = False, flush: bool = True,
 # OpenAI 兼容 API 可接受的生成参数白名单
 _ALLOWED_GEN_PARAMS = (
     'temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty',
-    'stop', 'logit_bias', 'user', 'reasoning_effort',
+    'stop', 'logit_bias', 'user', 'reasoning_effort', 'response_format',
 )
+
+# 未指定哨兵：区分"调用方没传"（继承 config）与"显式传 None"（强制不发）。
+# 修复旧 bug：translate_engine 传 reasoning_effort=None 想去掉思考，
+# 旧代码把 None 当未指定又从 config 继承回来，重试参数完全没变。
+_UNSET = object()
 # 部分 OpenAI 兼容服务不接受的扩展参数（被拒后自动剔除重试）
 _OPTIONAL_PARAMS = ('reasoning_effort', 'top_k')
 
@@ -152,9 +161,11 @@ class _CompatResponse:
     """
 
     def __init__(self, text: str, prompt_tokens: int, hit_tokens: int, miss_tokens: int,
-                 completion_tokens: int, finish_reason: str = 'stop'):
+                 completion_tokens: int, finish_reason: str = 'stop',
+                 reasoning_tokens: int = 0):
         self.choices = [_CompatChoice(text, finish_reason)]
-        self.usage = _CompatUsage(prompt_tokens, hit_tokens, miss_tokens, completion_tokens)
+        self.usage = _CompatUsage(prompt_tokens, hit_tokens, miss_tokens,
+                                  completion_tokens, reasoning_tokens)
 
 
 class _CompatChoice:
@@ -171,17 +182,192 @@ class _CompatMessage:
 
 class _CompatUsage:
     def __init__(self, prompt_tokens: int, hit_tokens: int, miss_tokens: int,
-                 completion_tokens: int):
+                 completion_tokens: int, reasoning_tokens: int = 0):
         self.prompt_tokens = prompt_tokens
         self.prompt_cache_hit_tokens = hit_tokens
         self.prompt_cache_miss_tokens = miss_tokens
         self.completion_tokens = completion_tokens
+        # 思维链 token（官方 responses: output_tokens_details.reasoning_tokens，
+        # 计入 output_tokens；用于费用分析"输出里多少是思考"）
+        self.reasoning_tokens = reasoning_tokens or 0
         self.prompt_tokens_details = _CompatPromptDetails(hit_tokens)
 
 
 class _CompatPromptDetails:
     def __init__(self, cached_tokens: int):
         self.cached_tokens = cached_tokens
+
+
+# 模型注册表支持的协议取值
+_VALID_PROTOCOLS = ('openai', 'anthropic', 'responses')
+
+
+def _normalize_registry_entry(entry) -> tuple[str | None, dict]:
+    """注册表条目归一化：支持字符串简写（"responses"）或字典
+    （{"protocol": "responses", "reasoning": {...}, "note": "..."}）。
+
+    返回: (protocol 或 None, extra 字典)
+    """
+    if isinstance(entry, str):
+        _p = entry.strip().lower()
+        return (_p if _p in _VALID_PROTOCOLS else None), {}
+    if isinstance(entry, dict):
+        _p = str(entry.get('protocol') or '').strip().lower()
+        return (_p if _p in _VALID_PROTOCOLS else None), dict(entry)
+    return None, {}
+
+
+def model_entry(model_name: str, api_cfg: dict) -> tuple[dict, str]:
+    """取注册表整条目：精确名 → 最长前缀（大小写不敏感）。
+
+    返回: (entry_dict, 命中的注册键；未命中返回 ({}, ''))
+    """
+    def _as_dict(_v):
+        if isinstance(_v, dict):
+            return _v
+        if isinstance(_v, str):
+            return {'protocol': _v}
+        return {}
+    try:
+        _models = (api_cfg or {}).get('models') or {}
+        if not isinstance(_models, dict) or not _models:
+            return {}, ''
+        _ml = str(model_name or '').lower()
+        _lower_map = {str(_k).lower(): (str(_k), _v) for _k, _v in _models.items()}
+        if _ml in _lower_map:
+            _k, _v = _lower_map[_ml]
+            return _as_dict(_v), _k
+        _best = ''
+        for _lk in _lower_map:
+            if _lk and _ml.startswith(_lk) and len(_lk) > len(_best):
+                _best = _lk
+        if _best:
+            _k, _v = _lower_map[_best]
+            return _as_dict(_v), _k
+    except Exception:
+        pass
+    return {}, ''
+
+
+def resolve_model_protocol(model_name: str, api_cfg: dict) -> tuple[str, str, dict]:
+    """按模型注册表判定协议（加新模型只改配置，不改代码）。
+
+    四层优先级（命中即停）：
+    1. 精确名：api.models["muse-spark-1.2-contributor"]（大小写不敏感）
+    2. 最长前缀：api.models["muse-spark"] 命中 "muse-spark-1.3-xxx"
+    3. 全局默认：api.protocol（整个网关一种协议时配这里）
+    4. 嗅探兜底：含 claude → anthropic，含 muse-spark → responses，其余 openai
+
+    reasoning 预留块（style/param/values）随 extra 原样返回，供阶段二适配器使用，
+    本阶段仅做协议判定。
+
+    返回: (protocol, 来源说明, extra)
+    """
+    api_cfg = api_cfg or {}
+    _model = str(model_name or '')
+    _ml = _model.lower()
+    # 1) 精确名 / 2) 最长前缀（共用 model_entry）
+    _entry, _key = model_entry(_model, api_cfg)
+    if _entry or _key:
+        _p, _ex = _normalize_registry_entry(_entry)
+        if _p:
+            _suffix = '' if _key.lower() == _ml else '（前缀匹配）'
+            return _p, f"模型配置 models['{_key}']{_suffix}", _ex
+    # 3) 全局默认
+    _g = str(api_cfg.get('protocol') or '').strip().lower()
+    if _g in _VALID_PROTOCOLS:
+        return _g, '全局 api.protocol', {}
+    # 4) 嗅探兜底（保留旧行为；新模型请登记到 models）
+    if 'claude' in _ml:
+        return 'anthropic', '嗅探兜底（模型名含 claude，建议登记）', {}
+    if 'muse-spark' in _ml:
+        return 'responses', '嗅探兜底（模型名含 muse-spark，建议登记）', {}
+    return 'openai', '嗅探兜底（默认 openai，建议登记）', {}
+
+
+def model_reasoning_spec(model_name: str, api_cfg: dict) -> dict:
+    """取注册表 reasoning 块（dict，无则 {}）。供各协议分支查询扩展字段。"""
+    try:
+        _spec = (resolve_model_protocol(model_name, api_cfg or {})[2] or {}).get('reasoning') or {}
+        return _spec if isinstance(_spec, dict) else {}
+    except Exception:
+        return {}
+
+
+def is_thinking_active(api_cfg: dict) -> bool:
+    """当前配置思考是否开启（effort 非空/非 none/非 off 且注册表 style 非 off）。
+
+    思考开启时思维链与正文共享输出配额，长文本必须切小块，否则正文被截断。
+    """
+    try:
+        _eff = ((api_cfg or {}).get('generation_params') or {}).get('reasoning_effort')
+        if not _eff or str(_eff).strip().lower() in ('none', 'off', '0', 'false'):
+            return False
+        _style = str(model_reasoning_spec(
+            (api_cfg or {}).get('model', ''), api_cfg).get('style') or 'effort').lower()
+        return _style in ('effort', 'budget')
+    except Exception:
+        return False
+
+
+def model_thinking_switch(model_name: str, api_cfg: dict) -> bool:
+    """该模型发请求时是否附带 thinking 开关（openai 协议 extra_body）。
+
+    注册表 reasoning.thinking_switch=true 即发；另保留旧行为：
+    base_url 含 deepseek（原生接口）默认发。
+    """
+    if model_reasoning_spec(model_name, api_cfg).get('thinking_switch') is True:
+        return True
+    try:
+        return 'deepseek' in ((api_cfg or {}).get('base_url') or '').lower()
+    except Exception:
+        return False
+
+
+def apply_reasoning_spec(gen_params: dict, model_name: str, api_cfg: dict) -> dict:
+    """按注册表 reasoning 块决定本次请求带不带思考强度（纯函数，可单测）。
+
+    style 语义（厂商维度）：
+    - 'effort'（默认）：保留 gen_params['reasoning_effort']，各协议按自家位置发送
+      （openai 顶层字段 / responses 的 reasoning.effort；anthropic 忽略）；
+    - 'off'：删掉 reasoning_effort，本模型不发送（传了可能被拒）；
+    - 'budget'：effort 档位换算成 token 数，供 anthropic 的 thinking.budget_tokens。
+      换算表取 reasoning.budgets（如 {"low": 4000, "high": 20000}），
+      或直接取 reasoning.budget_tokens；都取不到则删掉并由调用方打 warning。
+
+    未登记 reasoning 块的模型：原样返回（保持旧行为）。
+    返回: 新字典（不改输入）。
+    """
+    _out = dict(gen_params or {})
+    try:
+        _spec = (resolve_model_protocol(model_name, api_cfg or {})[2] or {}).get('reasoning') or {}
+    except Exception:
+        return _out
+    if not isinstance(_spec, dict) or not _spec:
+        return _out
+    _style = str(_spec.get('style') or 'effort').strip().lower()
+    if _style == 'off':
+        _out.pop('reasoning_effort', None)
+        _out.pop('reasoning_budget', None)
+        return _out
+    if _style == 'budget':
+        _eff = _out.get('reasoning_effort')
+        _tokens = _spec.get('budget_tokens')
+        if _tokens is None and _eff is not None:
+            try:
+                _budgets = _spec.get('budgets') or {}
+                _tokens = _budgets.get(str(_eff))
+            except Exception:
+                _tokens = None
+        try:
+            _tokens = int(_tokens) if _tokens is not None else None
+        except (TypeError, ValueError):
+            _tokens = None
+        _out.pop('reasoning_effort', None)
+        if _tokens and _tokens > 0:
+            _out['reasoning_budget'] = _tokens
+        return _out
+    return _out
 
 
 class APIClient:
@@ -205,26 +391,28 @@ class APIClient:
         self._client = None
         # 供应商识别：仅 DeepSeek 原生接口额外发送 thinking extra_body
         self._is_deepseek = 'deepseek' in (config.get('base_url') or '').lower()
-        # 协议探测：三态 —— 'openai'（chat/completions）/ 'anthropic'（messages）/ 'responses'（/v1/responses）。
-        # 支持 config 显式覆盖 api.protocol = 'openai' | 'anthropic' | 'responses'；
-        # 未显式指定时按模型名推断：含 claude → anthropic，含 muse-spark-1.2-contributor → responses，
-        # 其余默认 openai（chat/completions）。
-        _proto = (config.get('protocol') or '').lower()
+        # 协议判定：走模型注册表（config api.models），四层优先级
+        # 精确名 → 最长前缀 → 全局 api.protocol → 嗅探兜底。
+        # 加新模型只改配置，不改代码；reasoning 预留块供阶段二适配器使用。
+        _proto, _source, _extra = resolve_model_protocol(
+            config.get('model') or '', config)
+        self._protocol_source = _source
+        self._model_spec = _extra if isinstance(_extra, dict) else {}
         if _proto == 'anthropic':
             self._is_anthropic = True
             self._is_responses = False
         elif _proto == 'responses':
             self._is_anthropic = False
             self._is_responses = True
-        elif _proto == 'openai':
+        else:
             self._is_anthropic = False
             self._is_responses = False
-        else:
-            _model_l = (config.get('model') or '').lower()
-            self._is_anthropic = 'claude' in _model_l
-            # 注意顺序：muse-spark-1.2-contributor 在 opencode Zen 网关只支持 responses 协议
-            #（走 chat/completions 会 500 Internal server error），故单独命中为 responses。
-            self._is_responses = 'muse-spark-1.2-contributor' in _model_l and not self._is_anthropic
+        if _source.startswith('嗅探'):
+            try:
+                wlog(f"  [协议] 模型 {config.get('model') or ''} 未在 models 注册表登记，"
+                     f"已自动推断为 {_proto}，建议在 config.json → api.models 中登记")
+            except Exception:
+                pass
         # 模型轮换状态：当前在模型链中的索引
         self._model_idx = 0
 
@@ -331,12 +519,13 @@ class APIClient:
         }.get(self.protocol_name, '')
 
     @staticmethod
-    def protocol_source(config: dict) -> str:
-        """协议来源：显式配置还是模型名自动推断"""
-        _p = ((config or {}).get('protocol') or '').lower()
-        if _p in ('openai', 'anthropic', 'responses'):
-            return '显式配置 api.protocol'
-        return '模型名自动推断'
+    def protocol_source(config: dict, model_name: str = None) -> str:
+        """协议来源说明（与 resolve_model_protocol 同口径）。"""
+        try:
+            _m = model_name if model_name is not None else (config or {}).get('model', '')
+            return resolve_model_protocol(_m, config or {})[1]
+        except Exception:
+            return '未知'
 
     @staticmethod
     def _mask_proxy_url(url: str) -> str:
@@ -414,6 +603,7 @@ class APIClient:
                 messages=[{'role': 'user', 'content': 'ping'}],
                 max_tokens=16,
                 max_retries=0,  # 每模型只试一次（chat 内 max(0,1)=1 次尝试）
+                json_mode=False,  # ping 无 JSON 指示，强制关（官方要求含 json 字样）
             )
             _el = _time_mod.monotonic() - _t0
             try:
@@ -478,16 +668,24 @@ class APIClient:
         max_tokens: int,
         temperature: float | None = None,
         top_p: float | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: str | None = _UNSET,
         max_retries: int = 3,
+        json_mode: bool | None = None,
     ):
         """统一的 chat/completions 调用（内置模型轮换 + 参数剔除 + 指数退避）。
 
         参数:
             messages: OpenAI messages 列表 [{role, content}, ...]
             max_tokens: 输出 token 上限
-            temperature / top_p / reasoning_effort: 可选生成参数
+            temperature / top_p: 可选生成参数（None=继承 config）
+            reasoning_effort: 三态 —— _UNSET(默认)=继承 config；
+                具体值=本次使用；None=本次强制不发（再叠加注册表 reasoning 规则）。
+                注册表 style=off 的模型一律不发。
             max_retries: 每个模型的重试次数（配额耗尽不计入，直接切模型）
+            json_mode: 是否强制 response_format=json_object。
+                None(默认)=跟注册表（模型条目 json_mode=true 才开）；
+                True=强制开（调用方须保证 prompt 含 JSON 指示，官方强制要求）；
+                False=强制关（预检 ping 等非 JSON 任务必须关，否则 400）。
 
         返回:
             OpenAI ChatCompletion 对象（含 choices / usage）。
@@ -504,13 +702,23 @@ class APIClient:
             gen_params['temperature'] = temperature
         if top_p is not None:
             gen_params['top_p'] = top_p
-        if reasoning_effort is not None:
+        if reasoning_effort is not _UNSET and reasoning_effort is not None:
             gen_params['reasoning_effort'] = reasoning_effort
-        # 也允许从 config.generation_params 继承默认值（调用方未显式传入时）
+        # 继承 config.generation_params 默认值（仅"未指定"时；显式 None=强制不发）
         cfg_gen = self.config.get('generation_params', {}) or {}
-        for k in ('temperature', 'top_p', 'reasoning_effort'):
+        for k in ('temperature', 'top_p'):
             if k not in gen_params and k in cfg_gen:
                 gen_params[k] = cfg_gen[k]
+        if reasoning_effort is _UNSET and 'reasoning_effort' in cfg_gen:
+            gen_params['reasoning_effort'] = cfg_gen['reasoning_effort']
+        # 输出上限封顶：注册表 models[xxx].max_output_tokens（厂商上限，
+        # 0/缺省=不限）与 generation_params.max_tokens_cap（全局手动上限，
+        # 0=不限）取最小值。全局 max_tokens 保持大窗口，只在真超限时钳制。
+        _requested_max = max_tokens
+        try:
+            _global_cap = int(cfg_gen.get('max_tokens_cap', 0) or 0)
+        except (TypeError, ValueError):
+            _global_cap = 0
 
         _stripped_optional = False
         _model_chain = self._model_chain()
@@ -557,6 +765,27 @@ class APIClient:
                 # 回写当前激活模型，保证所有外部读取 config['model'] 的路径同步
                 self.config['model'] = _current_model
                 self._model_idx = _model_idx
+                # 逐模型输出上限（注册表 max_output_tokens 与全局 cap 取最小；都不设则用请求值）
+                max_tokens = _requested_max
+                try:
+                    _reg_cap = int((model_entry(
+                        _current_model, self.config)[0] or {}).get(
+                            'max_output_tokens', 0) or 0)
+                except (TypeError, ValueError):
+                    _reg_cap = 0
+                _eff_cap = 0
+                if _global_cap > 0:
+                    _eff_cap = _global_cap
+                if _reg_cap > 0:
+                    _eff_cap = _reg_cap if _eff_cap <= 0 else min(_eff_cap, _reg_cap)
+                if _eff_cap > 0 and max_tokens > _eff_cap:
+                    max_tokens = _eff_cap
+                # 按注册表 reasoning 规则裁剪本次请求参数（逐模型：链上模型规则可能不同）
+                _req_params = apply_reasoning_spec(gen_params, _current_model, self.config)
+                if (self.verbose and 'reasoning_effort' in gen_params
+                        and 'reasoning_effort' not in _req_params
+                        and 'reasoning_budget' not in _req_params):
+                    wlog(f"  [API] 模型 {_current_model} reasoning style=off，本次不发送思考强度")
                 if _model_idx > 0 and should_print_worker():
                     # 模型切换影响等待预期，强制上控制台（同时收录进轨日志）
                     wlog(f"  [API] 切换模型 → {_current_model}（第 {_model_idx+1}/{len(_model_chain)} 个）",
@@ -570,7 +799,7 @@ class APIClient:
                                 model=_current_model,
                                 messages=messages,
                                 max_tokens=max_tokens,
-                                gen_params=gen_params,
+                                gen_params=_req_params,
                                 stripped_optional=_stripped_optional,
                             )
                             return response
@@ -580,24 +809,58 @@ class APIClient:
                                 model=_current_model,
                                 messages=messages,
                                 max_tokens=max_tokens,
-                                gen_params=gen_params,
+                                gen_params=_req_params,
                                 stripped_optional=_stripped_optional,
                             )
                             return response
 
                         # 只保留白名单内参数
-                        _filtered = {k: v for k, v in gen_params.items() if k in _ALLOWED_GEN_PARAMS}
+                        _filtered = {k: v for k, v in _req_params.items() if k in _ALLOWED_GEN_PARAMS}
+                        # JSON 模式：保证正文是合法 JSON，专治"模型先聊两句英文
+                        # 再贴 JSON"类解析失败。官方强制要求 prompt 含 JSON 指示，
+                        # 因此仅 JSON 任务开启：json_mode=True 强制开，False 强制关，
+                        # None 跟注册表（模型条目 json_mode=true 才开）。
+                        _jm = json_mode
+                        if _jm is None:
+                            try:
+                                _jm = bool((model_entry(
+                                    _current_model, self.config)[0] or {}).get('json_mode'))
+                            except Exception:
+                                _jm = False
+                        if _jm:
+                            _filtered['response_format'] = {'type': 'json_object'}
                         _filtered['max_tokens'] = max_tokens
                         # 曾因参数不支持被拒 → 剔除可选参数重试
                         if _stripped_optional:
                             for _k in _OPTIONAL_PARAMS:
                                 _filtered.pop(_k, None)
 
-                        # 思考模式 extra_body：仅 DeepSeek 原生接口使用
+                        # 思考开关 extra_body：注册表 thinking_switch=true 的模型（如 deepseek）
+                        # 或 DeepSeek 原生接口（旧行为保留）都发；effort=none 表示关闭。
+                        # 曾被拒进入 stripped 重试时不再附带（避免同一参数反复被拒）。
                         _extra = {}
-                        if (not _stripped_optional and self._is_deepseek
+                        if (not _stripped_optional
+                                and (self._is_deepseek or model_thinking_switch(
+                                    _current_model, self.config))
                                 and 'reasoning_effort' in _filtered):
-                            _extra = {'thinking': {'type': 'enabled'}}
+                            if str(_filtered['reasoning_effort']).lower() == 'none':
+                                _extra = {'thinking': {'type': 'disabled'}}
+                                _filtered.pop('reasoning_effort', None)
+                            else:
+                                _extra = {'thinking': {'type': 'enabled'}}
+                        # 官方文档：思考模式下 temperature/top_p/presence_penalty/
+                        # frequency_penalty 不生效（设置不报错）。thinking 开启且注册表
+                        # strip_sampling_params=true 的模型，直接剔除，免得误导。
+                        if (_extra.get('thinking', {}).get('type') == 'enabled'
+                                and model_reasoning_spec(
+                                    _current_model, self.config).get(
+                                        'strip_sampling_params') is True):
+                            _dropped = [_k for _k in (
+                                'temperature', 'top_p', 'presence_penalty',
+                                'frequency_penalty') if _filtered.pop(_k, None) is not None]
+                            if _dropped and self.verbose:
+                                wlog(f"  [API] 思考模式开启，采样参数不生效，已剔除: "
+                                     f"{','.join(_dropped)}")
                         response = self._client.chat.completions.create(
                             model=_current_model,
                             messages=messages,
@@ -752,16 +1015,43 @@ class APIClient:
             _tp = gen_params.get('top_p')
             if _tp is not None:
                 body['top_p'] = _tp
-            # Anthropic 无 reasoning_effort 参数（用 thinking），且部分中转分组（如 aws-q）
-            # 禁用了 thinking 参数（传了会 503 model_not_found）。因此 anthropic 模式下忽略。
+            # budget 形态：注册表 reasoning.style=budget 且给出 token 数时，
+            # 发 Anthropic 自家的 thinking.budget_tokens；effort 形态在这里无对应字段，
+            # 且部分中转分组（如 aws-q）禁用了 thinking（传了 503），故默认不发。
+            _budget = gen_params.get('reasoning_budget')
+            try:
+                _budget = int(_budget) if _budget is not None else None
+            except (TypeError, ValueError):
+                _budget = None
+            if _budget and _budget > 0:
+                body['thinking'] = {'type': 'enabled', 'budget_tokens': _budget}
+            # 厂商方言位置覆盖：如 deepseek 在 anthropic 协议下强度走
+            # output_config.effort（注册表 effort_param.anthropic 指定）。
+            _eff_path = ''
+            try:
+                _eff_path = str((model_reasoning_spec(
+                    model, self.config).get('effort_param') or {}).get('anthropic') or '')
+            except Exception:
+                _eff_path = ''
+            if _eff_path == 'output_config.effort':
+                _ev = gen_params.get('reasoning_effort')
+                if _ev is not None:
+                    body['output_config'] = {'effort': str(_ev)}
         # (reasoning_effort 在 anthropic 协议下不传——部分中转不支持 thinking，传了会被拒)
 
+        # 鉴权头（官方文档：DeepSeek/Anthropic 官方用 x-api-key）：
+        # api.anthropic_auth = 'x-api-key' 发 x-api-key；默认 'bearer' 发
+        # Authorization: Bearer（PackyAPI 等中转要求，保持旧行为）。
+        _auth_mode = str(self.config.get('anthropic_auth') or 'bearer').strip().lower()
         url = f'{base_url}/messages'
         headers = {
             'Content-Type': 'application/json',
-            'Authorization': f'Bearer {api_key}',
             'anthropic-version': '2023-06-01',
         }
+        if _auth_mode == 'x-api-key':
+            headers['x-api-key'] = api_key
+        else:
+            headers['Authorization'] = f'Bearer {api_key}'
 
         if self.verbose and should_print_worker():
             wlog(f"{log_prefix()}  [Anthropic] POST {url} model={model} max_tokens={max_tokens} "
@@ -855,10 +1145,22 @@ class APIClient:
                 body['top_p'] = _tp
         # 思考强度：Responses 协议用顶层 reasoning.effort 控制（非 reasoning_effort 顶层字段）。
         # 映射自 gen_params.reasoning_effort（继承 config.generation_params.reasoning_effort，如 high）。
+        # DeepSeek 官方：effort=none 即关闭思考。
         _re = gen_params.get('reasoning_effort')
         if _re and not stripped_optional:
             body['reasoning'] = {'effort': str(_re)}
-
+        # 官方文档：思考模式下 temperature/top_p 不生效。思考开启（effort 非 none）
+        # 且注册表 strip_sampling_params=true 的模型，直接剔除。
+        _re_on = isinstance(body.get('reasoning'), dict) and str(
+            body['reasoning'].get('effort', '')).lower() != 'none'
+        if (_re_on and model_reasoning_spec(
+                model, self.config).get('strip_sampling_params') is True):
+            _dropped_r = [_k for _k in ('temperature', 'top_p') if _k in body]
+            for _k in _dropped_r:
+                body.pop(_k, None)
+            if _dropped_r and self.verbose:
+                wlog(f"  [API] 思考模式开启，采样参数不生效，已剔除: "
+                     f"{','.join(_dropped_r)}")
         url = f'{base_url}/responses'
         headers = {
             'Content-Type': 'application/json',
@@ -904,17 +1206,27 @@ class APIClient:
         usage = data.get('usage') or {}
         input_tokens = usage.get('input_tokens', 0)
         output_tokens = usage.get('output_tokens', 0)
-        # cache 统计：input_tokens_details.cached_tokens
+        # cache 统计：input_tokens_details.cached_tokens（官方文档确认字段）
         hit = 0
         _details = usage.get('input_tokens_details') or {}
         if isinstance(_details, dict):
             hit = _details.get('cached_tokens', 0) or 0
         miss = (input_tokens - hit) if input_tokens else 0
+        # 思维链 token：output_tokens_details.reasoning_tokens（官方文档确认字段，
+        # 已计入 output_tokens；transit 网关可能不返回，缺省 0）
+        _reasoning = 0
+        _o_details = usage.get('output_tokens_details') or {}
+        if isinstance(_o_details, dict):
+            try:
+                _reasoning = int(_o_details.get('reasoning_tokens', 0) or 0)
+            except (TypeError, ValueError):
+                _reasoning = 0
         stop_reason = data.get('status') or 'completed'
         if stop_reason == 'completed':
             stop_reason = 'stop'
 
-        return _CompatResponse(text, input_tokens, hit, miss, output_tokens, finish_reason=stop_reason)
+        return _CompatResponse(text, input_tokens, hit, miss, output_tokens,
+                               reasoning_tokens=_reasoning, finish_reason=stop_reason)
 
     # ---------- token 统计提取（统一 helper，供调用方复用） ----------
 
@@ -927,27 +1239,43 @@ class APIClient:
         - OpenAI 代理层: usage.prompt_tokens_details.cached_tokens
         """
         if usage is None:
-            return {'hit_tokens': 0, 'miss_tokens': 0, 'prompt_tokens': 0, 'completion_tokens': 0}
+            return {'hit_tokens': 0, 'miss_tokens': 0, 'prompt_tokens': 0,
+                    'completion_tokens': 0, 'reasoning_tokens': 0}
         hit = getattr(usage, 'prompt_cache_hit_tokens', None)
         miss = getattr(usage, 'prompt_cache_miss_tokens', None)
         if hit is None:
             details = getattr(usage, 'prompt_tokens_details', None)
             hit = details.cached_tokens if details else 0
             miss = (usage.prompt_tokens - hit) if usage.prompt_tokens else 0
+        try:
+            _reasoning = int(getattr(usage, 'reasoning_tokens', 0) or 0)
+        except (TypeError, ValueError):
+            _reasoning = 0
+        if not _reasoning:
+            # OpenAI SDK 对象：usage.completion_tokens_details.reasoning_tokens
+            #（官方文档确认字段；思考模型的思维链占比从这里看）
+            try:
+                _cd = getattr(usage, 'completion_tokens_details', None)
+                _reasoning = int(getattr(_cd, 'reasoning_tokens', 0) or 0) if _cd is not None else 0
+            except (TypeError, ValueError):
+                _reasoning = 0
         return {
             'hit_tokens': hit or 0,
             'miss_tokens': miss or 0,
             'prompt_tokens': usage.prompt_tokens or 0,
             'completion_tokens': usage.completion_tokens or 0,
+            'reasoning_tokens': _reasoning,
         }
 
     @staticmethod
     def extract_content(msg) -> str:
-        """从 response.choices[0].message 提取文本内容。
+        """从 response.choices[0].message 提取文本内容（仅最终正文）。
 
-        兼容 DeepSeek V4 reasoning: content 为空时回退到 reasoning_content。
+        禁止回退到 reasoning_content：思维链是过程不是答案，
+        拿它当结果会导致 JSON 解析失败、世界观存入垃圾（已实测）。
+        content 为空一律返回 ''，由调用方按失败处理（重试队列/正则回退）。
         """
-        content = msg.content or ''
-        if not content and hasattr(msg, 'reasoning_content') and msg.reasoning_content:
-            content = msg.reasoning_content
-        return content
+        try:
+            return msg.content or ''
+        except Exception:
+            return ''

@@ -34,6 +34,7 @@ class TokenUsage:
     completion_tokens: int  # 输出 token
     cost: float             # 本次费用
     elapsed: float          # 耗时（秒）
+    reasoning_tokens: int = 0  # 其中思维链 token（已计入 completion，仅分析用）
 
     @property
     def hit_rate(self) -> float:
@@ -116,6 +117,10 @@ class TokenTracker:
     @property
     def total_completion_tokens(self) -> int:
         return sum(r.completion_tokens for r in self.records)
+
+    @property
+    def total_reasoning_tokens(self) -> int:
+        return sum(getattr(r, 'reasoning_tokens', 0) or 0 for r in self.records)
 
     @property
     def overall_hit_rate(self) -> float:

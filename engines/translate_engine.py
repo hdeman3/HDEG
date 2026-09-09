@@ -80,6 +80,8 @@ class TranslationResult(TypedDict, total=False):
     miss_tokens: int             # 缓存未命中 token
     prompt_tokens: int           # 总输入 token
     completion_tokens: int       # 输出 token
+    reasoning_tokens: int        # 其中思维链 token（已计入 completion，仅分析用）
+    finish_reason: str | None    # 模型停止原因（stop/length/…，诊断空内容失败用）
     cost: float                  # 费用
     elapsed: float               # 本次调用耗时（秒）
 
@@ -469,7 +471,8 @@ class OpenAICompatEngine:
 
         返回:
             (response_text, token_stats)
-                token_stats: {hit_tokens, miss_tokens, completion_tokens, prompt_tokens}
+                token_stats: {hit_tokens, miss_tokens, completion_tokens, prompt_tokens,
+                    reasoning_tokens, finish_reason}
         """
         from engines.api_client import APIClient
 
@@ -518,8 +521,21 @@ class OpenAICompatEngine:
 
         msg = response.choices[0].message
         content = APIClient.extract_content(msg)
-        if self.verbose and not msg.content and content:
-            _p(f"  [API] content 为空, 使用 reasoning_content ({len(content)} 字符)", flush=True)
+        # 官方文档：finish_reason=length 表示输出撞到 max_tokens/上下文上限被截断，
+        # 内容可能不完整，点名告警（下游解析失败会进重试队列）。
+        try:
+            _fr = getattr(msg, 'finish_reason', None) or response.choices[0].finish_reason
+        except Exception:
+            _fr = None
+        if _fr in ('length', 'incomplete'):
+            _p(f"  [API] finish_reason={_fr}：输出被截断，结果可能不完整", flush=True)
+        if not content:
+            _reason_len = len(getattr(msg, 'reasoning_content', '') or '')
+            if _reason_len:
+                _p(f"  [API] content 为空（思考 {_reason_len} 字吃掉了输出配额），"
+                   f"按失败处理", flush=True)
+            elif self.verbose:
+                _p(f"  [API] content 为空，按失败处理", flush=True)
 
         # DEBUG: 尝试提取翻译结果供预览
         if self.verbose:
@@ -534,6 +550,12 @@ class OpenAICompatEngine:
                 _p(f"  [DEBUG] 返回内容(前5行):\n{resp_preview}", flush=True)
 
         token_stats = APIClient.extract_token_stats(response.usage)
+        try:
+            token_stats['finish_reason'] = (
+                getattr(msg, 'finish_reason', None) or response.choices[0].finish_reason
+            )
+        except Exception:
+            token_stats['finish_reason'] = None
         self._last_raw_response = content
         return content, token_stats
 
@@ -1030,6 +1052,7 @@ class OpenAICompatEngine:
         miss = token_stats['miss_tokens']
         prompt = token_stats.get('prompt_tokens', hit + miss)
         completion = token_stats['completion_tokens']
+        reasoning = token_stats.get('reasoning_tokens', 0) or 0
         cost = (hit / 1_000_000) * self.pricing['hit_per_1m'] + \
                (miss / 1_000_000) * self.pricing['miss_per_1m'] + \
                (completion / 1_000_000) * self.pricing['completion_per_1m']
@@ -1042,6 +1065,8 @@ class OpenAICompatEngine:
             miss_tokens=miss,
             prompt_tokens=prompt,
             completion_tokens=completion,
+            reasoning_tokens=reasoning,
+            finish_reason=token_stats.get('finish_reason'),
             cost=cost,
             elapsed=call_elapsed,
         )

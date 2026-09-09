@@ -150,7 +150,8 @@ class Printer:
 
     def token(self, type_cn: str, label: str, elapsed: float,
               prompt_tokens: int, hit_tokens: int, miss_tokens: int,
-              completion_tokens: int, cost: float | None) -> None:
+              completion_tokens: int, cost: float | None,
+              reasoning_tokens: int = 0) -> None:
         """单次 API 调用的 token 用量行"""
         elapsed_str = f"{elapsed:.1f}s" if elapsed >= 1 else f"{elapsed*1000:.0f}ms"
         hit_rate = (hit_tokens / (hit_tokens + miss_tokens) * 100) if (hit_tokens + miss_tokens) > 0 else 0
@@ -163,10 +164,15 @@ class Printer:
             f"Cache命中 {self._fmt_tok(hit_tokens)} ({hit_rate:.0f}%) | "
             f"Cache未命中 {self._fmt_tok(miss_tokens)}"
         )
-        self.fine(
-            f"输出 {self._fmt_tok(completion_tokens)} | "
-            f"费用 {cost_str}"
-        )
+        _out_line = f"输出 {self._fmt_tok(completion_tokens)}"
+        try:
+            _rt = int(reasoning_tokens or 0)
+        except (TypeError, ValueError):
+            _rt = 0
+        if _rt > 0:
+            _pct = _rt / completion_tokens * 100 if completion_tokens else 0
+            _out_line += f"（其中思考 {_rt:,} {_pct:.0f}%）"
+        self.fine(f"{_out_line} | 费用 {cost_str}")
 
     def token_summary(self, tracker: TokenTracker, elapsed_total: float = 0.0) -> None:
         """批次最终汇总"""
@@ -265,6 +271,7 @@ class Printer:
                 miss_tokens=usage.miss_tokens,
                 completion_tokens=usage.completion_tokens,
                 cost=usage.cost,
+                reasoning_tokens=getattr(usage, 'reasoning_tokens', 0) or 0,
             )
 
     # ── 仅 debug 模式 ──

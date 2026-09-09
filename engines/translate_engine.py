@@ -23,8 +23,21 @@ def _p(*args, **kwargs):
     主线程（main）日志刷屏。
     """
     try:
-        from engines.api_client import log_prefix, should_print_worker
-        if not should_print_worker():
+        from engines.api_client import (
+            log_prefix, should_print_worker, buffer_active, buffer_line,
+            debug_verbose_console,
+        )
+        # 逐轨缓冲中：详细行收录进该轨 buffer；非 debug 不上控制台，
+        # debug 直通控制台（旧行为，不受静默门控）。
+        if buffer_active():
+            try:
+                _raw = args[0] if args and isinstance(args[0], str) else ''
+                buffer_line((log_prefix() + _raw) if _raw else '')
+            except Exception:
+                pass
+            if not debug_verbose_console:
+                return
+        if not debug_verbose_console and not should_print_worker():
             return  # worker 静默模式：不打印 worker 详细日志
         prefix = log_prefix()
     except Exception:
@@ -48,7 +61,12 @@ def _p(*args, **kwargs):
         args = ('\n'.join(lines),) + args[1:]
     elif prefix:
         args = (prefix,) + args
-    print(*args, **kwargs)
+    try:
+        from engines.api_client import _PRINT_LOCK
+        with _PRINT_LOCK:
+            print(*args, **kwargs)
+    except Exception:
+        print(*args, **kwargs)
 
 
 # ==================== 翻译结果类型 ====================

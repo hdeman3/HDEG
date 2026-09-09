@@ -31,10 +31,24 @@ class Printer:
         self.debug_enabled = debug
 
     def _logp(self, *args, **kwargs):
-        """带 worker 前缀的 print：worker 线程日志自动加 [W{n}] 前缀，与 _log/_p 一致。"""
+        """带 worker 前缀的 print：worker 线程日志自动加 [W{n}] 前缀，与 _log/_p 一致。
+
+        逐轨缓冲中（含每轨 token 明细）：只收录进该轨 buffer，不上控制台。
+        """
         try:
-            from engines.api_client import log_prefix, should_print_worker
-            if not should_print_worker():
+            from engines.api_client import (
+                log_prefix, should_print_worker, buffer_active, buffer_line,
+                debug_verbose_console,
+            )
+            if buffer_active():
+                try:
+                    _raw = args[0] if args and isinstance(args[0], str) else ''
+                    buffer_line((log_prefix() + _raw) if _raw else '')
+                except Exception:
+                    pass
+                if not debug_verbose_console:
+                    return
+            if not debug_verbose_console and not should_print_worker():
                 return  # worker 静默模式：不打印 worker 详细日志
             prefix = log_prefix()
         except Exception:
@@ -47,7 +61,12 @@ class Printer:
             args = (s[:idx] + prefix + s[idx:],) + args[1:]
         elif prefix:
             args = (prefix,) + args
-        print(*args, **kwargs)
+        try:
+            from engines.api_client import _PRINT_LOCK
+            with _PRINT_LOCK:
+                print(*args, **kwargs)
+        except Exception:
+            print(*args, **kwargs)
 
     # ── 顶级结构 ──
 

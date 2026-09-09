@@ -49,6 +49,79 @@ def log_prefix() -> str:
     return f"[W{wid}] " if wid is not None else ''
 
 
+# ==================== 共享打印锁 + 逐轨日志缓冲 ====================
+# 多线程下所有控制台输出都应经 _PRINT_LOCK，保证一次 print 调用不被别的线程拦腰截断。
+# 逐轨缓冲：worker 翻译单个音轨时，详细日志先攒进线程本地 buffer（带 [+秒数] 时间戳），
+# 音轨结束由 orchestrator 一次性写入该轨专属日志文件（单次 write，原子不穿插）。
+_PRINT_LOCK = _threading_mod.RLock()
+_BUF_LOCK = _threading_mod.Lock()
+
+# debug 直通：app.debug=true 时，逐轨缓冲改为"双写"——详细行同时收录进 buffer
+# （作品文件照写）和打印到控制台（旧行为，按 [Wn] 前缀分组查看），且不受
+# worker_silent 门控（开了 debug 就是要看全量）。
+# 非 debug 时缓冲行只进文件不上控制台，控制台保持干净。
+debug_verbose_console = False
+
+
+def set_debug_console(enabled: bool) -> None:
+    """设置 debug 直通开关（由 PipelineContext 按 app.debug 初始化）。"""
+    global debug_verbose_console
+    debug_verbose_console = bool(enabled)
+
+
+def start_track_buffer() -> None:
+    """开始当前线程的逐轨缓冲（worker 翻译单个音轨前调用）。"""
+    worker_local._log_buffer = {'lines': [], 't0': _time_mod.monotonic()}
+
+
+def stop_track_buffer() -> dict | None:
+    """结束当前线程的逐轨缓冲并取回（worker 翻译单个音轨后调用）。"""
+    buf = getattr(worker_local, '_log_buffer', None)
+    worker_local._log_buffer = None
+    return buf
+
+
+def buffer_active() -> bool:
+    """当前线程是否处于逐轨缓冲中"""
+    return getattr(worker_local, '_log_buffer', None) is not None
+
+
+def buffer_line(text: str) -> None:
+    """向当前线程的逐轨 buffer 追加一行（行级原子，文件内不穿插）。"""
+    buf = getattr(worker_local, '_log_buffer', None)
+    if buf is None:
+        return
+    try:
+        elapsed = _time_mod.monotonic() - buf.get('t0', _time_mod.monotonic())
+        with _BUF_LOCK:
+            buf['lines'].append(f"[+{elapsed:7.1f}s] {text}")
+    except Exception:
+        pass
+
+
+def wlog(text: str = '', *, force_console: bool = False, flush: bool = True,
+         console_only: bool = False) -> None:
+    """worker 感知的统一打印：缓冲收录 + 加锁输出。
+
+    - 缓冲中：无论静默与否都先收录进 buffer（保证日志文件完整）；
+      控制台是否输出仍按 force_console / should_print_worker() 决定。
+    - 非缓冲：沿用旧语义（worker 且静默时不打印）。
+    - console_only=True：只上控制台不进文件（心跳专用；用时仍由完成行/
+      文件每轨用时/行级[+秒数]记录，不受影响）。
+    """
+    if buffer_active() and not console_only:
+        buffer_line(text)
+        # 缓冲中：常规细节只进文件不上控制台（API过程等），仅
+        # force_console（配额/模型切换）与 debug 直通上控制台
+        if not force_console and not debug_verbose_console:
+            return
+    else:
+        if not force_console and not debug_verbose_console and not should_print_worker():
+            return
+    with _PRINT_LOCK:
+        print(text, flush=flush)
+
+
 # OpenAI 兼容 API 可接受的生成参数白名单
 _ALLOWED_GEN_PARAMS = (
     'temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty',
@@ -56,6 +129,9 @@ _ALLOWED_GEN_PARAMS = (
 )
 # 部分 OpenAI 兼容服务不接受的扩展参数（被拒后自动剔除重试）
 _OPTIONAL_PARAMS = ('reasoning_effort', 'top_k')
+
+# 每个进程生成一次 session ID，所有请求共用（kikoeru 每次翻译启动一个 Python 进程）
+_RESPONSES_SESSION_ID = f'hdeg-{__import__("os").getpid():x}-{int(__import__("time").time()) & 0xFFFF:04x}'
 
 
 class _AnthropicAPIError(Exception):
@@ -236,6 +312,121 @@ class APIClient:
         """当前激活模型（受轮换影响，动态读取）"""
         return self.config.get('model') or 'gpt-4o-mini'
 
+    @property
+    def protocol_name(self) -> str:
+        """当前协议：'openai' | 'anthropic' | 'responses'（构造时已探测，无网络调用）"""
+        if self._is_anthropic:
+            return 'anthropic'
+        if self._is_responses:
+            return 'responses'
+        return 'openai'
+
+    @property
+    def protocol_endpoint(self) -> str:
+        """当前协议的请求路径（用于启动信息展示）"""
+        return {
+            'anthropic': '/v1/messages',
+            'responses': '/v1/responses',
+            'openai': '/v1/chat/completions',
+        }.get(self.protocol_name, '')
+
+    @staticmethod
+    def protocol_source(config: dict) -> str:
+        """协议来源：显式配置还是模型名自动推断"""
+        _p = ((config or {}).get('protocol') or '').lower()
+        if _p in ('openai', 'anthropic', 'responses'):
+            return '显式配置 api.protocol'
+        return '模型名自动推断'
+
+    @staticmethod
+    def _mask_proxy_url(url: str) -> str:
+        """代理 URL 脱敏（http://user:pass@host → http://user:***@host）。"""
+        try:
+            from urllib.parse import urlsplit, urlunsplit
+            _parts = urlsplit(url)
+            if _parts.password:
+                _net = _parts.hostname or ''
+                if _parts.port:
+                    _net += f':{_parts.port}'
+                _auth = (_parts.username or '') + ':***@' if _parts.username else ''
+                return urlunsplit((_parts.scheme, _auth + _net,
+                                   _parts.path, _parts.query, _parts.fragment))
+        except Exception:
+            pass
+        return url
+
+    @staticmethod
+    def detect_proxy(api_cfg: dict, network_cfg: dict = None) -> tuple[bool, str]:
+        """探测 API 请求实际走不走代理（纯本地判断，无网络调用）。
+
+        顺序：清代理开关 → Windows 系统注册表 → 进程环境变量。
+        生效栈：openai 协议走 OpenAI SDK（httpx，只读环境变量；
+        启动后 _ensure_client 会把注册表代理写回环境变量）；
+        anthropic/responses 协议走 requests 会话（注册表代理直读）。
+
+        返回: (是否走代理, 描述)
+        """
+        import os as _os
+        api_cfg = api_cfg or {}
+        network_cfg = network_cfg or {}
+        if bool(api_cfg.get('clear_proxy', False)) or \
+                bool(network_cfg.get('clear_proxy_on_startup', False)):
+            return False, '关（直连：clear_proxy=true）'
+        _reg = None
+        try:
+            import urllib.request as _ur
+            _r = _ur.getproxies_registry() or {}
+            _reg = _r.get('http') or _r.get('https')
+        except Exception:
+            _reg = None
+        if _reg:
+            return True, f'开 {APIClient._mask_proxy_url(_reg)}（来源：系统注册表）'
+        _env = (_os.environ.get('HTTP_PROXY') or _os.environ.get('HTTPS_PROXY')
+                or _os.environ.get('http_proxy') or _os.environ.get('https_proxy')
+                or _os.environ.get('ALL_PROXY') or _os.environ.get('all_proxy'))
+        if _env:
+            return True, f'开 {APIClient._mask_proxy_url(_env)}（来源：环境变量）'
+        if _os.environ.get('NO_PROXY') == '*':
+            return False, '关（直连：NO_PROXY=*）'
+        return False, '关（直连：未检测到系统代理）'
+
+    def preflight_check(self, timeout: float = 60.0) -> tuple[bool, str, float]:
+        """翻译开始前的 API 可用性探测：发一个极小请求，有正常响应即算可用。
+
+        轻量设计：输出上限 16 token、不带 reasoning_effort（不烧思考 token）、
+        独立短超时（默认 60s，不沿用翻译用的长 timeout，避免 hung 住）、
+        模型链内每个模型只试一次（配额耗尽自动轮换到下一个）。
+
+        返回: (可用, 实际响应的模型名/错误摘要, 耗时秒)
+        """
+        import copy as _copy
+        pre_cfg = _copy.deepcopy(self.config) if isinstance(self.config, dict) else {}
+        pre_cfg['timeout'] = timeout
+        # 去掉思考强度：预检不需要思考，别烧 token
+        _gp = dict(pre_cfg.get('generation_params', {}) or {})
+        _gp.pop('reasoning_effort', None)
+        _gp.pop('thinking', None)
+        pre_cfg['generation_params'] = _gp
+        _api = APIClient(pre_cfg, verbose=False)
+        _t0 = _time_mod.monotonic()
+        try:
+            resp = _api.chat(
+                messages=[{'role': 'user', 'content': 'ping'}],
+                max_tokens=16,
+                max_retries=0,  # 每模型只试一次（chat 内 max(0,1)=1 次尝试）
+            )
+            _el = _time_mod.monotonic() - _t0
+            try:
+                _model = _api.current_model
+            except Exception:
+                _model = ''
+            # 只要无异常返回即算可用（网关/模型正常响应，不校验内容）
+            _ = resp
+            return True, _model, _el
+        except Exception as e:
+            _el = _time_mod.monotonic() - _t0
+            return False, f"{type(e).__name__}: {e}", _el
+
     # ---------- 错误识别 ----------
 
     @staticmethod
@@ -336,17 +527,22 @@ class APIClient:
         # 心跳线程是独立线程，threading.local 不继承父线程的 worker_id；
         # 这里捕获父线程（当前调用线程）的 worker_id，心跳线程内设置，使 [等待] 日志带正确前缀。
         _hb_worker_id = getattr(worker_local, '_worker_id', None)
+        # 心跳线程同样不继承父线程的 buffer，显式传递 buffer 对象引用，
+        # 使心跳行收录进同一音轨的日志文件（列表 append 行级原子，文件内不穿插）。
+        _hb_buf = getattr(worker_local, '_log_buffer', None)
 
         def _print_heartbeat():
             if _hb_worker_id is not None:
                 worker_local._worker_id = _hb_worker_id
+            if _hb_buf is not None:
+                worker_local._log_buffer = _hb_buf
             while not heartbeat_stop.is_set():
                 heartbeat_stop.wait(10)
                 if not heartbeat_stop.is_set():
                     secs = int(_time_mod.monotonic() - _hb_start)
-                    # worker 静默模式下心跳不打印（只保留主线程内容）
-                    if should_print_worker():
-                        print(f"{log_prefix()}    [等待] 已等待 {secs} 秒...", flush=True)
+                    # 心跳 debug/非debug 都上控制台，但不记入日志文件
+                    # （用时仍有完成行用时/文件每轨用时/行级[+秒数]记录）
+                    wlog(f"{log_prefix()}    [等待] 已等待 {secs} 秒...", console_only=True)
 
         heartbeat_thread = threading.Thread(target=_print_heartbeat, daemon=True)
         heartbeat_thread.start()
@@ -362,7 +558,9 @@ class APIClient:
                 self.config['model'] = _current_model
                 self._model_idx = _model_idx
                 if _model_idx > 0 and should_print_worker():
-                    print(f"  [API] 切换模型 → {_current_model}（第 {_model_idx+1}/{len(_model_chain)} 个）", flush=True)
+                    # 模型切换影响等待预期，强制上控制台（同时收录进轨日志）
+                    wlog(f"  [API] 切换模型 → {_current_model}（第 {_model_idx+1}/{len(_model_chain)} 个）",
+                         force_console=True)
 
                 # 尝试次数 = max(max_retries, 1)：max_retries=0 表示不重试，但仍执行首次尝试
                 for attempt in range(max(max_retries, 1)):
@@ -412,18 +610,20 @@ class APIClient:
                     except Exception as e:
                         last_error = e
                         if self.verbose and should_print_worker():
-                            print(f"  [API] 模型 {_current_model} 尝试 {attempt+1}/{max_retries} 失败: "
-                                  f"{type(e).__name__}: {e}", flush=True)
+                            wlog(f"  [API] 模型 {_current_model} 尝试 {attempt+1}/{max_retries} 失败: "
+                                 f"{type(e).__name__}: {e}")
                         # 参数不支持 → 剔除可选参数后立即重试（同一模型）
                         if not _stripped_optional and self._looks_like_unsupported_param(e):
                             _stripped_optional = True
                             if self.verbose and should_print_worker():
-                                print("  [API] 服务可能不支持 reasoning_effort/top_k/thinking，自动剔除后重试", flush=True)
+                                wlog("  [API] 服务可能不支持 reasoning_effort/top_k/thinking，自动剔除后重试")
                             continue
                         # 配额耗尽 → 切换到下一个模型继续同一批次
+                        # （配额行影响用户等待预期，强制上控制台；同时收录进轨日志）
                         if self._looks_like_quota_exhausted(e):
                             if self.verbose:
-                                print(f"  [API] 模型 {_current_model} 配额/用量受限，准备切换模型", flush=True)
+                                wlog(f"  [API] 模型 {_current_model} 配额/用量受限，准备切换模型",
+                                     force_console=True)
                             break  # 跳出当前模型的 for 循环，外层 while 取下一个模型
                         # 其他错误：指数退避后重试同一模型
                         if attempt < max_retries - 1:
@@ -483,15 +683,20 @@ class APIClient:
     def _proxy_session() -> 'requests.Session':
         """构造带系统代理的 requests.Session。
 
-        trust_env=False → 完全忽略环境变量（含 NO_PROXY），只使用显式代理，
-        确保中转（muse/claude 等）即使进程环境残留 NO_PROXY 也强制走代理。
+        策略：先把注册表代理写回进程环境变量（HTTP_PROXY/HTTPS_PROXY），
+        再用默认 trust_env=True 创建 Session。这样 requests 会自动从环境变量
+        读取代理，无论 _get_system_proxies() 是否能从注册表读到，都能走代理。
+        同时清除 NO_PROXY 防止绕过。
         """
+        import os as _os
         import requests as _requests
-        _sess = _requests.Session()
-        _sess.trust_env = False
+        # 先把注册表代理写入环境变量（与 _ensure_client 一致）
         _px = APIClient._get_system_proxies()
         if _px:
-            _sess.proxies.update(_px)
+            _os.environ['HTTP_PROXY'] = _px.get('http', '')
+            _os.environ['HTTPS_PROXY'] = _px.get('https', '')
+            _os.environ.pop('NO_PROXY', None)
+        _sess = _requests.Session()
         return _sess
 
     # ---------- Anthropic messages 协议 ----------
@@ -559,8 +764,8 @@ class APIClient:
         }
 
         if self.verbose and should_print_worker():
-            print(f"{log_prefix()}  [Anthropic] POST {url} model={model} max_tokens={max_tokens} "
-                  f"messages={len(anthropic_messages)} system={len(system_prompt)}字符", flush=True)
+            wlog(f"{log_prefix()}  [Anthropic] POST {url} model={model} max_tokens={max_tokens} "
+                 f"messages={len(anthropic_messages)} system={len(system_prompt)}字符")
 
         resp = _sess.post(url, json=body, headers=headers, timeout=timeout)
         if resp.status_code != 200:
@@ -658,11 +863,12 @@ class APIClient:
         headers = {
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {api_key}',
+            'x-opencode-session': _RESPONSES_SESSION_ID,
         }
 
         if self.verbose and should_print_worker():
-            print(f"{log_prefix()}  [Responses] POST {url} model={model} max_output_tokens={_out_tokens} "
-                  f"input={len(input_items)} instructions={len(system_prompt)}字符", flush=True)
+            wlog(f"{log_prefix()}  [Responses] POST {url} model={model} max_output_tokens={_out_tokens} "
+                 f"input={len(input_items)} instructions={len(system_prompt)}字符")
 
         resp = _sess.post(url, json=body, headers=headers, timeout=timeout)
         if resp.status_code != 200:

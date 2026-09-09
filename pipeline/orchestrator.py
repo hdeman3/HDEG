@@ -1946,6 +1946,7 @@ def translate_one_lrc(
 
     _all_ok = True
     _fr_list: list = []  # 各块 finish_reason（诊断空内容失败用）
+    _last_reason_preview = ''  # 末块思维链预览（诊断用）
     for _ci, _chunk_idx in enumerate(_chunks):
         _chunk_numbered = [numbered[i] for i in _chunk_idx]
         # 分块内 scriptbook_aligned：把原始行索引 i 映射为子块内索引 (i - 块起点)
@@ -1992,6 +1993,7 @@ def translate_one_lrc(
         call_elapsed = time.time() - call_start
         try:
             _fr_list.append(result.get('finish_reason'))
+            _last_reason_preview = result.get('reasoning_preview', '') or ''
         except Exception:
             pass
 
@@ -2052,6 +2054,8 @@ def translate_one_lrc(
              f"（已尝试 {attempts} 次，最多重试 {_max_r} 次）"
              f"（停因:{','.join(_fr_show) if _fr_show else '?'}"
              f" 思考{_total_reasoning}tok/输出{_total_comp}tok）")
+        if _last_reason_preview:
+            _log(f"  [异常翻译] 思维链预览: {_last_reason_preview[:500]}")
         _enqueue_failed_track(ctx, {
             'lrc_path': lrc_path,
             'label': label,

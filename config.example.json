@@ -14,15 +14,14 @@
           "thinking_switch": true, "strip_sampling_params": true,
           "effort_param": {"anthropic": "output_config.effort"}}}
     },
-    "anthropic_auth": "bearer",
     "timeout": 2000,
     "generation_params": {
       "temperature": 1,
       "top_p": 0.9,
       "max_tokens": 262144,
-      "max_tokens_cap": 0,
       "reasoning_effort": "high"
-    },
+    }
+  },
     "presets": {
       "deepseek-official": {
         "note": "已实测(chat/anthropic/responses三协议+思考开关)，直连无需代理也可跑",
@@ -30,7 +29,6 @@
         "key": "",
         "base_url": "https://api.deepseek.com",
         "protocol": "",
-        "anthropic_auth": "x-api-key",
         "models": {
           "deepseek-chat": {"protocol": "openai", "note": "无思考模型",
             "json_mode": true,
@@ -49,7 +47,6 @@
           "temperature": 1,
           "top_p": 0.9,
           "max_tokens": 196608,
-          "max_tokens_cap": 0,
           "reasoning_effort": "low"
         }
       },
@@ -67,7 +64,6 @@
           "temperature": 1,
           "top_p": 0.9,
           "max_tokens": 196608,
-          "max_tokens_cap": 0,
           "reasoning_effort": "high"
         }
       }

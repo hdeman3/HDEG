@@ -723,14 +723,9 @@ class APIClient:
                 gen_params[k] = cfg_gen[k]
         if reasoning_effort is _UNSET and 'reasoning_effort' in cfg_gen:
             gen_params['reasoning_effort'] = cfg_gen['reasoning_effort']
-        # 输出上限封顶：注册表 models[xxx].max_output_tokens（厂商上限，
-        # 0/缺省=不限）与 generation_params.max_tokens_cap（全局手动上限，
-        # 0=不限）取最小值。全局 max_tokens 保持大窗口，只在真超限时钳制。
+        # 输出上限封顶：仅注册表 models[xxx].max_output_tokens（厂商上限，
+        # 0/缺省=不限）。全局 max_tokens 保持大窗口，只在真超限时钳制。
         _requested_max = max_tokens
-        try:
-            _global_cap = int(cfg_gen.get('max_tokens_cap', 0) or 0)
-        except (TypeError, ValueError):
-            _global_cap = 0
 
         _stripped_optional = False
         _model_chain = self._model_chain()
@@ -777,7 +772,7 @@ class APIClient:
                 # 回写当前激活模型，保证所有外部读取 config['model'] 的路径同步
                 self.config['model'] = _current_model
                 self._model_idx = _model_idx
-                # 逐模型输出上限（注册表 max_output_tokens 与全局 cap 取最小；都不设则用请求值）
+                # 逐模型输出上限（注册表 max_output_tokens；不设则用请求值）
                 max_tokens = _requested_max
                 try:
                     _reg_cap = int((model_entry(
@@ -785,13 +780,8 @@ class APIClient:
                             'max_output_tokens', 0) or 0)
                 except (TypeError, ValueError):
                     _reg_cap = 0
-                _eff_cap = 0
-                if _global_cap > 0:
-                    _eff_cap = _global_cap
-                if _reg_cap > 0:
-                    _eff_cap = _reg_cap if _eff_cap <= 0 else min(_eff_cap, _reg_cap)
-                if _eff_cap > 0 and max_tokens > _eff_cap:
-                    max_tokens = _eff_cap
+                if _reg_cap > 0 and max_tokens > _reg_cap:
+                    max_tokens = _reg_cap
                 # 按注册表 reasoning 规则裁剪本次请求参数（逐模型：链上模型规则可能不同）
                 _req_params = apply_reasoning_spec(gen_params, _current_model, self.config)
                 if (self.verbose and 'reasoning_effort' in gen_params
@@ -1051,19 +1041,13 @@ class APIClient:
                     body['output_config'] = {'effort': str(_ev)}
         # (reasoning_effort 在 anthropic 协议下不传——部分中转不支持 thinking，传了会被拒)
 
-        # 鉴权头（官方文档：DeepSeek/Anthropic 官方用 x-api-key）：
-        # api.anthropic_auth = 'x-api-key' 发 x-api-key；默认 'bearer' 发
-        # Authorization: Bearer（PackyAPI 等中转要求，保持旧行为）。
-        _auth_mode = str(self.config.get('anthropic_auth') or 'bearer').strip().lower()
+        # 鉴权头：anthropic 协议一律 x-api-key（官方标准，不考虑中转站）。
         url = f'{base_url}/messages'
         headers = {
             'Content-Type': 'application/json',
             'anthropic-version': '2023-06-01',
+            'x-api-key': api_key,
         }
-        if _auth_mode == 'x-api-key':
-            headers['x-api-key'] = api_key
-        else:
-            headers['Authorization'] = f'Bearer {api_key}'
         headers.update(_zen_session_headers(base_url))
 
         if self.verbose and should_print_worker():

@@ -185,7 +185,7 @@ def run_pyinstaller():
         print("❌ PyInstaller 打包失败！")
         sys.exit(1)
     
-    print("✓ PyInstaller 打包完成")
+    print("OK PyInstaller 打包完成")
     print()
 
 
@@ -241,7 +241,7 @@ def run_pyinstaller():
 #
 #         print(f"  正在复制 PaddleOCR 模型: {src_dir} -> {local_dir}")
 #         shutil.copytree(src_dir, local_dir)
-#         print(f"  ✓ PaddleOCR 模型复制完成")
+#         print(f"  OK PaddleOCR 模型复制完成")
 #         return local_dir
 #
 #     except Exception as e:
@@ -262,7 +262,7 @@ def create_release_dir():
         shutil.rmtree(RELEASE_DIR)
     
     RELEASE_DIR.mkdir(parents=True)
-    print(f"✓ 创建发布文件夹: {RELEASE_DIR}")
+    print(f"OK 创建发布文件夹: {RELEASE_DIR}")
     print()
 
 
@@ -281,7 +281,7 @@ def copy_exe():
         sys.exit(1)
     
     shutil.copy2(exe_src, exe_dst)
-    print(f"✓ 复制: {exe_src} -> {exe_dst}")
+    print(f"OK 复制: {exe_src} -> {exe_dst}")
     print()
 
 
@@ -481,7 +481,7 @@ pause'''
         count += 1
         print(f"  生成: {filename}")
 
-    print(f"✓ 共生成 {count} 个 .bat 文件")
+    print(f"OK 共生成 {count} 个 .bat 文件")
     print()
 
 
@@ -540,7 +540,7 @@ def extract_system_prompt():
     with open(prompt_file, 'w', encoding='utf-8') as f:
         f.write(full_prompt)
     
-    print(f"✓ 提取系统提示词写入: {prompt_file}")
+    print(f"OK 提取系统提示词写入: {prompt_file}")
     print(f"  提示词长度: {len(full_prompt)} 字符")
     print()
 
@@ -559,11 +559,19 @@ def copy_config():
     with open(config_src, 'r', encoding='utf-8') as f:
         config = json.load(f)
     
-    # 抹去 API key
-    if "api" in config and "key" in config["api"]:
-        original_key = config["api"]["key"]
-        config["api"]["key"] = ""  # 清空 key
-        print(f"  抹去 API key: {original_key[:10]}... -> (空)")
+    # 抹去 API key（含 presets 内各服务商的 key）
+    if "api" in config:
+        if "key" in config["api"]:
+            original_key = config["api"]["key"]
+            config["api"]["key"] = ""
+            print(f"  抹去 API key: {str(original_key)[:10]}... -> (空)")
+        # 预设中的 key 也需清空
+        presets = config["api"].get("presets")
+        if isinstance(presets, dict):
+            for pname, pval in presets.items():
+                if isinstance(pval, dict) and "key" in pval and pval["key"]:
+                    pval["key"] = ""
+                    print(f"  抹去 preset[{pname}].key -> (空)")
     
     # 关闭 debug
     if "app" in config and "debug" in config["app"]:
@@ -588,12 +596,63 @@ def copy_config():
         # 开启 ja.lrc 输出
         config["app"]["export_ja_lrc"] = True
         print(f"  开启 ja.lrc 输出: True")
+
+        # 新版本新增参数：确保发布件包含合理默认值
+        defaults_app = {
+            "translate_failed_max_retries": 3,
+            "save_track_logs": True,
+            "track_log_detail": True,
+            "api_preflight": True,
+            "print_worker_detail": True,
+        }
+        for k, v in defaults_app.items():
+            if k not in config["app"]:
+                config["app"][k] = v
+                print(f"  补齐新参数 {k}: {v}")
         
         # 移除旧的废弃参数（如果存在）
         for old_param in ["scriptbook_full_mode", "full_mode_one_request", "full_mode_batch_all"]:
             if old_param in config["app"]:
                 del config["app"][old_param]
                 print(f"  移除废弃参数: {old_param}")
+
+    # 新版本 API 预设与模型注册表：确保发布件包含示例预设结构（若源配置缺失则补齐）
+    if "api" in config:
+        if "presets" not in config["api"]:
+            config["api"]["presets"] = {}
+            print("  补齐 presets: {}")
+        # 若发布源 presets 为空，从示例配置补齐预设模板
+        if not config["api"]["presets"]:
+            try:
+                ex_path = SCRIPT_DIR / "config.example.json"
+                if ex_path.exists():
+                    with open(ex_path, 'r', encoding='utf-8') as ef:
+                        ex_cfg = json.load(ef)
+                    ex_presets = ex_cfg.get("api", {}).get("presets", {})
+                    if isinstance(ex_presets, dict) and ex_presets:
+                        config["api"]["presets"] = ex_presets
+                        print(f"  补齐 presets 来自示例: {list(ex_presets.keys())}")
+            except Exception as e:
+                print(f"  补齐 presets 失败: {e}")
+        if "models" not in config["api"]:
+            config["api"]["models"] = {}
+            print("  补齐 models: {}")
+        if "active_preset" not in config["api"]:
+            config["api"]["active_preset"] = ""
+        # 确保 generation_params 含 reasoning_effort（新版本必备）
+        if "generation_params" not in config["api"]:
+            config["api"]["generation_params"] = {}
+        if "reasoning_effort" not in config["api"]["generation_params"]:
+            config["api"]["generation_params"]["reasoning_effort"] = "low"
+            print("  补齐 generation_params.reasoning_effort: low")
+
+        # 发布件默认使用 deepseek-v4-flash（按用户要求）
+        config["api"]["model"] = "deepseek-v4-flash"
+        config["api"]["base_url"] = "https://api.deepseek.com"
+        # 若存在 deepseek-official 预设则默认选用，否则保持空由模型自动匹配
+        if isinstance(config["api"].get("presets"), dict) and "deepseek-official" in config["api"]["presets"]:
+            config["api"]["active_preset"] = "deepseek-official"
+        print("  设置默认模型: deepseek-v4-flash (base_url=https://api.deepseek.com)")
     
     # OCR 已禁用 —— 不再设置 OCR 参数
     # if "ocr" in config:
@@ -612,7 +671,7 @@ def copy_config():
     with open(config_dst, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
     
-    print(f"✓ 处理后的 config.json 已保存到: {config_dst}")
+    print(f"OK 处理后的 config.json 已保存到: {config_dst}")
     print()
 
 
@@ -632,7 +691,7 @@ def copy_config():
 #             print(f"  复制本地 PaddleOCR 模型: {local_models} -> {dst}")
 #             shutil.copytree(local_models, dst)
 #             total_size = sum(f.stat().st_size for f in dst.rglob('*') if f.is_file())
-#             print(f"  ✓ PaddleOCR 模型已复制到发布目录 ({total_size / 1024 / 1024:.1f} MB)")
+#             print(f"  OK PaddleOCR 模型已复制到发布目录 ({total_size / 1024 / 1024:.1f} MB)")
 #         else:
 #             print(f"  发布目录中已有 PaddleOCR 模型")
 #         print()
@@ -646,7 +705,7 @@ def copy_config():
 #             print(f"  复制 PaddleOCR 模型到发布目录: {models} -> {dst}")
 #             shutil.copytree(models, dst)
 #             total_size = sum(f.stat().st_size for f in dst.rglob('*') if f.is_file())
-#             print(f"  ✓ PaddleOCR 模型已复制到发布目录 ({total_size / 1024 / 1024:.1f} MB)")
+#             print(f"  OK PaddleOCR 模型已复制到发布目录 ({total_size / 1024 / 1024:.1f} MB)")
 #     else:
 #         print("  ⚠ 未找到 PaddleOCR 模型，发布后 OCR 功能将需要联网下载模型")
 #

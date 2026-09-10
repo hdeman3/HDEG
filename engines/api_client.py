@@ -143,6 +143,17 @@ _OPTIONAL_PARAMS = ('reasoning_effort', 'top_k')
 _RESPONSES_SESSION_ID = f'hdeg-{__import__("os").getpid():x}-{int(__import__("time").time()) & 0xFFFF:04x}'
 
 
+def _zen_session_headers(base_url: str) -> dict:
+    """Zen 网关会话头：opencode 网关全部分支强制要求（缺则 400 MissingSessionID），
+    其他端点不发（未知网关收到多余头可能 400）。"""
+    try:
+        if base_url and 'opencode' in str(base_url).lower():
+            return {'x-opencode-session': _RESPONSES_SESSION_ID}
+    except Exception:
+        pass
+    return {}
+
+
 class _AnthropicAPIError(Exception):
     """Anthropic messages API 调用错误（携带 HTTP 状态码，供配额/参数识别复用）"""
 
@@ -479,6 +490,7 @@ class APIClient:
             api_key=api_key,
             timeout=timeout,
             http_client=None,
+            default_headers=_zen_session_headers(base_url) or None,
         )
 
     # ---------- 模型轮换 ----------
@@ -1052,6 +1064,7 @@ class APIClient:
             headers['x-api-key'] = api_key
         else:
             headers['Authorization'] = f'Bearer {api_key}'
+        headers.update(_zen_session_headers(base_url))
 
         if self.verbose and should_print_worker():
             wlog(f"{log_prefix()}  [Anthropic] POST {url} model={model} max_tokens={max_tokens} "
@@ -1176,13 +1189,7 @@ class APIClient:
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {api_key}',
         }
-        # Zen 网关会话头：仅 opencode 网关需要，其他 responses 端点不发
-        #（未知网关收到多余头可能 400）。
-        try:
-            if 'opencode' in (base_url or '').lower():
-                headers['x-opencode-session'] = _RESPONSES_SESSION_ID
-        except Exception:
-            pass
+        headers.update(_zen_session_headers(base_url))
 
         if self.verbose and should_print_worker():
             wlog(f"{log_prefix()}  [Responses] POST {url} model={model} max_output_tokens={_out_tokens} "

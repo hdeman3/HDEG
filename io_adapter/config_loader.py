@@ -108,17 +108,43 @@ def _is_empty_value(v) -> bool:
     return False
 
 
+def _preset_host(url: str) -> str:
+    """取 URL 的 host（小写去端口），用于 preset 按地址自动匹配。"""
+    try:
+        from urllib.parse import urlsplit
+        h = (urlsplit(str(url or '')).hostname or '').strip().lower()
+        return h
+    except Exception:
+        return ''
+
+
 def _apply_api_preset(config: dict) -> None:
-    """应用 api.active_preset（就地合并进 config['api']）。无 preset 时无操作。"""
+    """应用服务商预设（就地合并进 config['api']）。
+
+    选择顺序：显式 active_preset 优先；为空时按 base_url 的 host 自动匹配
+    presets 中 base_url 同 host 的条目。因此切服务商只需改 key / model /
+    base_url（+ 协议），preset 自动跟上。都不命中则无操作。
+    """
     try:
         api = config.get('api')
         if not isinstance(api, dict):
             return
+        presets = api.get('presets') or {}
+        if not isinstance(presets, dict):
+            return
         name = str(api.get('active_preset') or '').strip()
         if not name:
+            # 自动匹配：找 base_url 同 host 的 preset
+            _host = _preset_host(api.get('base_url', ''))
+            if _host:
+                for _pn, _pv in presets.items():
+                    if isinstance(_pv, dict) and _preset_host(_pv.get('base_url', '')) == _host:
+                        name = _pn
+                        print(f"[配置] 按地址自动匹配预设: {name}")
+                        break
+        if not name:
             return
-        presets = api.get('presets') or {}
-        if not isinstance(presets, dict) or name not in presets:
+        if name not in presets:
             print(f"[配置] active_preset='{name}' 在 presets 中不存在，忽略")
             return
         preset = presets[name]

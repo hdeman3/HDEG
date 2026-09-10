@@ -208,10 +208,122 @@ def _record_track_run(ctx: PipelineContext, wkey: str, task: dict,
         _write_work_log(ctx, str(wkey))
 
 
+def _batch_id() -> str:
+    """批量任务 ID（后端 spawn 时经环境变量 HDEG_BATCH_ID 传入）。
+
+    有 ID = 批量模式：日志写入 translate_logs/batch_<id>/ 下的嵌套结构，
+    供前端打包下载。无 ID = 单作品模式，保持原单文件行为。
+    """
+    try:
+        import os
+        return re.sub(r'[\\/:*?"<>|\s]+', '_',
+                      str(os.environ.get('HDEG_BATCH_ID') or '')).strip('_')
+    except Exception:
+        return ''
+
+
+def _logs_root(ctx: PipelineContext) -> Path:
+    """日志根目录：批量模式为 translate_logs/batch_<id>/，否则 translate_logs/。"""
+    base = Path(__file__).resolve().parent.parent / 'translate_logs'
+    _bid = _batch_id()
+    return base / f"batch_{_bid}" if _bid else base
+
+
+def _write_track_log_file(ctx: PipelineContext, wkey: str, short: str,
+                          fname: str, entry: dict, log_dir: Path) -> None:
+    """写单轨日志文件：<log_dir>/<作品标识>/<音轨stem>.log（单次 write）。
+
+    内容仅为过程详情（状态/用时/重试/失败原因 + 详细行），不含译文文本。
+    """
+    try:
+        track_dir = log_dir / _sanitize_log_name(short)
+        track_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(fname).stem
+        out = [
+            f"音轨: {fname}  作品: {short}",
+            f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        ]
+        _st = f"状态: {entry.get('status','?')}  用时: {entry.get('elapsed', 0):.1f}s"
+        try:
+            _at = int(entry.get('attempts', 0) or 0)
+        except (TypeError, ValueError):
+            _at = 0
+        if _at > 0:
+            _st += f"  重试: {_at}次"
+        if entry.get('reason'):
+            _st += f"  原因: {entry['reason']}"
+        out.append(_st)
+        out.append("-" * 60)
+        for _r in entry.get('runs', []):
+            try:
+                _ra = int(_r.get('attempts', 0) or 0)
+            except (TypeError, ValueError):
+                _ra = 0
+            _tag = '首轮' if _ra <= 0 else f"第{_ra}次重试"
+            out.append(f"---- {_tag}（{_r.get('status','?')}，{_r.get('elapsed', 0):.1f}s） ----")
+            out.extend(str(_l) for _l in _r.get('lines', []))
+        (track_dir / f"{_sanitize_log_name(stem)}.log").write_text(
+            "\n".join(out) + "\n", encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _write_batch_manifest(ctx: PipelineContext) -> Path | None:
+    """写批量 manifest.json（单次 write）：作品/音轨状态汇总 + 总费用，供前端展示。"""
+    try:
+        if not ctx.config.get('app', {}).get('save_track_logs', True):
+            return None
+    except Exception:
+        pass
+    _bid = _batch_id()
+    if not _bid:
+        return None
+    try:
+        with ctx.thread_lock:
+            _keys = list(ctx.work_expected_counts.keys()) or list(ctx.work_track_runs.keys())
+            _works = {}
+            for _wk in _keys:
+                _runs = ctx.work_track_runs.get(str(_wk), {})
+                _exp = ctx.work_expected_counts.get(str(_wk), 0) or len(_runs)
+                _works[_work_short_id(str(_wk))] = {
+                    'total': _exp,
+                    'ok': sum(1 for e in _runs.values() if e.get('status') == '成功'),
+                    'retrying': sum(1 for e in _runs.values() if e.get('status') == '失败待重试'),
+                    'failed': sum(1 for e in _runs.values() if e.get('status') == '最终失败'),
+                    'skip': sum(1 for e in _runs.values() if e.get('status') == '跳过'),
+                }
+            try:
+                _cost = float(ctx.tracker.total_cost or 0)
+            except Exception:
+                _cost = 0.0
+            try:
+                _elapsed = float(ctx.elapsed)
+            except Exception:
+                _elapsed = 0.0
+        import json as _json
+        _manifest = {
+            'batch_id': _bid,
+            '生成时间': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'works': _works,
+            'translated': int(ctx.stats.get('translated', 0)),
+            'total_cost': round(_cost, 4),
+            'elapsed': round(_elapsed, 1),
+        }
+        _log_dir = _logs_root(ctx)
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _mp = _log_dir / 'manifest.json'
+        _mp.write_text(_json.dumps(_manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+        return _mp
+    except Exception:
+        return None
+
+
 def _write_work_log(ctx: PipelineContext, wkey: str) -> Path | None:
     """写一个作品的日志文件（单次 write，原子不穿插）。
 
-    文件：translate_logs/<作品标识>.log，UTF-8。
+    单作品模式：translate_logs/<作品标识>.log，UTF-8。
+    批量模式（HDEG_BATCH_ID）：translate_logs/batch_<id>/<作品标识>.log，
+    外加 <作品标识>/<音轨>.log 按轨拆分 + manifest.json，供前端打包下载。
     内容：每音轨翻译情况（状态/用时/重试次数/失败原因）+ 各轨详细过程（带 [+秒数]）。
     重试进展会重写本文件，保证最终状态准确。返回路径（禁用时返回 None）。
     """
@@ -232,7 +344,7 @@ def _write_work_log(ctx: PipelineContext, wkey: str) -> Path | None:
         except Exception:
             pass
         short = _work_short_id(wkey)
-        log_dir = Path(__file__).resolve().parent.parent / 'translate_logs'
+        log_dir = _logs_root(ctx)
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{_sanitize_log_name(short)}.log"
         n_ok = sum(1 for e in runs.values() if e.get('status') == '成功')
@@ -266,6 +378,14 @@ def _write_work_log(ctx: PipelineContext, wkey: str) -> Path | None:
             out.append("-" * 60)
         # 单次 write：同一作品文件同一时刻只可能被一个写者重写，不穿插
         log_path.write_text("\n".join(out) + "\n", encoding='utf-8')
+        # 批量模式：同步按轨拆分 + 重写 manifest
+        if _batch_id():
+            try:
+                for _fname, _entry in runs.items():
+                    _write_track_log_file(ctx, wkey, short, _fname, _entry, log_dir)
+            except Exception:
+                pass
+            _write_batch_manifest(ctx)
         with ctx.thread_lock:
             if str(wkey) not in ctx._work_log_announced:
                 ctx._work_log_announced.add(str(wkey))
@@ -3523,6 +3643,14 @@ def run_pipeline(
     _log("  .alias.json          = ASR 误识别参考表")
     _log("  .worldview.json      = 作品世界观")
     _log()
+
+    # 批量模式收尾：最终版 manifest（含全部作品终态，供前端打包下载）
+    try:
+        _mp = _write_batch_manifest(ctx)
+        if _mp is not None:
+            _log(f"  [批量产物] {Path(_mp).parent.name}/manifest.json 已就绪", console=True)
+    except Exception:
+        pass
 
     # 翻译总览报告
     print_summary_report(ctx)

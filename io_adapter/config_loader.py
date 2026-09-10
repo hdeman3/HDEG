@@ -108,22 +108,33 @@ def _is_empty_value(v) -> bool:
     return False
 
 
-def _preset_host(url: str) -> str:
-    """取 URL 的 host（小写去端口），用于 preset 按地址自动匹配。"""
+def _preset_match_model(preset: dict, model: str) -> bool:
+    """preset 是否覆盖该模型：models 键精确命中或为其前缀（大小写不敏感）。
+
+    base_url 是用户的事，preset 里不放地址、不按地址匹配。
+    """
     try:
-        from urllib.parse import urlsplit
-        h = (urlsplit(str(url or '')).hostname or '').strip().lower()
-        return h
+        if not isinstance(preset, dict) or not model:
+            return False
+        _ml = str(model).lower()
+        _models = preset.get('models') or {}
+        if not isinstance(_models, dict):
+            return False
+        for _k in _models.keys():
+            _lk = str(_k).lower()
+            if _lk and (_ml == _lk or _ml.startswith(_lk)):
+                return True
     except Exception:
-        return ''
+        pass
+    return False
 
 
 def _apply_api_preset(config: dict) -> None:
     """应用服务商预设（就地合并进 config['api']）。
 
-    选择顺序：显式 active_preset 优先；为空时按 base_url 的 host 自动匹配
-    presets 中 base_url 同 host 的条目。因此切服务商只需改 key / model /
-    base_url（+ 协议），preset 自动跟上。都不命中则无操作。
+    选择顺序：显式 active_preset 优先；为空时按 model 自动匹配
+    models 覆盖到它的 preset。因此切服务商只需改 key / model /
+    base_url，方言（协议/思考/鉴权/参数）自动跟上。都不命中则无操作。
     """
     try:
         api = config.get('api')
@@ -134,13 +145,13 @@ def _apply_api_preset(config: dict) -> None:
             return
         name = str(api.get('active_preset') or '').strip()
         if not name:
-            # 自动匹配：找 base_url 同 host 的 preset
-            _host = _preset_host(api.get('base_url', ''))
-            if _host:
+            # 自动匹配：找 models 覆盖当前 model 的 preset
+            _model = str(api.get('model') or '')
+            if _model:
                 for _pn, _pv in presets.items():
-                    if isinstance(_pv, dict) and _preset_host(_pv.get('base_url', '')) == _host:
+                    if _preset_match_model(_pv, _model):
                         name = _pn
-                        print(f"[配置] 按地址自动匹配预设: {name}")
+                        print(f"[配置] 按模型自动匹配预设: {name}")
                         break
         if not name:
             return

@@ -3127,6 +3127,11 @@ def run_pipeline(
                         wkey=task.get('wkey') or '',
                     )
                     _elapsed = time.time() - _start
+                    # 先落本次结论，再判定状态：重试成功必须先覆盖首轮的“失败”标记，
+                    # 否则进度会被陈旧标记误判为失败
+                    if success and _attempts > 0:
+                        with ctx.thread_lock:
+                            ctx.retry_results[lrc_path.name] = '重试成功'
                     # 异常翻译（解析失败/截断/调用异常）→ 主线程进度标记为"失败"并提示待重试
                     _abnormal = lrc_path.name in ctx.retry_results and ctx.retry_results[lrc_path.name].startswith('失败')
                     if ctx.parallel_mode:
@@ -3135,9 +3140,6 @@ def run_pipeline(
                         else:
                             ctx.update_work_progress(label, '完成', lrc_path.name, wid, _start, _elapsed)
                     if success:
-                        if _attempts > 0:
-                            with ctx.thread_lock:
-                                ctx.retry_results[lrc_path.name] = '重试成功'
                         _log(f"  ✔ 完成音轨: {label} | {lrc_path.name}（用时 {_elapsed:.1f}s）", console=True)
                         _ok = True
                         _run_status = '成功'

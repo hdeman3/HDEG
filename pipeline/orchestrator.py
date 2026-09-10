@@ -2564,6 +2564,12 @@ def run_pipeline(
     api_cfg = ctx.api_cfg
     gen_params = api_cfg.get('generation_params', {})
     _log("[API 配置]")
+    try:
+        _preset_name = str((api_cfg.get('active_preset') or '')).strip()
+    except Exception:
+        _preset_name = ''
+    if _preset_name:
+        _log(f"  预设: {_preset_name}")
     _log(f"  模型: {api_cfg.get('model', 'N/A')}")
     _fb = api_cfg.get('fallback_models') or []
     if _fb:

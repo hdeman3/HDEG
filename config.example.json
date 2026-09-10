@@ -3,6 +3,7 @@
     "key": "your-api-key-here",
     "base_url": "https://opencode.ai/zen/go/v1",
     "model": "deepseek-v4-flash",
+    "active_preset": "",
     "protocol": "",
     "models": {
       "muse-spark": {"protocol": "responses", "note": "Zen网关仅支持responses",
@@ -21,6 +22,55 @@
       "max_tokens": 262144,
       "max_tokens_cap": 0,
       "reasoning_effort": "high"
+    },
+    "presets": {
+      "deepseek-official": {
+        "note": "已实测(chat/anthropic/responses三协议+思考开关)，直连无需代理也可跑",
+        "verified": true,
+        "key": "",
+        "base_url": "https://api.deepseek.com",
+        "protocol": "",
+        "anthropic_auth": "x-api-key",
+        "models": {
+          "deepseek-chat": {"protocol": "openai", "note": "无思考模型",
+            "json_mode": true,
+            "reasoning": {"style": "off"}},
+          "deepseek-reasoner": {"protocol": "openai", "note": "思考模型",
+            "json_mode": true,
+            "reasoning": {"style": "effort", "values": ["none", "low", "high", "max"],
+              "thinking_switch": true, "strip_sampling_params": true}},
+          "deepseek-v4-flash": {"protocol": "openai", "note": "chat/completions",
+            "json_mode": true,
+            "reasoning": {"style": "effort", "values": ["low", "high", "max"],
+              "thinking_switch": true, "strip_sampling_params": true,
+              "effort_param": {"anthropic": "output_config.effort"}}}
+        },
+        "generation_params": {
+          "temperature": 1,
+          "top_p": 0.9,
+          "max_tokens": 196608,
+          "max_tokens_cap": 0,
+          "reasoning_effort": "low"
+        }
+      },
+      "muse-zen": {
+        "note": "已实测(翻译11/11+台本+世界观)，走系统代理",
+        "verified": true,
+        "key": "",
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "protocol": "",
+        "models": {
+          "muse-spark": {"protocol": "responses", "note": "Zen网关仅支持responses",
+            "reasoning": {"style": "effort", "param": "reasoning.effort", "values": ["low", "high"]}}
+        },
+        "generation_params": {
+          "temperature": 1,
+          "top_p": 0.9,
+          "max_tokens": 196608,
+          "max_tokens_cap": 0,
+          "reasoning_effort": "high"
+        }
+      }
     }
   },
   "transcription": {

@@ -88,7 +88,55 @@ def load_config(path: Path = None) -> dict[str, Any]:
                 if k not in config[section]:
                     config[section][k] = v
 
+    # 服务商预设合并：api.active_preset 指向 api.presets 中的一组经验证配置
+    # （协议/思考/鉴权/代理等），用户只需改 key / model / base_url 三项。
+    # 规则：显式非空值优先（用户写的赢），空值/缺失由 preset 补齐；
+    # 字典型字段（models/generation_params）按 key 合并，用户同名 key 覆盖。
+    _apply_api_preset(config)
+
     return config
+
+
+def _is_empty_value(v) -> bool:
+    """空值判定：None/空字符串/空列表/空字典视为未填写，由 preset 补齐。"""
+    if v is None:
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    if isinstance(v, (list, dict)) and len(v) == 0:
+        return True
+    return False
+
+
+def _apply_api_preset(config: dict) -> None:
+    """应用 api.active_preset（就地合并进 config['api']）。无 preset 时无操作。"""
+    try:
+        api = config.get('api')
+        if not isinstance(api, dict):
+            return
+        name = str(api.get('active_preset') or '').strip()
+        if not name:
+            return
+        presets = api.get('presets') or {}
+        if not isinstance(presets, dict) or name not in presets:
+            print(f"[配置] active_preset='{name}' 在 presets 中不存在，忽略")
+            return
+        preset = presets[name]
+        if not isinstance(preset, dict):
+            return
+        for k, v in preset.items():
+            if k in ('presets', 'active_preset'):
+                continue
+            cur = api.get(k)
+            if isinstance(v, dict) and isinstance(cur, dict):
+                for sk, sv in v.items():
+                    if sk not in cur or _is_empty_value(cur[sk]):
+                        cur[sk] = sv
+            elif _is_empty_value(cur):
+                api[k] = v
+        print(f"[配置] 已应用服务商预设: {name}")
+    except Exception as e:
+        print(f"[配置] preset 合并失败（沿用原配置）: {e}")
 
 
 def save_config(config: dict, path: Path = None) -> None:

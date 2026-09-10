@@ -1072,14 +1072,24 @@ class APIClient:
         usage = data.get('usage') or {}
         input_tokens = usage.get('input_tokens', 0)
         output_tokens = usage.get('output_tokens', 0)
-        # cache 统计（Anthropic cache_read_input_tokens / cache_creation_input_tokens）
-        cache_read = usage.get('cache_read_input_tokens', 0)
-        cache_write = usage.get('cache_creation_input_tokens', 0)
+        # cache 统计（Anthropic cache_read_input_tokens / cache_creation_input_tokens）。
+        # 注意 Anthropic 口径与 OpenAI 不同：input_tokens 仅指未缓存部分，
+        # 总输入 = input + read + write。旧代码按 OpenAI 口径相减，
+        # 缓存命中大时算出负数 miss（如实测 miss=-90），污染费用统计。
+        cache_read = usage.get('cache_read_input_tokens', 0) or 0
+        cache_write = usage.get('cache_creation_input_tokens', 0) or 0
+        try:
+            cache_read = max(0, int(cache_read))
+            cache_write = max(0, int(cache_write))
+            input_tokens = max(0, int(input_tokens or 0))
+        except (TypeError, ValueError):
+            cache_read, cache_write = 0, 0
         hit = cache_read
-        miss = input_tokens - cache_read - cache_write
+        prompt_total = input_tokens + cache_read + cache_write
+        miss = max(0, prompt_total - hit)
         stop_reason = data.get('stop_reason') or 'end_turn'
 
-        return _CompatResponse(text, input_tokens, hit, miss, output_tokens, finish_reason=stop_reason)
+        return _CompatResponse(text, prompt_total, hit, miss, output_tokens, finish_reason=stop_reason)
 
     # ---------- OpenAI Responses 协议 ----------
 
@@ -1165,8 +1175,14 @@ class APIClient:
         headers = {
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {api_key}',
-            'x-opencode-session': _RESPONSES_SESSION_ID,
         }
+        # Zen 网关会话头：仅 opencode 网关需要，其他 responses 端点不发
+        #（未知网关收到多余头可能 400）。
+        try:
+            if 'opencode' in (base_url or '').lower():
+                headers['x-opencode-session'] = _RESPONSES_SESSION_ID
+        except Exception:
+            pass
 
         if self.verbose and should_print_worker():
             wlog(f"{log_prefix()}  [Responses] POST {url} model={model} max_output_tokens={_out_tokens} "

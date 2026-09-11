@@ -164,12 +164,12 @@ def _apply_api_preset(config: dict) -> None:
         for k, v in preset.items():
             if k in ('presets', 'active_preset'):
                 continue
-            cur = api.get(k)
-            if isinstance(v, dict) and isinstance(cur, dict):
+            if isinstance(v, dict) and isinstance(api.get(k), dict):
+                cur = api.get(k)
                 for sk, sv in v.items():
                     if sk not in cur or _is_empty_value(cur[sk]):
                         cur[sk] = sv
-            elif _is_empty_value(cur):
+            elif _is_empty_value(api.get(k)):
                 api[k] = v
         print(f"[配置] 已应用服务商预设: {name}")
     except Exception as e:

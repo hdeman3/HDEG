@@ -136,8 +136,10 @@ _ALLOWED_GEN_PARAMS = (
 # 修复旧 bug：translate_engine 传 reasoning_effort=None 想去掉思考，
 # 旧代码把 None 当未指定又从 config 继承回来，重试参数完全没变。
 _UNSET = object()
-# 部分 OpenAI 兼容服务不接受的扩展参数（被拒后自动剔除重试）
-_OPTIONAL_PARAMS = ('reasoning_effort', 'top_k')
+# 部分 OpenAI 兼容服务不接受的扩展参数（被拒后自动剔除重试）。
+# response_format 也放进来：换到不支持 json_object 的网关时自动降级为纯文本 JSON，
+# 由上层 _extract_json_array 兜底解析，避免硬失败。
+_OPTIONAL_PARAMS = ('reasoning_effort', 'top_k', 'response_format')
 
 # 每个进程生成一次 session ID，所有请求共用（kikoeru 每次翻译启动一个 Python 进程）
 _RESPONSES_SESSION_ID = f'hdeg-{__import__("os").getpid():x}-{int(__import__("time").time()) & 0xFFFF:04x}'
@@ -152,6 +154,25 @@ def _zen_session_headers(base_url: str) -> dict:
     except Exception:
         pass
     return {}
+
+
+def _set_dotted(target: dict, path: str, value) -> None:
+    """按点分路径写入嵌套字典（openai 协议 extra_body 用）。
+
+    例：_set_dotted(d, "reasoning.effort", "low") → {"reasoning": {"effort": "low"}}
+    中间层已存在但非 dict 时覆盖为 dict，保证路径可写。
+    """
+    parts = [p for p in str(path or '').split('.') if p]
+    if not parts:
+        return
+    cur = target
+    for p in parts[:-1]:
+        nxt = cur.get(p)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[p] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
 
 
 class _AnthropicAPIError(Exception):
@@ -228,6 +249,90 @@ def _normalize_registry_entry(entry) -> tuple[str | None, dict]:
     return None, {}
 
 
+def _deep_merge_variant(base: dict, over: dict) -> dict:
+    """递归覆盖：over 中的 dict 递归合并，null 表示删除该键，其余直接覆盖。"""
+    _out = dict(base or {})
+    for _k, _v in (over or {}).items():
+        if _v is None:
+            _out.pop(_k, None)
+        elif isinstance(_v, dict) and isinstance(_out.get(_k), dict):
+            _out[_k] = _deep_merge_variant(_out[_k], _v)
+        else:
+            _out[_k] = _v
+    return _out
+
+
+# 未识别网关回退到"干净 openai"时，要从 reasoning 块里剔掉的厂商私有键
+_REASONING_VENDOR_KEYS = (
+    'param', 'budget_param', 'enable', 'disable',
+    'thinking_switch', 'always_on', 'effort_param', 'opencode',
+)
+
+
+def _generic_openai_entry(entry: dict) -> dict:
+    """把厂商条目降级为通用 openai：协议强制 openai，去掉厂商私有思考方言。
+
+    保留 style/values/default_effort/strip_sampling_params/drop_sampling_params
+    等标准或安全键（reasoning_effort 是 OpenAI 标准字段）。
+    """
+    _out = dict(entry or {})
+    _out['protocol'] = 'openai'
+    _r = _out.get('reasoning')
+    if isinstance(_r, dict):
+        _r = {k: v for k, v in _r.items() if k not in _REASONING_VENDOR_KEYS}
+        if str(_r.get('style', '')).strip().lower() == 'budget':
+            # 无 budget_param 就发不出预算，退回标准顶层 effort
+            _r['style'] = 'effort'
+        _out['reasoning'] = _r
+    return _out
+
+
+def _apply_entry_variant(entry: dict, api_cfg: dict) -> dict:
+    """按 base_url 选择注册表条目的方言变体（不改原配置对象）。
+
+    条目可声明：
+    - `hosts`: 该厂商官方域名列表（子串匹配）。用于判断 base_url 是否"认识"。
+    - `opencode`: base_url 含 "opencode" 时的覆盖块（protocol/json_mode/reasoning
+      均可换，null=删键）。
+
+    三种情形：
+    1. base_url 含 "opencode" → 用 `opencode` 覆盖（Zen 行为）；
+    2. base_url 命中 `hosts` → 保持基础（=官方厂商）方言；
+    3. 声明了 `hosts` 但都不命中（未知网关）→ 降级为干净 openai
+       （避免往未知网关发 thinking/enable/disable 等私有参数）。
+
+    返回: 合并后的新条目 dict（已移除 'opencode'/'hosts' 标记键）。
+    """
+    _e = dict(entry or {})
+    try:
+        _bl = str((api_cfg or {}).get('base_url') or '').lower()
+        _is_open = 'opencode' in _bl
+        _hosts = _e.get('hosts') if isinstance(_e.get('hosts'), list) else None
+        _is_official = bool(_hosts) and any(
+            str(h).lower() in _bl for h in _hosts if h)
+        _orig_reason = entry.get('reasoning') if isinstance(entry, dict) else None
+        # 条目级 opencode 变体（可换 protocol/json_mode/reasoning 等）
+        _over = _e.pop('opencode', None)
+        if isinstance(_over, dict) and _is_open:
+            _e = _deep_merge_variant(_e, _over)
+        # 兼容：reasoning.opencode（仅覆盖思考方言）
+        _reason = _e.get('reasoning')
+        if isinstance(_reason, dict) and isinstance(_orig_reason, dict) \
+                and 'opencode' in _orig_reason:
+            _clean = {k: v for k, v in _reason.items() if k != 'opencode'}
+            _rover = _orig_reason.get('opencode')
+            if isinstance(_rover, dict) and _is_open:
+                _clean = _deep_merge_variant(_clean, _rover)
+            _e['reasoning'] = _clean
+        # 未识别网关 → 干净 openai（仅对声明了 hosts 的厂商条目生效）
+        if not _is_open and _hosts and not _is_official:
+            _e = _generic_openai_entry(_e)
+        _e.pop('hosts', None)
+    except Exception:
+        return dict(entry or {})
+    return _e
+
+
 def model_entry(model_name: str, api_cfg: dict) -> tuple[dict, str]:
     """取注册表整条目：精确名 → 最长前缀（大小写不敏感）。
 
@@ -260,6 +365,12 @@ def model_entry(model_name: str, api_cfg: dict) -> tuple[dict, str]:
     return {}, ''
 
 
+def model_entry_merged(model_name: str, api_cfg: dict) -> tuple[dict, str]:
+    """取注册表条目并按 base_url 应用 opencode 变体（供协议/参数读取共用）。"""
+    _entry, _key = model_entry(model_name, api_cfg)
+    return _apply_entry_variant(_entry, api_cfg), _key
+
+
 def resolve_model_protocol(model_name: str, api_cfg: dict) -> tuple[str, str, dict]:
     """按模型注册表判定协议（加新模型只改配置，不改代码）。
 
@@ -269,16 +380,16 @@ def resolve_model_protocol(model_name: str, api_cfg: dict) -> tuple[str, str, di
     3. 全局默认：api.protocol（整个网关一种协议时配这里）
     4. 嗅探兜底：含 claude → anthropic，含 muse-spark → responses，其余 openai
 
-    reasoning 预留块（style/param/values）随 extra 原样返回，供阶段二适配器使用，
-    本阶段仅做协议判定。
+    条目可声明顶层 `opencode` 子块：base_url 含 "opencode" 时递归覆盖
+    protocol/json_mode/reasoning（Zen 走 Zen 行为，其他网关走官方行为）。
 
     返回: (protocol, 来源说明, extra)
     """
     api_cfg = api_cfg or {}
     _model = str(model_name or '')
     _ml = _model.lower()
-    # 1) 精确名 / 2) 最长前缀（共用 model_entry）
-    _entry, _key = model_entry(_model, api_cfg)
+    # 1) 精确名 / 2) 最长前缀（共用 model_entry，先应用 base_url 变体）
+    _entry, _key = model_entry_merged(_model, api_cfg)
     if _entry or _key:
         _p, _ex = _normalize_registry_entry(_entry)
         if _p:
@@ -312,10 +423,13 @@ def is_thinking_active(api_cfg: dict) -> bool:
     """
     try:
         _eff = ((api_cfg or {}).get('generation_params') or {}).get('reasoning_effort')
+        _spec = model_reasoning_spec((api_cfg or {}).get('model', ''), api_cfg)
+        if not _eff:
+            # 未指定时用注册表默认档位判断（与 apply_reasoning_spec 一致）
+            _eff = _spec.get('default_effort')
         if not _eff or str(_eff).strip().lower() in ('none', 'off', '0', 'false'):
             return False
-        _style = str(model_reasoning_spec(
-            (api_cfg or {}).get('model', ''), api_cfg).get('style') or 'effort').lower()
+        _style = str(_spec.get('style') or 'effort').lower()
         return _style in ('effort', 'budget')
     except Exception:
         return False
@@ -350,6 +464,11 @@ def apply_reasoning_spec(gen_params: dict, model_name: str, api_cfg: dict) -> di
     返回: 新字典（不改输入）。
     """
     _out = dict(gen_params or {})
+    # 显式强制不发（chat 传入的哨兵）优先于注册表默认档位
+    _force_off = bool(_out.pop('_no_reasoning_effort', False))
+    if _force_off:
+        # 转成开关哨兵：让"只有 thinking 开关、没有 effort"的模型也能关闭思考
+        _out['_thinking_off'] = True
     try:
         _spec = (resolve_model_protocol(model_name, api_cfg or {})[2] or {}).get('reasoning') or {}
     except Exception:
@@ -361,6 +480,13 @@ def apply_reasoning_spec(gen_params: dict, model_name: str, api_cfg: dict) -> di
         _out.pop('reasoning_effort', None)
         _out.pop('reasoning_budget', None)
         return _out
+    # 模型自带默认档位（reasoning.default_effort）：调用方未指定时兜底，
+    # 实现"用户只换 model，思考强度自动定档"。
+    if not _force_off and not _out.get('reasoning_effort') and _spec.get('default_effort'):
+        _out['reasoning_effort'] = str(_spec['default_effort'])
+    if not _out.get('reasoning_effort'):
+        # 空字符串/None 一律视为未指定，避免把 "" 发到接口被拒
+        _out.pop('reasoning_effort', None)
     if _style == 'budget':
         _eff = _out.get('reasoning_effort')
         _tokens = _spec.get('budget_tokens')
@@ -616,6 +742,7 @@ class APIClient:
                 max_tokens=16,
                 max_retries=0,  # 每模型只试一次（chat 内 max(0,1)=1 次尝试）
                 json_mode=False,  # ping 无 JSON 指示，强制关（官方要求含 json 字样）
+                reasoning_effort=None,  # 预检不烧思考 token，也不触发注册表默认档位
             )
             _el = _time_mod.monotonic() - _t0
             try:
@@ -721,8 +848,12 @@ class APIClient:
         for k in ('temperature', 'top_p'):
             if k not in gen_params and k in cfg_gen:
                 gen_params[k] = cfg_gen[k]
-        if reasoning_effort is _UNSET and 'reasoning_effort' in cfg_gen:
+        if reasoning_effort is _UNSET and cfg_gen.get('reasoning_effort'):
+            # 空字符串视为未指定，交由注册表 default_effort 定档
             gen_params['reasoning_effort'] = cfg_gen['reasoning_effort']
+        if reasoning_effort is None:
+            # 显式强制不发：打哨兵，阻止注册表 default_effort 兜底
+            gen_params['_no_reasoning_effort'] = True
         # 输出上限封顶：仅注册表 models[xxx].max_output_tokens（厂商上限，
         # 0/缺省=不限）。全局 max_tokens 保持大窗口，只在真超限时钳制。
         _requested_max = max_tokens
@@ -775,7 +906,7 @@ class APIClient:
                 # 逐模型输出上限（注册表 max_output_tokens；不设则用请求值）
                 max_tokens = _requested_max
                 try:
-                    _reg_cap = int((model_entry(
+                    _reg_cap = int((model_entry_merged(
                         _current_model, self.config)[0] or {}).get(
                             'max_output_tokens', 0) or 0)
                 except (TypeError, ValueError):
@@ -825,7 +956,7 @@ class APIClient:
                         _jm = json_mode
                         if _jm is None:
                             try:
-                                _jm = bool((model_entry(
+                                _jm = bool((model_entry_merged(
                                     _current_model, self.config)[0] or {}).get('json_mode'))
                             except Exception:
                                 _jm = False
@@ -837,32 +968,74 @@ class APIClient:
                             for _k in _OPTIONAL_PARAMS:
                                 _filtered.pop(_k, None)
 
-                        # 思考开关 extra_body：注册表 thinking_switch=true 的模型（如 deepseek）
-                        # 或 DeepSeek 原生接口（旧行为保留）都发；effort=none 表示关闭。
+                        # ---- 思考强度方言适配（openai 协议）----
+                        # 各厂商对思考强度的字段位置/开关方式不同，全部由注册表
+                        # reasoning 块声明，代码不写死厂商：
+                        #   param        effort 落位路径（默认顶层 reasoning_effort；
+                        #                如 "reasoning.effort" = OpenRouter 方言）
+                        #   budget_param budget 落位路径（style=budget，如 "thinking_budget"）
+                        #   enable/disable 开关 extra_body 片段（如 {"enable_thinking": true}）
+                        #   always_on    thinking-only 模型，禁止发送关闭片段
+                        #   thinking_switch / strip_sampling_params 沿用旧语义
                         # 曾被拒进入 stripped 重试时不再附带（避免同一参数反复被拒）。
+                        _spec = model_reasoning_spec(_current_model, self.config)
+                        _eff = _req_params.get('reasoning_effort')
+                        _budget = _req_params.get('reasoning_budget')
+                        _off = ((_eff is not None and str(_eff).lower() in (
+                            'none', 'off', 'false', '0', 'disabled'))
+                            or bool(_req_params.get('_thinking_off')))
+                        _param = str(_spec.get('param') or 'reasoning_effort').strip() or 'reasoning_effort'
+                        _budget_param = str(_spec.get('budget_param') or '').strip()
+                        _enable_frag = _spec.get('enable') if isinstance(_spec.get('enable'), dict) else None
+                        _disable_frag = _spec.get('disable') if isinstance(_spec.get('disable'), dict) else None
+                        _switch = (self._is_deepseek or model_thinking_switch(
+                            _current_model, self.config))
                         _extra = {}
-                        if (not _stripped_optional
-                                and (self._is_deepseek or model_thinking_switch(
-                                    _current_model, self.config))
-                                and 'reasoning_effort' in _filtered):
-                            if str(_filtered['reasoning_effort']).lower() == 'none':
-                                _extra = {'thinking': {'type': 'disabled'}}
+                        _thinking_on = False
+                        if not _stripped_optional:
+                            # 1) effort / budget 按注册表路径落位
+                            if _eff is not None and _param != 'reasoning_effort':
                                 _filtered.pop('reasoning_effort', None)
-                            else:
-                                _extra = {'thinking': {'type': 'enabled'}}
+                                if not _off:
+                                    _set_dotted(_extra, _param, _eff)
+                            if _budget is not None and _budget_param:
+                                _set_dotted(_extra, _budget_param, _budget)
+                            # 2) 思考开关
+                            if _spec.get('always_on') is True:
+                                # thinking-only 模型：无法关闭；关闭请求时只省略 effort
+                                _thinking_on = True
+                                if _off:
+                                    _filtered.pop('reasoning_effort', None)
+                            elif _off:
+                                # 关闭：优先注册表 disable 片段；否则旧默认 thinking.disabled
+                                if _disable_frag:
+                                    _extra.update(_disable_frag)
+                                    _filtered.pop('reasoning_effort', None)
+                                elif _switch:
+                                    _extra.update({'thinking': {'type': 'disabled'}})
+                                    _filtered.pop('reasoning_effort', None)
+                                _thinking_on = False
+                            elif _eff is not None or _budget is not None:
+                                # 开启：注册表 enable 片段；否则旧默认 thinking.enabled
+                                if _switch:
+                                    _extra.update(_enable_frag or {'thinking': {'type': 'enabled'}})
+                                _thinking_on = True
                         # 官方文档：思考模式下 temperature/top_p/presence_penalty/
                         # frequency_penalty 不生效（设置不报错）。thinking 开启且注册表
                         # strip_sampling_params=true 的模型，直接剔除，免得误导。
-                        if (_extra.get('thinking', {}).get('type') == 'enabled'
-                                and model_reasoning_spec(
-                                    _current_model, self.config).get(
-                                        'strip_sampling_params') is True):
+                        if _thinking_on and _spec.get('strip_sampling_params') is True:
                             _dropped = [_k for _k in (
                                 'temperature', 'top_p', 'presence_penalty',
                                 'frequency_penalty') if _filtered.pop(_k, None) is not None]
                             if _dropped and self.verbose:
                                 wlog(f"  [API] 思考模式开启，采样参数不生效，已剔除: "
                                      f"{','.join(_dropped)}")
+                        # 注册表 drop_sampling_params=true：该模型完全不接受采样参数
+                        # （如 GPT-5 系列），无论思考开关都剔除，避免 400。
+                        if _spec.get('drop_sampling_params') is True:
+                            for _k in ('temperature', 'top_p',
+                                       'presence_penalty', 'frequency_penalty'):
+                                _filtered.pop(_k, None)
                         response = self._client.chat.completions.create(
                             model=_current_model,
                             messages=messages,
@@ -1168,6 +1341,10 @@ class APIClient:
             if _dropped_r and self.verbose:
                 wlog(f"  [API] 思考模式开启，采样参数不生效，已剔除: "
                      f"{','.join(_dropped_r)}")
+        # 注册表 drop_sampling_params=true：该模型完全不接受采样参数（如 GPT-5 系列）
+        if model_reasoning_spec(model, self.config).get('drop_sampling_params') is True:
+            for _k in ('temperature', 'top_p'):
+                body.pop(_k, None)
         url = f'{base_url}/responses'
         headers = {
             'Content-Type': 'application/json',

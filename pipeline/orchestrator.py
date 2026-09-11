@@ -461,6 +461,72 @@ def _debug(msg: str):
         _log(f"    [DEBUG] {msg}")
 
 
+def _print_banner():
+    """开头 Logo + 开源地址（固定布局，注意保持等宽）"""
+    _log("")
+    _log("  _    _    _____    ______    _____")
+    _log(" | |  | |  |  __ \\  |  ____|  / ____|")
+    _log(" | |__| |  | |  | | | |__    | |  __")
+    _log(" |  __  |  | |  | | |  __|   | | |_ |")
+    _log(" | |  | |  | |__| | | |____  | |__| |")
+    _log(" |_|  |_|  |_____/  |______|  \\_____|    dev by hdeman")
+    _log("")
+    _log("  开源地址: https://github.com/eeesen/HDEG")
+    _log("")
+
+
+def _print_api_config(ctx: PipelineContext):
+    """打印翻译模型相关配置（在转录完成后、翻译前调用）"""
+    api_cfg = ctx.api_cfg
+    gen_params = api_cfg.get('generation_params', {})
+    _sep("翻译模型配置")
+    _log("[API 配置]")
+    try:
+        _preset_name = str((api_cfg.get('active_preset') or '')).strip()
+    except Exception:
+        _preset_name = ''
+    if _preset_name:
+        _log(f"  预设: {_preset_name}")
+    _log(f"  模型: {api_cfg.get('model', 'N/A')}")
+    _fb = api_cfg.get('fallback_models') or []
+    if _fb:
+        _log(f"  备用模型链: {' → '.join([api_cfg.get('model', '')] + list(_fb))}（配额耗尽时自动轮换）")
+    _log(f"  Base URL: {api_cfg.get('base_url', 'N/A')}")
+    try:
+        from engines.api_client import APIClient as _APIClient_Info
+        _info_api = _APIClient_Info(dict(api_cfg))
+        _log(f"  协议: {_info_api.protocol_name} ({_info_api.protocol_endpoint})"
+             f"  ← {_APIClient_Info.protocol_source(api_cfg, api_cfg.get('model', ''))}")
+        _proxy_on, _proxy_detail = _APIClient_Info.detect_proxy(
+            api_cfg, ctx.config.get('network', {}))
+        _log(f"  代理: {_proxy_detail}")
+        try:
+            _re_cfg = gen_params.get('reasoning_effort', '未配置')
+            _re_spec = (_info_api._model_spec or {}).get('reasoning') or {}
+            _re_style = str(_re_spec.get('style') or 'effort')
+            _re_vals = _re_spec.get('values') or []
+            _re_vals_s = f"档位{_re_vals}" if _re_vals else ""
+            _re_think = "＋thinking开关" if _re_spec.get('thinking_switch') is True else ""
+            if _re_style == 'off':
+                _log(f"  思考强度: {_re_cfg}（本模型 style=off，请求中不发送）")
+            elif _re_style == 'budget':
+                _log(f"  思考强度: {_re_cfg}（style=budget，按 budgets 换算 token 发送）")
+            else:
+                _log(f"  思考强度: {_re_cfg}（style=effort{_re_vals_s}{_re_think}，随请求发送）")
+        except Exception:
+            pass
+    except Exception as _pie:
+        _log(f"  协议/代理探测失败: {_pie}")
+    _log(f"  Timeout: {api_cfg.get('timeout', 'N/A')}s")
+    _log(f"  temperature: {gen_params.get('temperature', 'N/A')}")
+    _log(f"  top_p: {gen_params.get('top_p', 'N/A')}")
+    _log(f"  max_tokens: {gen_params.get('max_tokens', 'N/A')}")
+    _log(f"  reasoning_effort: {gen_params.get('reasoning_effort', 'N/A')}  (思考强度)")
+    _polish_on = bool(ctx.config.get('app', {}).get('polish_after_translate', False))
+    _log(f"  翻译后润色(Post-editing): {'开' if _polish_on else '关'}")
+    _log()
+
+
 # ==================== 管道上下文 ====================
 
 class PipelineContext:
@@ -783,10 +849,6 @@ def _llm_identify_scriptbook_files(
 【非台本文件典型特征】
 - readme / 説明 / 注意事項 / 必ず読んで 等说明文档
 - クレジット / credit / cast / 声優 等演职员信息
-- 特典 / bonus / おまけ 等赠品说明
-- フィニッシュタイム / 射精メモ / 射精箇所 等特殊标注
-- あとがき / 感想 / 紹介 等后记感想
-- キャスト / 購入特典 等非台本内容
 
 【txt 优先规则】（重要，必须遵守）
 - 若同一台本同时存在 .txt 和 .pdf 两个版本（同名或内容相同），scriptbook_indices **只选择 .txt 版本**，忽略 .pdf
@@ -842,7 +904,7 @@ def _llm_identify_scriptbook_files(
         _log(f"  [台本·LLM] 发送 {len(candidates)} 个备选文件给 LLM 识别 (model={api_cfg.get('model', 'N/A')})")
 
         # 统一走 APIClient：模型轮换 / 重试 / 参数剔除全部内聚，此处无需关心
-        _api = APIClient(api_cfg, verbose=ctx.pr.debug)
+        _api = APIClient(api_cfg, verbose=ctx.pr.debug_enabled)
         # max_tokens 从 config 的 generation_params.max_tokens 读取（muse 等模型思考消耗大，
         # 硬编码小值会导致输出被思考耗尽截断为空）；未配置时兜底 16384。
         _id_max_tokens = int((api_cfg.get('generation_params') or {}).get('max_tokens', 0) or 0)
@@ -1467,7 +1529,7 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
         from engines.scriptbook_cleaner import ScriptbookSplitter, split_scriptbook_regex
         api_config = ctx.api_cfg
         try:
-            splitter = ScriptbookSplitter(api_config, verbose=ctx.pr.debug)
+            splitter = ScriptbookSplitter(api_config, verbose=ctx.pr.debug_enabled)
             track_map, sb_token_stats = splitter.split_and_clean_all_in_one(
                 track_names, raw_text, track_samples=track_samples)
             # 统一 token 追踪：记录台本 Flash 分割调用
@@ -1753,8 +1815,8 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
                 if api_config.get('key') or api_config.get('api_key'):
                     try:
                         from engines.translate_engine import OpenAICompatEngine
-                        engine = OpenAICompatEngine(api_config, verbose=ctx.pr.debug, pricing=ctx.pricing)
-                        worldview, wv_token_stats = analyze_worldview_with_llm(engine, samples, verbose=ctx.pr.debug)
+                        engine = OpenAICompatEngine(api_config, verbose=ctx.pr.debug_enabled, pricing=ctx.pricing)
+                        worldview, wv_token_stats = analyze_worldview_with_llm(engine, samples, verbose=ctx.pr.debug_enabled)
                         # 统一 token 追踪：记录世界观分析 LLM 调用
                         if wv_token_stats:
                             _wv_cost = ctx.tracker.compute_cost(
@@ -2014,7 +2076,7 @@ def translate_one_lrc(
             scriptbook_aligned = {_nonempty[k]: v for k, v in _aligned.items()}
             _log(f"  [台本·对齐] {len(scriptbook_aligned)}/{len(_nonempty)} 行已对齐到台本区间")
             _preview_i = _nonempty[0] if _nonempty else 0
-            if scriptbook_aligned and ctx.pr.debug:
+            if scriptbook_aligned and ctx.pr.debug_enabled:
                 _log(f"  [台本·对齐] 示例 行{_preview_i}: sb={scriptbook_aligned[_preview_i]['sb'][:40]} "
                      f"conf={scriptbook_aligned[_preview_i]['conf']}")
         except Exception as _e:
@@ -2198,7 +2260,7 @@ def translate_one_lrc(
         _log(f"    有效行: {len(non_empty)}/{len(translated_texts)}")
     if not non_empty:
         _log(f"  WARN: 所有行为空！首3行原文: {[t[:40] for t in texts[:3]]}")
-    elif ctx.pr.debug:
+    elif ctx.pr.debug_enabled:
         for i, t in enumerate(non_empty[:3]):
             _log(f"      [{i+1}] {t[:80]}")
     # token 统计：分块时累加所有块的 token；整文件时用单块 result
@@ -2673,63 +2735,17 @@ def run_pipeline(
     with _preprocess_id_lock:
         _preprocess_id_counter[0] = 0
 
-    # 打印启动信息
+    # 打印启动信息（Logo + 基本信息）
+    _print_banner()
     _sep("字幕翻译管道启动")
     _log(f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     _log(f"工作目录: {root_abs}")
     _log(f"配置文件: {(config_path.absolute() if config_path else Path('config.json').absolute())}")
     _log()
 
-    # API 信息
     api_cfg = ctx.api_cfg
-    gen_params = api_cfg.get('generation_params', {})
-    _log("[API 配置]")
-    try:
-        _preset_name = str((api_cfg.get('active_preset') or '')).strip()
-    except Exception:
-        _preset_name = ''
-    if _preset_name:
-        _log(f"  预设: {_preset_name}")
-    _log(f"  模型: {api_cfg.get('model', 'N/A')}")
-    _fb = api_cfg.get('fallback_models') or []
-    if _fb:
-        _log(f"  备用模型链: {' → '.join([api_cfg.get('model', '')] + list(_fb))}（配额耗尽时自动轮换）")
-    _log(f"  Base URL: {api_cfg.get('base_url', 'N/A')}")
-    try:
-        from engines.api_client import APIClient as _APIClient_Info
-        _info_api = _APIClient_Info(dict(api_cfg))  # 轻量实例，仅做协议判定，无网络调用
-        _log(f"  协议: {_info_api.protocol_name} ({_info_api.protocol_endpoint})"
-             f"  ← {_APIClient_Info.protocol_source(api_cfg, api_cfg.get('model', ''))}")
-        _proxy_on, _proxy_detail = _APIClient_Info.detect_proxy(
-            api_cfg, ctx.config.get('network', {}))
-        _log(f"  代理: {_proxy_detail}")
-        try:
-            _re_cfg = gen_params.get('reasoning_effort', '未配置')
-            _re_spec = (_info_api._model_spec or {}).get('reasoning') or {}
-            _re_style = str(_re_spec.get('style') or 'effort')
-            _re_vals = _re_spec.get('values') or []
-            _re_vals_s = f"档位{_re_vals}" if _re_vals else ""
-            _re_think = "＋thinking开关" if _re_spec.get('thinking_switch') is True else ""
-            if _re_style == 'off':
-                _log(f"  思考强度: {_re_cfg}（本模型 style=off，请求中不发送）")
-            elif _re_style == 'budget':
-                _log(f"  思考强度: {_re_cfg}（style=budget，按 budgets 换算 token 发送）")
-            else:
-                _log(f"  思考强度: {_re_cfg}（style=effort{_re_vals_s}{_re_think}，随请求发送）")
-        except Exception:
-            pass
-    except Exception as _pie:
-        _log(f"  协议/代理探测失败: {_pie}")
-    _log(f"  Timeout: {api_cfg.get('timeout', 'N/A')}s")
-    _log(f"  temperature: {gen_params.get('temperature', 'N/A')}")
-    _log(f"  top_p: {gen_params.get('top_p', 'N/A')}")
-    _log(f"  max_tokens: {gen_params.get('max_tokens', 'N/A')}")
-    _log(f"  reasoning_effort: {gen_params.get('reasoning_effort', 'N/A')}  (思考强度)")
-    _polish_on = bool(ctx.config.get('app', {}).get('polish_after_translate', False))
-    _log(f"  翻译后润色(Post-editing): {'开' if _polish_on else '关'}")
-    _log()
 
-    # 峰谷调度预期提示
+    # 峰谷调度预期提示（仅提示，不阻塞）
     if ctx.delay_translate_to_offpeak:
         from utils.time_price import is_peak_time
         if is_peak_time():
@@ -2745,7 +2761,7 @@ def run_pipeline(
     # ──── 检查 API Key ────
     api_key = api_cfg.get('key') or api_cfg.get('api_key', '')
     if not api_key:
-        _log("⚠ API Key 为空，仅执行本地模型（转录/翻译），跳过 LLM 翻译")
+        _log("⚠ API Key 为空，仅执行本地模型（转录），跳过 LLM 翻译")
         _log()
 
         # 仅运行转录（infer.exe），然后直接返回
@@ -2761,13 +2777,14 @@ def run_pipeline(
                 _log(f"  {ext}: {count} 个")
         return ctx.stats
 
-    # ──── API 可用性预检：翻译开始前发一个极小请求，正常才继续 ────
-    if ctx.config.get('app', {}).get('api_preflight', True):
-        _preflight_api_check(ctx)
-
     # ──── 第 0 步: 语音转录（infer.exe）──
     _run_transcription_if_needed(root, ctx)
     _log()
+
+    # ──── 翻译模型配置 + API 可用性预检（转录完成后、翻译前）──
+    _print_api_config(ctx)
+    if ctx.config.get('app', {}).get('api_preflight', True):
+        _preflight_api_check(ctx)
 
     # ──── 第 0.5 步: 峰谷调度（转录完成后延迟翻译到空闲时段）──
     _wait_for_offpeak_if_needed(ctx)

@@ -8,24 +8,89 @@
     "models": {
       "muse-spark": {"protocol": "responses", "note": "Zen网关仅支持responses",
         "reasoning": {"style": "effort", "param": "reasoning.effort", "values": ["low", "high"]}},
-      "deepseek-v4-flash": {"protocol": "openai", "note": "chat/completions",
+      "deepseek-v4-flash": {"protocol": "openai", "hosts": ["api.deepseek.com"], "note": "chat/completions",
         "json_mode": true,
-        "reasoning": {"style": "effort", "values": ["low", "high", "max"],
+        "reasoning": {"style": "effort", "values": ["low", "high", "max"], "default_effort": "low",
           "thinking_switch": true, "strip_sampling_params": true,
-          "effort_param": {"anthropic": "output_config.effort"}}}
+          "effort_param": {"anthropic": "output_config.effort"}}},
+      "deepseek-flash": {"protocol": "openai", "hosts": ["api.deepseek.com"], "note": "DeepSeek Flash (V4)；chat/completions；官方 https://api.deepseek.com",
+        "json_mode": true,
+        "reasoning": {"style": "effort", "values": ["low", "high", "max"], "default_effort": "low",
+          "thinking_switch": true, "strip_sampling_params": true,
+          "effort_param": {"anthropic": "output_config.effort"}}},
+      "hy3": {"protocol": "openai", "hosts": ["tokenhub-intl.tencentcloudmaas.com", "api.hunyuan.cloud.tencent.com"],
+        "note": "腾讯Hy3：官方 thinking+reasoning_effort(low/high)；base_url含opencode自动切Zen reasoning.effort；未识别网关降级干净openai；不支持 response_format",
+        "reasoning": {"style": "effort", "values": ["low", "high"], "default_effort": "low",
+          "enable": {"thinking": {"type": "enabled"}}, "disable": {"thinking": {"type": "disabled"}},
+          "thinking_switch": true, "strip_sampling_params": true,
+          "opencode": {"param": "reasoning.effort", "values": ["low", "medium", "high"],
+            "default_effort": "medium", "enable": null,
+            "disable": {"reasoning": {"enabled": false}}, "thinking_switch": false}}},
+      "hy4": {"protocol": "openai", "hosts": ["tokenhub-intl.tencentcloudmaas.com", "api.hunyuan.cloud.tencent.com"],
+        "note": "腾讯Hy4-preview：官方 thinking+reasoning_effort(high)；base_url含opencode自动切Zen reasoning.effort；未识别网关降级干净openai；不支持 response_format",
+        "reasoning": {"style": "effort", "values": ["high"], "default_effort": "high",
+          "enable": {"thinking": {"type": "enabled"}}, "disable": {"thinking": {"type": "disabled"}},
+          "thinking_switch": true, "strip_sampling_params": true,
+          "opencode": {"param": "reasoning.effort", "values": ["low", "medium", "high"],
+            "default_effort": "medium", "enable": null,
+            "disable": {"reasoning": {"enabled": false}}, "thinking_switch": false}}},
+      "qwen": {"protocol": "openai", "hosts": ["dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com"],
+        "note": "通义千问(qwen3.8-max/plus/flash)：官方 enable_thinking+thinking_budget；未识别网关降级干净openai",
+        "json_mode": true,
+        "reasoning": {"style": "budget",
+          "budgets": {"low": 2048, "medium": 4096, "high": 8192},
+          "budget_param": "thinking_budget",
+          "enable": {"enable_thinking": true}, "disable": {"enable_thinking": false},
+          "thinking_switch": true,
+          "values": ["low", "medium", "high"], "default_effort": "medium",
+          "strip_sampling_params": true}},
+      "kimi": {"protocol": "openai", "hosts": ["api.moonshot.cn", "api.moonshot.ai"],
+        "note": "月之暗面 Kimi K3：官方顶层 reasoning_effort(low/high/max，始终思考)；base_url含opencode自动切Zen reasoning.effort；未识别网关降级干净openai",
+        "json_mode": true,
+        "reasoning": {"style": "effort", "values": ["low", "high", "max"], "default_effort": "high",
+          "always_on": true, "strip_sampling_params": true,
+          "opencode": {"param": "reasoning.effort", "values": ["low", "medium", "high"], "default_effort": "medium"}}},
+      "kimi-k2": {"protocol": "openai", "hosts": ["api.moonshot.cn", "api.moonshot.ai"],
+        "note": "月之暗面 Kimi K2.x(k2.6/k2.5 可开关思考)：官方 thinking{enabled/disabled}；base_url含opencode走 reasoning.enabled；未识别网关降级干净openai",
+        "json_mode": true,
+        "reasoning": {"style": "effort",
+          "enable": {"thinking": {"type": "enabled"}}, "disable": {"thinking": {"type": "disabled"}},
+          "thinking_switch": true,
+          "opencode": {"enable": null, "disable": {"reasoning": {"enabled": false}}, "thinking_switch": false}}},
+      "glm": {"protocol": "openai", "hosts": ["open.bigmodel.cn", "api.z.ai"],
+        "note": "智谱 GLM(5.3/5.2/5)：官方 thinking+顶层 reasoning_effort(low/high/max)；base_url含opencode自动切Zen；未识别网关降级干净openai",
+        "json_mode": true,
+        "reasoning": {"style": "effort", "values": ["low", "high", "max"], "default_effort": "high",
+          "enable": {"thinking": {"type": "enabled"}}, "disable": {"thinking": {"type": "disabled"}},
+          "thinking_switch": true, "strip_sampling_params": true,
+          "opencode": {"enable": null, "disable": null, "thinking_switch": false,
+            "always_on": true, "values": ["low", "medium", "high"], "default_effort": "medium"}}},
+      "gpt": {"protocol": "openai", "hosts": ["api.openai.com"],
+        "note": "OpenAI GPT：官方 openai(chat/completions)+reasoning_effort；base_url含opencode(Zen)自动切 responses；未识别网关降级干净openai；外国模型走代理",
+        "json_mode": true,
+        "reasoning": {"style": "effort", "values": ["low", "medium", "high"], "default_effort": "medium",
+          "strip_sampling_params": true, "drop_sampling_params": true},
+        "opencode": {"protocol": "responses"}},
+      "grok": {"protocol": "openai", "hosts": ["api.x.ai"],
+        "note": "xAI Grok：官方 openai+reasoning_effort；base_url含opencode(Zen)自动切 responses(不支持oa-compat)；未识别网关降级干净openai；外国模型走代理",
+        "json_mode": true,
+        "reasoning": {"style": "effort", "values": ["low", "high"], "default_effort": "low",
+          "strip_sampling_params": true},
+        "opencode": {"protocol": "responses"}}
     },
     "timeout": 2000,
     "generation_params": {
       "temperature": 1,
       "top_p": 0.9,
       "max_tokens": 262144,
-      "reasoning_effort": "high"
+      "reasoning_effort": ""
     },
     "presets": {
       "deepseek-official": {
-        "note": "已实测(chat/anthropic/responses三协议+思考开关)，直连无需代理也可跑",
+        "note": "DeepSeek 官方：直连（无需代理）；发布件默认就绪（model=deepseek-flash），只需填 key",
         "verified": true,
         "key": "",
+        "clear_proxy": true,
         "protocol": "",
         "models": {
           "deepseek-chat": {"protocol": "openai", "note": "无思考模型",
@@ -35,9 +100,14 @@
             "json_mode": true,
             "reasoning": {"style": "effort", "values": ["none", "low", "high", "max"],
               "thinking_switch": true, "strip_sampling_params": true}},
-          "deepseek-v4-flash": {"protocol": "openai", "note": "chat/completions",
+          "deepseek-v4-flash": {"protocol": "openai", "hosts": ["api.deepseek.com"], "note": "chat/completions",
             "json_mode": true,
-            "reasoning": {"style": "effort", "values": ["low", "high", "max"],
+            "reasoning": {"style": "effort", "values": ["low", "high", "max"], "default_effort": "low",
+              "thinking_switch": true, "strip_sampling_params": true,
+              "effort_param": {"anthropic": "output_config.effort"}}},
+          "deepseek-flash": {"protocol": "openai", "hosts": ["api.deepseek.com"], "note": "DeepSeek Flash (V4)；chat/completions",
+            "json_mode": true,
+            "reasoning": {"style": "effort", "values": ["low", "high", "max"], "default_effort": "low",
               "thinking_switch": true, "strip_sampling_params": true,
               "effort_param": {"anthropic": "output_config.effort"}}}
         },
@@ -52,6 +122,7 @@
         "note": "已实测(翻译11/11+台本+世界观)，走系统代理",
         "verified": true,
         "key": "",
+        "clear_proxy": false,
         "protocol": "",
         "models": {
           "muse-spark": {"protocol": "responses", "note": "Zen网关仅支持responses",
@@ -62,6 +133,28 @@
           "top_p": 0.9,
           "max_tokens": 196608,
           "reasoning_effort": "high"
+        }
+      },
+      "zen-chat": {
+        "note": "多模型(hy3/hy4/qwen/kimi/kimi-k2/glm/gpt/grok)：注册表按 base_url 自动切换官方/ Zen 方言；用户只改 base_url/key/model；思考强度按各模型默认档位自动；外国模型走代理",
+        "verified": true,
+        "key": "",
+        "clear_proxy": false,
+        "protocol": "openai",
+        "models": {
+          "hy3": {"protocol": "openai"},
+          "hy4": {"protocol": "openai"},
+          "qwen": {"protocol": "openai"},
+          "kimi": {"protocol": "openai"},
+          "kimi-k2": {"protocol": "openai"},
+          "glm": {"protocol": "openai"},
+          "gpt": {"protocol": "openai"},
+          "grok": {"protocol": "openai"}
+        },
+        "generation_params": {
+          "temperature": 1,
+          "top_p": 0.9,
+          "max_tokens": 196608
         }
       }
     }
@@ -137,7 +230,7 @@
     "system_prompt_file": ""
   },
   "network": {
-    "clear_proxy_on_startup": true
+    "clear_proxy_on_startup": false
   },
   "active_preset": "default"
 }

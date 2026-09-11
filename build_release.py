@@ -573,11 +573,16 @@ def copy_config():
                     pval["key"] = ""
                     print(f"  抹去 preset[{pname}].key -> (空)")
     
-    # 关闭 debug
-    if "app" in config and "debug" in config["app"]:
-        original_debug = config["app"]["debug"]
-        config["app"]["debug"] = False
-        print(f"  关闭 debug: {original_debug} -> False")
+    # 关闭 debug（用户默认只看错误 + 进度，不要全量详情）
+    if "app" in config:
+        if "debug" in config["app"]:
+            original_debug = config["app"]["debug"]
+            config["app"]["debug"] = False
+            print(f"  关闭 debug: {original_debug} -> False")
+        # worker 详细日志（心跳/token 等）静默，只保留主线程的错误与进度事件
+        original_worker = config["app"].get("print_worker_detail")
+        config["app"]["print_worker_detail"] = False
+        print(f"  关闭 worker 详细日志: {original_worker} -> False")
     
     # 设置台本翻译参数（新参数名）
     if "app" in config:
@@ -616,43 +621,56 @@ def copy_config():
                 del config["app"][old_param]
                 print(f"  移除废弃参数: {old_param}")
 
-    # 新版本 API 预设与模型注册表：确保发布件包含示例预设结构（若源配置缺失则补齐）
+    # 新版本 API 预设与模型注册表：确保发布件默认 DeepSeek 就绪（用户只填 key 即可用）
     if "api" in config:
-        if "presets" not in config["api"]:
-            config["api"]["presets"] = {}
-            print("  补齐 presets: {}")
-        # 若发布源 presets 为空，从示例配置补齐预设模板
-        if not config["api"]["presets"]:
-            try:
-                ex_path = SCRIPT_DIR / "config.example.json"
-                if ex_path.exists():
-                    with open(ex_path, 'r', encoding='utf-8') as ef:
-                        ex_cfg = json.load(ef)
-                    ex_presets = ex_cfg.get("api", {}).get("presets", {})
-                    if isinstance(ex_presets, dict) and ex_presets:
-                        config["api"]["presets"] = ex_presets
-                        print(f"  补齐 presets 来自示例: {list(ex_presets.keys())}")
-            except Exception as e:
-                print(f"  补齐 presets 失败: {e}")
-        if "models" not in config["api"]:
-            config["api"]["models"] = {}
-            print("  补齐 models: {}")
-        if "active_preset" not in config["api"]:
-            config["api"]["active_preset"] = ""
-        # 确保 generation_params 含 reasoning_effort（新版本必备）
-        if "generation_params" not in config["api"]:
-            config["api"]["generation_params"] = {}
-        if "reasoning_effort" not in config["api"]["generation_params"]:
-            config["api"]["generation_params"]["reasoning_effort"] = "low"
-            print("  补齐 generation_params.reasoning_effort: low")
+        api = config["api"]
+        if not isinstance(api.get("presets"), dict):
+            api["presets"] = {}
+        if not isinstance(api.get("models"), dict):
+            api["models"] = {}
+        if "active_preset" not in api:
+            api["active_preset"] = ""
 
-        # 发布件默认使用 deepseek-v4-flash（按用户要求）
-        config["api"]["model"] = "deepseek-v4-flash"
-        config["api"]["base_url"] = "https://api.deepseek.com"
-        # 若存在 deepseek-official 预设则默认选用，否则保持空由模型自动匹配
-        if isinstance(config["api"].get("presets"), dict) and "deepseek-official" in config["api"]["presets"]:
-            config["api"]["active_preset"] = "deepseek-official"
-        print("  设置默认模型: deepseek-v4-flash (base_url=https://api.deepseek.com)")
+        # 从示例配置补齐缺失的模型注册表与预设（新增模型/预设自动跟进，不覆盖已有）
+        try:
+            ex_path = SCRIPT_DIR / "config.example.json"
+            if ex_path.exists():
+                with open(ex_path, 'r', encoding='utf-8') as ef:
+                    ex_api = (json.load(ef).get("api") or {})
+                for _mk, _mv in (ex_api.get("models") or {}).items():
+                    if _mk not in api["models"]:
+                        api["models"][_mk] = _mv
+                        print(f"  补齐模型注册: {_mk}")
+                for _pk, _pv in (ex_api.get("presets") or {}).items():
+                    if _pk not in api["presets"]:
+                        api["presets"][_pk] = _pv
+                        print(f"  补齐预设: {_pk}")
+        except Exception as e:
+            print(f"  补齐模型/预设失败: {e}")
+
+        # generation_params 必备项：思考强度缺失/为空时补 low
+        if not isinstance(api.get("generation_params"), dict):
+            api["generation_params"] = {}
+        if not api["generation_params"].get("reasoning_effort"):
+            api["generation_params"]["reasoning_effort"] = "low"
+            print("  设置 generation_params.reasoning_effort: low")
+
+        # 发布件默认 DeepSeek Flash (V4)：只差 key
+        api["model"] = "deepseek-flash"
+        api["base_url"] = "https://api.deepseek.com"
+        if "deepseek-official" in api["presets"]:
+            api["active_preset"] = "deepseek-official"
+        # 清掉开发机遗留的全局协议（避免误导非注册模型；已登记模型仍按 models 判定）
+        api["protocol"] = ""
+        # DeepSeek 官方为直连（无需代理）
+        api["clear_proxy"] = True
+        print("  设置默认: model=deepseek-flash, base_url=https://api.deepseek.com, "
+              "active_preset=deepseek-official（用户仅需填 key）")
+
+    # 全局代理开关：发布件默认不强制清代理（交给 api.clear_proxy 与系统代理）
+    if isinstance(config.get("network"), dict):
+        config["network"]["clear_proxy_on_startup"] = False
+        print("  设置 network.clear_proxy_on_startup: False")
     
     # OCR 已禁用 —— 不再设置 OCR 参数
     # if "ocr" in config:

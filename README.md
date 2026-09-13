@@ -4,7 +4,6 @@
 
 `Python` · `Faster-Whisper` · `PyMuPDF` · `pyopenjtalk` · 多厂商 LLM · `PyInstaller`
 
-开源地址：<https://github.com/eeesen/HDEG>
 
 ---
 

@@ -471,7 +471,7 @@ def _print_banner():
     _log(" | |  | |  | |__| | | |____  | |__| |")
     _log(" |_|  |_|  |_____/  |______|  \\_____|    dev by hdeman")
     _log("")
-    _log("  开源地址: https://github.com/eeesen/HDEG")
+    _log("  开源地址: https://github.com/hdeman3/HDEG")
     _log("")
 
 

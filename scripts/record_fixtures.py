@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """record 模式：用真实 API 跑一遍真实作品，把 LLM 响应录制成 fixture。
 
 录制产物供 CI 的 mock 服务回放（0 token、确定性），真实模型只在本地/手动冒烟时用。
@@ -45,13 +45,15 @@ from tests.mock_llm_server import compute_key, detect_stage  # noqa: E402
 
 
 def _build_record_config(tmp_path: Path, config_path: Path, clear_proxy: bool = True,
-                         parallel: int = 1) -> Path:
+                         parallel: int = 1, model: str = None) -> Path:
     """基于真实配置，关掉润色/预检，产物写入临时配置。
 
     并行录制：mock 按 <asr> 内容哈希路由、与调用顺序无关，因此提高
     translation_parallel 只提速、不影响 fixture 正确性。推理强度不改。
     """
     cfg = load_config(config_path)
+    if model:
+        cfg.setdefault('api', {})['model'] = model
     app = cfg.setdefault('app', {})
     app['polish_after_translate'] = False
     app['api_preflight'] = False
@@ -70,7 +72,7 @@ def _build_record_config(tmp_path: Path, config_path: Path, clear_proxy: bool = 
 
 
 def record_work(work: str, config_path: Path, out_path: Path, clear_proxy: bool = True,
-                parallel: int = 1) -> dict:
+                parallel: int = 1, model: str = None) -> dict:
     from engines.api_client import APIClient
     from pipeline import orchestrator
 
@@ -98,7 +100,7 @@ def record_work(work: str, config_path: Path, out_path: Path, clear_proxy: bool 
     tmp = Path(tempfile.mkdtemp(prefix=f'hdeg_record_{work}_'))
     try:
         work_dir = copy_work(work, tmp)
-        cfg = _build_record_config(tmp, config_path, clear_proxy=clear_proxy, parallel=parallel)
+        cfg = _build_record_config(tmp, config_path, clear_proxy=clear_proxy, parallel=parallel, model=model)
         monkey_orig = getattr(orchestrator, '_fetch_balance')
         orchestrator._fetch_balance = lambda ctx: None  # 录制不查余额
         APIClient.chat = patched
@@ -128,6 +130,7 @@ def main():
                         help='保留系统代理（默认强制直连 clear_proxy=true）')
     parser.add_argument('--fast', action='store_true',
                         help='兼容旧参数，等价于 --parallel 4')
+    parser.add_argument('--model', default=None, help='录制用模型（覆盖 config.json），如 muse-spark-1.2-contributor')
     parser.add_argument('--parallel', type=int, default=1,
                         help='录制并发数（默认 1；只提速，不改推理强度/不影响 fixture 正确性）')
     args = parser.parse_args()
@@ -148,7 +151,8 @@ def main():
         print(f'\n===== 录制 {work} =====')
         out = out_dir / f'{work}.json'
         plan = record_work(work, config_path, out,
-                           clear_proxy=not args.keep_proxy, parallel=parallel)
+                           clear_proxy=not args.keep_proxy, parallel=parallel,
+                           model=args.model)
         print(f'[OK] {work}: 录制 {len(plan["calls"])} 个调用 → {out}')
     return 0
 

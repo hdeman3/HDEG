@@ -75,6 +75,7 @@ def detect_stage(messages: list, max_tokens: int = 0) -> str:
 
 
 _ASR_RE = re.compile(r'<asr>(.*?)</asr>', re.S)
+_ASR_JSON_RE = re.compile(r'\{.*\}', re.S)
 
 
 def extract_asr_block(user_text: str) -> str:
@@ -83,11 +84,36 @@ def extract_asr_block(user_text: str) -> str:
     return m.group(1) if m else user_text
 
 
+def asr_signature(user_text: str) -> str:
+    """ASR 正文签名：只取每行的 index + text。
+
+    **刻意剔除 `sb` / `sb_conf`**：这两个字段由「ASR↔台本对齐」生成，而对齐在
+    装了 pyopenjtalk 与未装时会走不同实现（读音 vs 纯假名/汉字比较），结果会有差异。
+    若把它们算进 key，同一个音轨在「录制机」与「CI 机」上会得到不同 key 而 miss。
+    只看 ASR 正文即可稳定标识一个音轨，且与运行环境无关。
+    """
+    inner = extract_asr_block(user_text)
+    m = _ASR_JSON_RE.search(inner)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            lines = data.get('lines')
+            if isinstance(lines, list):
+                return '\n'.join(
+                    f"{o.get('index')}\t{o.get('text')}"
+                    for o in lines if isinstance(o, dict)
+                )
+        except Exception:
+            pass
+    # 兜底：归一化换行后的原始块
+    return inner.replace('\r\n', '\n').strip()
+
+
 def compute_key(stage: str, messages: list, max_tokens: int = 0) -> str:
     """计算路由 key。"""
     if stage in ('translate', 'polish'):
         user = _messages_text(messages, 'user')
-        digest = hashlib.sha1(extract_asr_block(user).encode('utf-8')).hexdigest()[:16]
+        digest = hashlib.sha1(asr_signature(user).encode('utf-8')).hexdigest()[:16]
         return f'{stage}:{digest}'
     return stage
 

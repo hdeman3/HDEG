@@ -9,5 +9,6 @@ PyMuPDF>=1.23.0
 fugashi>=1.2.0
 unidic-lite>=1.0.8
 requests>=2.28.0
+rapidfuzz>=3.0.0
 
 pytest>=7.0

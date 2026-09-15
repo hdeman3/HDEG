@@ -127,7 +127,12 @@ def find_anchors_by_asr(
     返回:
         {track_name: anchor_line}  仅包含成功定位的音轨
     """
-    from rapidfuzz import fuzz
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        # 未安装 rapidfuzz：跳过 FZ 锚点。上层 split_by_llm_line_range 会退化为
+        # 「无锚点、全文定位」的 LLM 分割，流程不中断（仅失去锚点加速/收敛）。
+        return {}
     from statistics import median
 
     # 预处理台本：只保留非空行，建立 (行号, 文本) 索引

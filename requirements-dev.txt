@@ -1,0 +1,13 @@
+# CI / 开发依赖
+# 安装: pip install -r requirements-dev.txt
+#
+# 说明：这里包含主流程「必装」项 + 测试依赖，刻意**不含 pyopenjtalk / OCR**
+# （可选增强，缺失时程序自动回退；CI 上避免源码编译，加快安装）。
+
+openai>=1.0.0
+PyMuPDF>=1.23.0
+fugashi>=1.2.0
+unidic-lite>=1.0.8
+requests>=2.28.0
+
+pytest>=7.0

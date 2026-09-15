@@ -716,10 +716,6 @@ def scan_subtitle_files(work_dir: Path) -> tuple[list[Path], list[Path], int, di
 
 
 # 兼容旧接口
-def scan_lrc_files(work_dir: Path) -> tuple[list[Path], list[Path], int]:
-    """兼容旧接口"""
-    all_files, ja_files, restored, _groups = scan_subtitle_files(work_dir)
-    return all_files, ja_files, restored
 
 
 def sync_lrc_to_srt_vtt(lrc_path: Path, translated_texts: list[str]) -> int:
@@ -1530,7 +1526,7 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
         api_config = ctx.api_cfg
         try:
             splitter = ScriptbookSplitter(api_config, verbose=ctx.pr.debug_enabled)
-            track_map, sb_token_stats = splitter.split_and_clean_all_in_one(
+            track_map, sb_token_stats = splitter.split_by_llm_line_range(
                 track_names, raw_text, track_samples=track_samples)
             # 统一 token 追踪：记录台本 Flash 分割调用
             if sb_token_stats:
@@ -1606,58 +1602,6 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
         _log(f"  [台本] 分割结果为空，跳过缓存导出（下次将重新分割）")
 
     return track_map
-
-
-# ==================== 世界观加载 ====================
-
-def _load_worldview(work_dir: Path, ctx: PipelineContext) -> dict | None:
-    """加载世界观/角色/场景设定
-
-    返回:
-        世界观字典 {worldview, characters, scene, _source} 或 None
-    """
-    from engines.worldview_engine import load_worldview_from_dir
-
-    _log(f"\n[世界观] 搜索目录: {work_dir.absolute()}")
-
-    try:
-        worldview, source_files = load_worldview_from_dir(work_dir)
-        if worldview and source_files:
-            wv_text = worldview.get('worldview', '')
-            chars = worldview.get('characters', {})
-            scene = worldview.get('scene', '')
-
-            worldview['_source'] = source_files
-            _log(f"  → 来源: {', '.join(str(p) for p in source_files)}")
-            _log(f"  → 世界观: {'有' if wv_text else '无'} ({len(wv_text)} 字符)")
-            _log(f"  → 角色: {len(chars)} 个")
-            _log(f"  → 场景: {'有' if scene else '无'}")
-
-            return worldview
-        else:
-            _log("  → 未发现世界观文件")
-            return None
-    except Exception as e:
-        _log(f"  [警告] 世界观加载失败: {e}")
-        return None
-
-
-# ==================== 台本关键字过滤 ====================
-
-def _apply_keyword_filter(lines: list[str]) -> list[str]:
-    """对台本行应用关键字过滤（scriptbook_mode=keyword 时使用）"""
-    from core.scriptbook_parser import is_key_dialogue_line
-    keyword_lines = []
-    for line in lines:
-        if line and line.strip() and is_key_dialogue_line(line):
-            keyword_lines.append(line)
-    if keyword_lines:
-        _log(f"  → 关键字模式: {len(keyword_lines)}/{len(lines)} 行")
-        return keyword_lines
-    # 回退：如果没有关键台词，保留所有有效行
-    fallback = [line for line in lines if line and line.strip() and len(line.strip()) >= 5]
-    _log(f"  → 关键字模式（回退）: {len(fallback)}/{len(lines)} 行")
-    return fallback
 
 
 # ==================== 自动术语/世界观分析（LLM驱动） ====================
@@ -1765,12 +1709,6 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
     from engines.term_manager import (
         get_terms_path, get_alias_path,
         load_terms_from_file, load_alias,
-        # save_terms_to_file, save_alias,  # 术语分析已禁用
-        # extract_names_from_filenames,
-        # sample_all_lrc_files,
-        # find_similar_reading_clusters,
-        # analyze_characters_with_llm,
-        # ROLE_TRANSLATIONS,
     )
     from engines.worldview_engine import (
         get_worldview_path, load_worldview,
@@ -1858,6 +1796,39 @@ def _analyze_work_terms(work_dir: Path, ctx: PipelineContext) -> tuple[dict, lis
 
     return terms, alias_list, worldview
 
+
+# ==================== 世界观加载 ====================
+
+def _load_worldview(work_dir: Path, ctx: PipelineContext) -> dict | None:
+    """加载世界观/角色/场景设定
+
+    返回:
+        世界观字典 {worldview, characters, scene, _source} 或 None
+    """
+    from engines.worldview_engine import load_worldview_from_dir
+
+    _log(f"\n[世界观] 搜索目录: {work_dir.absolute()}")
+
+    try:
+        worldview, source_files = load_worldview_from_dir(work_dir)
+        if worldview and source_files:
+            wv_text = worldview.get('worldview', '')
+            chars = worldview.get('characters', {})
+            scene = worldview.get('scene', '')
+
+            worldview['_source'] = source_files
+            _log(f"  → 来源: {', '.join(str(p) for p in source_files)}")
+            _log(f"  → 世界观: {'有' if wv_text else '无'} ({len(wv_text)} 字符)")
+            _log(f"  → 角色: {len(chars)} 个")
+            _log(f"  → 场景: {'有' if scene else '无'}")
+
+            return worldview
+        else:
+            _log("  → 未发现世界观文件")
+            return None
+    except Exception as e:
+        _log(f"  [警告] 世界观加载失败: {e}")
+        return None
 
 # ==================== 目录报告 ====================
 

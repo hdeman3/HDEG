@@ -95,34 +95,6 @@ def parse_lrc_file(path: Path) -> list[LrcLine]:
 
 # ==================== LRC 生成 ====================
 
-def generate_lrc(
-    lrc_lines: list[LrcLine],
-    translations: list[str],
-) -> str:
-    """
-    根据时间轴和翻译文本生成 LRC
-
-    参数:
-        lrc_lines: 原始 LRC 时间轴（parse_lrc 结果）
-        translations: 对应行的翻译文本
-
-    返回:
-        完整 LRC 文本（双语格式）
-    """
-    result_lines = []
-
-    for i, (lrc_line, trans) in enumerate(zip(lrc_lines, translations)):
-        ts = lrc_line.timestamp_str
-        original = lrc_line.text
-
-        # 格式: [02:15.30]原文 / 译文
-        if trans and trans != original:
-            result_lines.append(f"{ts}{original}／{trans}")
-        else:
-            result_lines.append(f"{ts}{original}")
-
-    return '\n'.join(result_lines)
-
 
 def generate_single_language_lrc(
     lrc_lines: list[LrcLine],
@@ -144,80 +116,6 @@ def generate_single_language_lrc(
         result_lines.append(f"{lrc_line.timestamp_str}{text}")
 
     return '\n'.join(result_lines)
-
-
-def save_lrc(
-    path: Path,
-    lrc_lines: list[LrcLine],
-    translations: list[str],
-    *,
-    name_suffix: str = '',
-) -> None:
-    """
-    保存双语 LRC 文件
-
-    参数:
-        path: 输出路径
-        lrc_lines: 时间轴
-        translations: 翻译文本
-        name_suffix: 文件名后缀（如 '_双语'）
-    """
-    content = generate_lrc(lrc_lines, translations)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding='utf-8')
-
-
-# ==================== 时间戳工具 ====================
-
-def parse_timestamp(ts_str: str) -> int:
-    """
-    解析时间戳字符串为毫秒
-
-    支持格式:
-    - [mm:ss.xx]
-    - mm:ss.xx
-    """
-    ts_str = ts_str.strip('[]')
-    m = re.match(r'(\d+):(\d+(?:\.\d+)?)', ts_str)
-    if m:
-        minutes = int(m.group(1))
-        seconds = float(m.group(2))
-        return int((minutes * 60 + seconds) * 1000)
-    return 0
-
-
-def format_timestamp(ms: int, bracket: bool = True) -> str:
-    """格式化毫秒为时间戳字符串"""
-    total_s = ms / 1000.0
-    m = int(total_s // 60)
-    s = total_s % 60
-    ts = f"{m:02d}:{s:05.2f}"
-    return f"[{ts}]" if bracket else ts
-
-
-def parse_chapter_lrc(text: str, time_threshold_ms: int = 1000) -> list[LrcLine]:
-    """
-    从 LRC 标记解析章节点
-
-    只保留间隔 >= threshold 的关键时间点，过滤假的小间隔。
-
-    参数:
-        text: LRC 文本（如 '00:00 标题\\n01:30 第1节\\n...'）
-        time_threshold_ms: 最小间隔，小于此值的时间戳视作假标记
-
-    返回:
-        有效的时间轴节点
-    """
-    all_lines = parse_lrc(text)
-    if not all_lines:
-        return []
-
-    result = [all_lines[0]]
-    for i in range(1, len(all_lines)):
-        if all_lines[i].time_ms - result[-1].time_ms >= time_threshold_ms:
-            result.append(all_lines[i])
-
-    return result
 
 
 # ==================== 通用字幕文本提取（LRC/SRT/VTT） ====================
@@ -502,63 +400,7 @@ def write_subtitle_file_nonempty(sub_file: SubtitleFile, translated_lyrics: list
         f.writelines(out_lines)
 
 
-
-
 # ==================== 语言检测 ====================
-
-def extract_subtitle_texts(content: str, ext: str) -> list[str]:
-    """从字幕内容中提取纯文本行（去掉时间戳）"""
-    lines = content.split('\n')
-    lyric_texts = []
-
-    if ext == '.lrc':
-        tag_pattern = re.compile(r'^(\[.*?\])\s*(.*)')
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            match = tag_pattern.match(line)
-            if match:
-                tags = match.group(1)
-                text_after = match.group(2)
-                if re.search(r'\[\d+:\d{2}\.\d{2,3}\]', tags):
-                    lyric_texts.append(text_after)
-
-    elif ext == '.srt':
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            if line.isdigit():
-                i += 1
-                if i < len(lines) and '-->' in lines[i]:
-                    i += 1
-                    while i < len(lines) and lines[i].strip():
-                        lyric_texts.append(lines[i].strip())
-                        i += 1
-            i += 1
-
-    elif ext == '.vtt':
-        i = 0
-        while i < len(lines) and not lines[i].strip().startswith('00:'):
-            i += 1
-        while i < len(lines):
-            line = lines[i].strip()
-            if not line or line.startswith('NOTE'):
-                i += 1
-                continue
-            if '-->' in line:
-                i += 1
-                while i < len(lines):
-                    next_line = lines[i].strip()
-                    if not next_line or '-->' in next_line:
-                        break
-                    lyric_texts.append(next_line)
-                    i += 1
-            else:
-                i += 1
-
-    return lyric_texts
-
 
 def detect_lrc_language(file_path: Path) -> str:
     """检测字幕文件的语言

@@ -14,8 +14,6 @@ from typing import Protocol, TypedDict
 SB_MIN_CONF = 0.3
 
 
-
-
 def _p(*args, **kwargs):
     """带 worker 前缀的 print：worker 线程日志自动加 [W{n}] 前缀，便于前端分 tab。
 
@@ -86,16 +84,6 @@ class TranslationResult(TypedDict, total=False):
     reasoning_preview: str       # 思维链前600字单行预览（诊断用）
     cost: float                  # 费用
     elapsed: float               # 本次调用耗时（秒）
-
-
-class BatchTranslationResult(TypedDict):
-    """批量翻译结果"""
-    total: int
-    success: int
-    failed: int
-    token_stats: dict
-    cost: float
-    elapsed: float
 
 
 # ==================== 翻译引擎接口 ====================

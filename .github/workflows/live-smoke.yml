@@ -1,0 +1,50 @@
+name: Live Smoke
+
+# 真实 API 冒烟（L2 层）：验证「真机可用 / 协议发得对」。
+# 与 CI 的区别：这里真的调用厂商 API，只断言不变量（不崩 / 产出中文 / token 在预算内），
+# 绝不比对具体译文。需要仓库 Secret：HDEG_API_KEY（可选 HDEG_BASE_URL / HDEG_MODEL）。
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 19:00 UTC（北京时间凌晨 3:00，空闲时段，无峰谷溢价）
+    - cron: '0 19 * * *'
+
+concurrency:
+  group: live-smoke
+  cancel-in-progress: false
+
+jobs:
+  live-smoke:
+    # 无 key 时直接跳过，不报红
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.ENABLE_LIVE_SMOKE == 'true' }}
+    name: 真实 API 最小冒烟
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: 准备测试素材
+        run: |
+          # 素材生成脚本依赖本地作品库；CI 上若没有素材则冒烟自动 skip。
+          if [ ! -d tests/fixtures/works/RJ01702644 ]; then
+            echo "::warning::未找到测试素材 tests/fixtures/works/RJ01702644，live smoke 将跳过"
+          fi
+
+      - name: 真实 API 冒烟
+        env:
+          PYTHONIOENCODING: utf-8
+          HDEG_API_KEY: ${{ secrets.HDEG_API_KEY }}
+          HDEG_BASE_URL: ${{ secrets.HDEG_BASE_URL }}
+          HDEG_MODEL: ${{ secrets.HDEG_MODEL }}
+        run: pytest tests/test_live_smoke.py -q -s

@@ -167,3 +167,19 @@ pipeline/or
 
 # 算法原型（本地保留，不入库）
 vertical_sort.py
+
+# ==================== CI 测试（纳入版本控制）====================
+# 注意：上面的 *.txt/*.lrc/*.pdf/*.json、RJ[0-9]*/、test_*.py 等规则会误伤测试素材，
+# 这里按顺序逐级「反忽略」——必须先恢复被忽略的父目录，才能恢复其下文件。
+!tests/
+!tests/**
+!scripts/
+!scripts/**
+!pytest.ini
+!requirements-dev.txt
+
+# 反忽略之后再压一遍：缓存/字节码在 tests/、scripts/ 下也要忽略
+__pycache__/
+*.py[cod]
+.pytest_cache/
+

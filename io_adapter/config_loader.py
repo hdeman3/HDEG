@@ -45,7 +45,8 @@ def load_config(path: Path = None) -> dict[str, Any]:
         - output: 输出配置
     """
     if path is None:
-        path = get_config_path()
+        _env_path = os.environ.get('HDEG_CONFIG', '').strip()
+        path = Path(_env_path) if _env_path else get_config_path()
 
     # 默认配置（当 config.json 不存在或缺少字段时使用）
     default_config = {
@@ -93,6 +94,9 @@ def load_config(path: Path = None) -> dict[str, Any]:
     # 规则：显式非空值优先（用户写的赢），空值/缺失由 preset 补齐；
     # 字典型字段（models/generation_params）按 key 合并，用户同名 key 覆盖。
     _apply_api_preset(config)
+
+    # 环境变量覆盖（CI / 命令行注入凭证用）：优先级高于 config.json
+    _apply_env_overrides(config)
 
     return config
 
@@ -176,6 +180,35 @@ def _apply_api_preset(config: dict) -> None:
         print(f"[配置] preset 合并失败（沿用原配置）: {e}")
 
 
+def _apply_env_overrides(config: dict) -> None:
+    """用环境变量覆盖 api 配置（就地修改）。
+
+    供 CI / 命令行注入凭证，避免把 key 写进仓库。仅在变量非空时生效，
+    优先级高于 config.json 与 preset。
+
+    支持：
+        HDEG_API_KEY   → api.key
+        HDEG_BASE_URL  → api.base_url
+        HDEG_MODEL     → api.model
+        HDEG_PROTOCOL  → api.protocol
+    """
+    try:
+        api = config.get('api')
+        if not isinstance(api, dict):
+            return
+        for env_name, key in (
+            ('HDEG_API_KEY', 'key'),
+            ('HDEG_BASE_URL', 'base_url'),
+            ('HDEG_MODEL', 'model'),
+            ('HDEG_PROTOCOL', 'protocol'),
+        ):
+            value = os.environ.get(env_name, '').strip()
+            if value:
+                api[key] = value
+    except Exception as e:
+        print(f"[配置] 环境变量覆盖失败（沿用原配置）: {e}")
+
+
 def save_config(config: dict, path: Path = None) -> None:
     """保存配置到文件"""
     if path is None:
@@ -199,27 +232,6 @@ def get_api_config(config: dict = None) -> dict:
     return config.get('api', {})
 
 
-def get_ocr_config(config: dict = None) -> dict:
-    """提取 OCR 配置"""
-    if config is None:
-        config = load_config()
-    return config.get('ocr', {})
-
-
-def get_translation_config(config: dict = None) -> dict:
-    """提取翻译配置"""
-    if config is None:
-        config = load_config()
-    return config.get('translation', {})
-
-
-def get_output_config(config: dict = None) -> dict:
-    """提取输出配置"""
-    if config is None:
-        config = load_config()
-    return config.get('output', {})
-
-
 # ==================== 术语表加载 ====================
 
 def load_terms_from_config(config: dict = None) -> dict[str, str]:
@@ -238,74 +250,3 @@ def load_terms_from_config(config: dict = None) -> dict[str, str]:
         return {item['ja']: item['zh'] for item in terms if 'ja' in item and 'zh' in item}
     return dict(terms)
 
-
-# ==================== 模型配置 ====================
-
-def get_model_config(config: dict = None) -> dict:
-    """获取模型配置"""
-    if config is None:
-        config = load_config()
-    return config.get('model', {})
-
-
-def get_transcription_config(config: dict = None) -> dict:
-    """获取转录配置（infer.exe 路径、设备参数等）
-
-    返回:
-        {infer_exe, model_dir, device, compute_type, audio_suffixes, sub_formats}
-    """
-    if config is None:
-        config = load_config()
-    return config.get('transcription', {})
-
-
-def get_generation_params(config: dict = None) -> dict:
-    """获取生成参数
-
-    返回:
-        {temperature, top_p, max_tokens, reasoning_effort}
-    """
-    if config is None:
-        config = load_config()
-    return config.get('generation_params', {})
-
-
-# ==================== 作品目录配置 ====================
-
-def get_work_dirs(config: dict = None) -> list[str]:
-    """获取作品目录列表"""
-    if config is None:
-        config = load_config()
-    return config.get('work_dirs', [])
-
-
-# ==================== 配置热更新 ====================
-
-def update_config(key: str, value: Any, config: dict = None, save: bool = False) -> dict:
-    """
-    更新配置项
-
-    参数:
-        key: 配置键（支持点号分隔的嵌套键，如 'api.model'）
-        value: 新值
-        config: 配置字典（为 None 则加载）
-        save: 是否持久化保存
-
-    返回:
-        更新后的完整配置
-    """
-    if config is None:
-        config = load_config()
-
-    keys = key.split('.')
-    target = config
-    for k in keys[:-1]:
-        if k not in target:
-            target[k] = {}
-        target = target[k]
-    target[keys[-1]] = value
-
-    if save:
-        save_config(config)
-
-    return config

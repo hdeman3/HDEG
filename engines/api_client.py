@@ -416,25 +416,6 @@ def model_reasoning_spec(model_name: str, api_cfg: dict) -> dict:
         return {}
 
 
-def is_thinking_active(api_cfg: dict) -> bool:
-    """当前配置思考是否开启（effort 非空/非 none/非 off 且注册表 style 非 off）。
-
-    思考开启时思维链与正文共享输出配额，长文本必须切小块，否则正文被截断。
-    """
-    try:
-        _eff = ((api_cfg or {}).get('generation_params') or {}).get('reasoning_effort')
-        _spec = model_reasoning_spec((api_cfg or {}).get('model', ''), api_cfg)
-        if not _eff:
-            # 未指定时用注册表默认档位判断（与 apply_reasoning_spec 一致）
-            _eff = _spec.get('default_effort')
-        if not _eff or str(_eff).strip().lower() in ('none', 'off', '0', 'false'):
-            return False
-        _style = str(_spec.get('style') or 'effort').lower()
-        return _style in ('effort', 'budget')
-    except Exception:
-        return False
-
-
 def model_thinking_switch(model_name: str, api_cfg: dict) -> bool:
     """该模型发请求时是否附带 thinking 开关（openai 协议 extra_body）。
 

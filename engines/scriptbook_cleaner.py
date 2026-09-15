@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 台本分割与清洗引擎
 
@@ -35,12 +35,12 @@ SPLIT_SYSTEM_PROMPT = (
 
 # ══ V2 (已废弃) — 全文本输出 + 清洗规则 ══
 # _SPLIT_USER_TEMPLATE_V2 = """..."""
-# 由 V3 行号范围方案替代
+# 由「LLM 行号范围分割」替代
 
 
-# ── V3 Prompt（行号范围输出，不做清洗，只做定位） ──
+# ── LLM 行号范围分割 Prompt（只做定位，不做清洗） ──
 
-_SPLIT_USER_TEMPLATE_V3 = """【音轨列表】（必须使用以下名称作为输出的 key，一个都不能少）
+_SPLIT_USER_TEMPLATE_LINE_RANGE = """【音轨列表】（必须使用以下名称作为输出的 key，一个都不能少）
 {track_names_json}
 
 【音轨 ASR 样本】（每条音轨的前几句实际台词，用于辅助定位台本中的对应段落。⚠ ASR 识别可能有误，仅作语义锚点参考，不要逐字匹配）
@@ -59,30 +59,6 @@ _SPLIT_USER_TEMPLATE_V3 = """【音轨列表】（必须使用以下名称作为
 
 仅输出 JSON（无任何解释）：
 {{"tracks": {{"track_name": [start, end], ...}}}}"""
-
-
-# ── 预分割台本清洗 Prompt（已按文件分轨，只需清洗） ──
-
-_PRE_SPLIT_CLEAN_TEMPLATE = """【音轨文件】（每个文件对应一个音轨，文件名即音轨名）
-{track_files_json}
-
-【规则 —— 删除以下内容】
-1. **SE（音效）**：ＳＥ：开头的音效描述
-2. **演技指示**：（）包裹的演技注记（如 (驚いた様子で)）、■ 开头的指示行
-3. **场景描述/设定**：⚪︎⚫︎标记的场景说明、角色设定、＊...＊ 包裹的演出注释
-4. **非台词叙述**：主人公「...」格式的叙述行、纯场景描述行
-
-【规则 —— 保留以下内容】
-- 【角色名】标记的台词行及其后续对话行（无【角色名】但紧跟台词的叙述除外）
-- 台词中的娇喘/发声
-- ♥♡ 等语气符号
-- **每句对话作为独立的数组元素，不要将多句合并为一个字符串**
-
-仅做清洗，不做翻译、不做纠错。**台词按说话顺序**，适当拆句。
-输出 JSON（数组元素必须逐句拆分）：
-{{"tracks": {{"track_name": ["台词1", "台词2"], ...}}}}
-
-台本不一定存在——找不到内容或文件为空的音轨设为空数组 []，不强求。"""
 
 
 # ── 保守预清洗（仅删 100% 确定的噪音） ──
@@ -231,9 +207,9 @@ class ScriptbookSplitter:
     # ══ V1 (已废弃) — 全文本输出，LLM 返回清洗+分割后的完整台本 ══
     # def split_and_clean(self, track_names, raw_scriptbook, *, max_retries=2):
     #     """一次 Flash 调用完成台本分割+清洗。"""
-    #     ... (已废弃，由 V3 行号范围方案替代)
+    #     ... (已废弃，由「LLM 行号范围分割」替代)
 
-    def split_and_clean_all_in_one(
+    def split_by_llm_line_range(
         self,
         track_names: list[str],
         raw_scriptbook: str,
@@ -242,7 +218,7 @@ class ScriptbookSplitter:
         max_retries: int = 2,
     ) -> dict[str, list[str]]:
         """
-        V3: 一次 Flash 调用完成「定位」（行号范围输出）。
+        LLM 行号范围分割：一次 Flash 调用完成「定位」（行号范围输出）。
 
         LLM 只返回每个音轨对应台本的行号区间 [start, end]，
         文本提取和清洗全部在本地完成，输出 token 减少 ~99%。
@@ -263,12 +239,12 @@ class ScriptbookSplitter:
         cleaned = _conservative_pre_clean(raw_scriptbook)
         if self.verbose:
             red_pct = (1 - len(cleaned) / max(len(raw_scriptbook), 1)) * 100
-            print(f"  [台本分割V3] 预清洗: {len(raw_scriptbook)} → {len(cleaned)} 字符 ({red_pct:.0f}% 减少)")
+            print(f"  [台本LLM分割] 预清洗: {len(raw_scriptbook)} → {len(cleaned)} 字符 ({red_pct:.0f}% 减少)")
 
         # 1.5 短行合并 (降低 PDF 碎片度)
         cleaned = _merge_short_lines(cleaned)
         if self.verbose:
-            print(f"  [台本分割V3] 短行合并后: {len(cleaned)} 字符")
+            print(f"  [台本LLM分割] 短行合并后: {len(cleaned)} 字符")
 
         # 2. FZ 锚点定位（用 ASR 前 5 句逐行匹配，缩窄 LLM 搜索范围）
         cleaned_lines = cleaned.split('\n')
@@ -295,7 +271,7 @@ class ScriptbookSplitter:
         # 3. 编号行号
         numbered_text, original_lines = self._number_scriptbook_lines(cleaned)
         if self.verbose:
-            print(f"  [台本分割V3] 编号 {len(original_lines)} 行")
+            print(f"  [台本LLM分割] 编号 {len(original_lines)} 行")
 
         # 4. 构建 ASR 样本参考文本
         if track_samples:
@@ -328,9 +304,9 @@ class ScriptbookSplitter:
         else:
             fz_hint_section = ''
 
-        # 6. 构建 V3 prompt
+        # 6. 构建 LLM 行号范围 prompt
         track_names_json = _json.dumps(track_names, ensure_ascii=False)
-        user_prompt = _SPLIT_USER_TEMPLATE_V3.format(
+        user_prompt = _SPLIT_USER_TEMPLATE_LINE_RANGE.format(
             track_names_json=track_names_json,
             track_samples_text=track_samples_text,
             numbered_scriptbook=numbered_text,
@@ -354,7 +330,7 @@ class ScriptbookSplitter:
             )
         except Exception as e:
             if self.verbose:
-                print(f"  [台本分割V3] 全部尝试失败: {e}")
+                print(f"  [台本LLM分割] 全部尝试失败: {e}")
             return {}, {}
 
         _model = self._api.current_model
@@ -376,14 +352,14 @@ class ScriptbookSplitter:
             return result, token_stats
 
         if self.verbose:
-            print(f"  [台本分割V3] 解析失败（模型 {_model}）")
+            print(f"  [台本LLM分割] 解析失败（模型 {_model}）")
         return {}, {}
 
     # ═════════════════════════════════════════════════════════
     # V2 (注释保留): 全文本输出方案，LLM 返回完整清洗后台本。
-    # 如需回退，取消下方注释并注释掉上面的 V3 实现。
+    # 如需回退，取消下方注释并注释掉上面的「LLM 行号范围分割」实现。
     # ═════════════════════════════════════════════════════════
-    # def split_and_clean_all_in_one_v2(
+    # def split_by_llm_fulltext_v2(
     #     self,
     #     track_names: list[str],
     #     raw_scriptbook: str,
@@ -455,78 +431,6 @@ class ScriptbookSplitter:
     #         print(f"  [台本分割V2] 全部尝试失败: {last_error}")
     #     return {}
 
-    def clean_pre_split_tracks(
-        self,
-        track_files: dict[str, str],
-        *,
-        max_retries: int = 2,
-    ) -> dict[str, list[str]]:
-        """
-        预分割台本清洗：每个文件已对应一个音轨，只需清洗。
-
-        参数:
-            track_files: {track_name: file_content} 映射
-
-        返回:
-            {track_name: [clean_lines]}
-        """
-        if not track_files:
-            return {}
-
-        # 不做事先本地清洗（用户要求跳过，避免误伤；清洗全部交给 Flash）
-        active_files = {k: v for k, v in track_files.items() if v.strip()}
-        if not active_files:
-            return {name: [] for name in track_files}
-
-        # 将所有文件内容拼接（每个文件标注所属音轨）
-        combined = "\n\n".join(
-            f"=== Track {name} ===\n{content}"
-            for name, content in active_files.items()
-        )
-
-        track_files_json = _json.dumps(
-            {k: f"{len(v)} 字符" for k, v in active_files.items()},
-            ensure_ascii=False,
-        )
-
-        user_prompt = _PRE_SPLIT_CLEAN_TEMPLATE.format(
-            track_files_json=track_files_json,
-        ) + f"\n\n【完整台本内容】\n{combined}"
-
-        if self.verbose:
-            print(f"  [预分割清洗] {len(active_files)} 个文件, prompt {len(user_prompt)} 字符")
-
-        try:
-            response = self._api.chat(
-                messages=[
-                    {'role': 'system', 'content': SPLIT_SYSTEM_PROMPT},
-                    {'role': 'user', 'content': user_prompt},
-                ],
-                max_tokens=self.SPLIT_MAX_TOKENS,
-                temperature=0.1,
-                max_retries=max_retries,
-            )
-        except Exception as e:
-            if self.verbose:
-                print(f"  [预分割清洗] 全部尝试失败: {e}")
-            return {}
-
-        content = response.choices[0].message.content or ''
-        result = self._parse_response(content, list(active_files.keys()))
-        if result:
-            # 补全缺失的音轨
-            for name in track_files:
-                if name not in result:
-                    result[name] = []
-            if self.verbose:
-                total_lines = sum(len(v) for v in result.values())
-                print(f"  [预分割清洗] 成功: {len(result)} 个音轨, 共 {total_lines} 行台词")
-            return result
-
-        if self.verbose:
-            print(f"  [预分割清洗] 解析失败（模型 {self._api.current_model}）")
-        return {}
-
     @staticmethod
     def _number_scriptbook_lines(text: str) -> tuple[str, list[str]]:
         """给台本每行加上行号前缀，供 LLM 引用
@@ -576,7 +480,7 @@ class ScriptbookSplitter:
         """解析 LLM 返回的 JSON，校验并返回结果
 
         支持两种输出格式：
-        - V3 行号范围: {"tracks": {"name": [start, end]}}
+        - LLM 行号范围: {"tracks": {"name": [start, end]}}
         - V2/V1 全文本: {"tracks": {"name": ["line1", "line2"]}}
         """
         # 提取 JSON
@@ -611,7 +515,7 @@ class ScriptbookSplitter:
             if not isinstance(value, list):
                 continue
 
-            # ── 检测格式：V3 行号范围 vs V2/V1 全文本 ──
+            # ── 检测格式：LLM 行号范围 vs V2/V1 全文本 ──
             is_range_format = (
                 len(value) == 2
                 and all(isinstance(v, (int, float)) for v in value)
@@ -632,7 +536,7 @@ class ScriptbookSplitter:
                 continue
 
             if is_range_format and original_lines is not None:
-                # V3 格式: [start, end] → 本地提取+清洗
+                # LLM 行号范围格式: [start, end] → 本地提取+清洗
                 start, end = int(value[0]), int(value[1])
                 # 校验行号范围：越界时警告并跳过
                 if start < 1 or end < start or start > len(original_lines):

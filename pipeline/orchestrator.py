@@ -845,6 +845,14 @@ def _llm_identify_scriptbook_files(
 【非台本文件典型特征】
 - readme / 説明 / 注意事項 / 必ず読んで 等说明文档
 - クレジット / credit / cast / 声優 等演职员信息
+- 以上仅限「明确是说明/演职员信息」的文件
+
+【⚠ 仅凭文件名不得排除台本 —— 重要】
+- 文件名含「販促 / 宣伝 / プロモーション / プロモ / おまけ / 特典 / 抜粋 / サンプル / 体験版」等字样，**不能**作为排除依据：这类文件经常就是含全部分轨（トラック1~N）的正式台本。例如「販促シナリオ.pdf」完全可能包含全部音轨台词。
+- **不得臆测内容**：你只看到文件名，无法判断文件内部；不要编造或假设"宣传用/摘录/不是完整台本"这类结论。
+- 「シナリオ / 台本 / 脚本 / セリフ / script / 本編 / 台詞」是**强正向特征**，命中即优先纳入。
+- 若某文件可能覆盖多个或全部音轨，也应纳入（is_pre_split=false，必要时用 file_track_groups 描述分组），而不是排除。
+- **不确定时倾向纳入**：误纳的代价是后续可再分割/回退；误漏会导致整部作品完全没有台本参考，代价更大。
 
 【txt 优先规则】（重要，必须遵守）
 - 若同一台本同时存在 .txt 和 .pdf 两个版本（同名或内容相同），scriptbook_indices **只选择 .txt 版本**，忽略 .pdf
@@ -860,9 +868,11 @@ def _llm_identify_scriptbook_files(
 - 若识别到这类文件，用 file_track_groups 描述：格式 {{文件名: [音轨名1, 音轨名2]}}
 - 此时 is_pre_split 仍应判断为 false（因为不是每个文件恰好一个音轨），但 file_track_groups 提供精确的文件→音轨分组信息。
 - 若所有台本文件都是"一文件一音轨"（真正的预分割），则 file_track_groups 留空对象 {{}}，走 is_pre_split=true 路径。
+- 【程序行为】程序会依据 file_track_groups 对**每个文件内部做行号分割**，把内容切给组内音轨；因此组内音轨必须完整列出（漏填会导致该音轨无台本）。
 
 【PDF 台本 + 视角变体音轨】（常见形式，务必识别）
 - 常见于 PDF 台本按「トラック」分文件（如 トラック1.pdf ~ トラック7.pdf），每个 PDF 对应一个章节/トラック的场景。
+- 另一种常见形式：**只有一个 PDF，内部用「トラック1」「トラック2」…分节**（如「販促シナリオ.pdf」可能就含全部音轨台词）。这是**未分割台本**（is_pre_split=false），应纳入，而不是当成「宣传/摘录」排除。
 - 而音轨文件（LRC/MP3 名）常含**视角变体**：同一场景有多个视角，如「_主人公視点」「_他人棒視点」「_主人公集中Ver」「_他人棒集中Ver」「（おまけ）」等后缀。
 - 这类**一个 PDF 通常包含多个视角音轨的共用台词**（同一段剧情，从不同视角演绎，台词内容相同/高度重叠）。
 - 识别方法：先剥离音轨名中的视角后缀（主人公視点/他人棒視点/集中Ver/おまけ 等），找到基础场景名（如 トラック1_二人のはずが…_），再与 PDF 文件名（如 トラック1.pdf）按编号/名称匹配。
@@ -1309,12 +1319,11 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
     # ═══════════════════════════════════════════════════════════
     # 一文件多音轨路径: LLM 已返回 file_track_groups {文件名: [音轨名...]}
     # 每个台本文件内含多个音轨（如 第一章.txt → 1-1、1-2；第二章.txt → 2-1、2-2）。
-    # 方案：不做逐文件 Flash 分割（省时），而是把该文件的完整台本直接赋给文件内所有音轨，
-    # 翻译时靠 align_asr_scriptbook 的 sb 对齐自动把每行 ASR 匹配到台本对应台词。
+    # 方案：对每个文件**内部再分割**（LLM 行号范围分割），把内容切给该文件对应的音轨；
+    # 分割失败/结果不足时回退正则。与「单文件覆盖全部音轨」的标准未分割路径行为一致。
     # ═══════════════════════════════════════════════════════════
     if file_track_groups:
-        _log(f"  [台本] LLM 识别到 {len(file_track_groups)} 个多音轨台本文件，共用完整台本（靠 sb 对齐）")
-        from engines.scriptbook_cleaner import _conservative_pre_clean
+        _log(f"  [台本] LLM 识别到 {len(file_track_groups)} 个多音轨台本文件，逐文件内部再分割")
         from core.scriptbook_parser import load_scriptbook_content
         import unicodedata as _uni
 
@@ -1363,8 +1372,6 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
             if not content:
                 _log(f"  [台本·多轨] 加载失败: {_fname}")
                 continue
-            cleaned = _conservative_pre_clean(content)
-            full_lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
 
             # 把 LLM 返回的音轨名匹配到真实音轨名
             _file_tracks_real: list[str] = []
@@ -1383,13 +1390,61 @@ def _load_scriptbook(work_dir: Path, ctx: PipelineContext, track_names: list[str
                 _log(f"  [台本·多轨] {_f.name} 音轨名无法匹配真实音轨，跳过")
                 continue
 
-            # 完整台本直接赋给该文件的所有音轨（靠 sb 对齐在翻译时匹配）
+            # 逐文件内部再分割：按该文件包含的音轨做 LLM 行号范围分割
+            _sub_samples = {t: (track_samples or {}).get(t, '') for t in _file_tracks_real}
+            _part_map: dict[str, list[str]] = {}
+            try:
+                from engines.scriptbook_cleaner import ScriptbookSplitter
+                _splitter = ScriptbookSplitter(ctx.api_cfg, verbose=ctx.pr.debug_enabled)
+                _part_map, _sb_stats = _splitter.split_by_llm_line_range(
+                    _file_tracks_real, content, track_samples=_sub_samples)
+                if _sb_stats:
+                    _sb_cost = ctx.tracker.compute_cost(
+                        _sb_stats.get('hit_tokens', 0),
+                        _sb_stats.get('miss_tokens', 0),
+                        _sb_stats.get('completion_tokens', 0))
+                    ctx.tracker.record(TokenUsage(
+                        request_type='scriptbook_split',
+                        label=f'{len(_file_tracks_real)}个音轨',
+                        work_key=str(work_dir),
+                        prompt_tokens=_sb_stats.get('prompt_tokens', 0),
+                        hit_tokens=_sb_stats.get('hit_tokens', 0),
+                        miss_tokens=_sb_stats.get('miss_tokens', 0),
+                        completion_tokens=_sb_stats.get('completion_tokens', 0),
+                        reasoning_tokens=_sb_stats.get('reasoning_tokens', 0) or 0,
+                        cost=_sb_cost,
+                        elapsed=0))
+                    ctx.pr.token_inline(ctx.tracker.records[-1])
+            except Exception as _se:
+                _log(f"  [台本·多轨] {_f.name} 分割失败: {_se}，回退正则")
+                _part_map = {}
+
+            # 分割结果不足该文件音轨的一半 → 用正则补齐
+            _matched_tracks = sum(1 for t in _file_tracks_real if _part_map.get(t))
+            if _matched_tracks < len(_file_tracks_real) * 0.5:
+                from engines.scriptbook_cleaner import split_scriptbook_regex
+                _rx = split_scriptbook_regex(content, _file_tracks_real)
+                for _t in _file_tracks_real:
+                    if not _part_map.get(_t) and _rx.get(_t):
+                        _part_map[_t] = _rx[_t]
+
+            _n_lines = 0
             for _t in _file_tracks_real:
-                track_map[_t] = full_lines
-            _log(f"  [台本·多轨] {_f.name}: 完整台本 {len(full_lines)} 行，赋给 {len(_file_tracks_real)} 个音轨共用")
+                track_map[_t] = _part_map.get(_t, [])
+                _n_lines += len(track_map[_t])
+            _log(f"  [台本·多轨] {_f.name}: 内部再分割 → {len(_file_tracks_real)} 个音轨, 共 {_n_lines} 行")
+
+        # 变体轨继承主轨台本（与标准未分割路径一致）
+        import re as _re_variant
+        for name in list(track_map.keys()):
+            if not track_map[name]:
+                base = _re_variant.sub(r'[（(][^）)]*[）)]', '', name)
+                if base != name and base in track_map and track_map[base]:
+                    track_map[name] = track_map[base]
+                    _log(f"  [台本·多轨] 变体轨 {name[:40]}... 继承主轨台本 ({len(track_map[base])} 行)")
 
         total_clean = sum(len(v) for v in track_map.values())
-        _log(f"  → 多轨文件共用完整台本: {len(track_map)} 个音轨, 每音轨 {total_clean // max(len(track_map),1)} 行（靠 sb 对齐）")
+        _log(f"  → 多轨文件内部再分割: {len(track_map)} 个音轨, 共 {total_clean} 行")
 
         # 导出
         if export_scriptbook and track_map:
@@ -2097,9 +2152,14 @@ def translate_one_lrc(
     else:
         _chunks.append(list(range(len(_texts_eff))))
 
-    _all_ok = True
+    _failed_chunks: list[int] = []  # 块级重试仍失败的块
     _fr_list: list = []  # 各块 finish_reason（诊断空内容失败用）
     _last_reason_preview = ''  # 末块思维链预览（诊断用）
+    # 块级重试：单块调用失败（网络抖动 / 解析全空）时**只重试该块**，不整轨重来、
+    # 也不中断后续块。次数/退避：config.app.translate_chunk_retries(默认2) / translate_retry_delay(默认2s)。
+    _chunk_retries = max(0, int(ctx.config.get('app', {}).get('translate_chunk_retries', 2) or 0))
+    _retry_delay = float(ctx.config.get('app', {}).get('translate_retry_delay', 2.0) or 0.0)
+
     for _ci, _chunk_idx in enumerate(_chunks):
         _chunk_numbered = [numbered[i] for i in _chunk_idx]
         # 分块内 scriptbook_aligned：把原始行索引 i 映射为子块内索引 (i - 块起点)
@@ -2115,54 +2175,61 @@ def translate_one_lrc(
             _log(f"  [块 {_ci+1}/{len(_chunks)}] 行 {_chunk_idx[0]+1}-{_chunk_idx[-1]+1}，发送请求...")
         else:
             _log(f"  → 时间: {time.strftime('%H:%M:%S')}, 发送请求...")
+
+        _block_result = None
+        _block_err = ''
         call_start = time.time()
-        try:
-            result = ctx.translate_engine.translate_batch(
-                _chunk_numbered, terms=terms,
-                alias_list=alias_list,
-                worldview=worldview,
-                scriptbook_lines=scriptbook_lines,
-                scriptbook_aligned=_chunk_sb,
-                skip_hallucination_check=True,
-            )
-        except Exception as _tx_e:
-            # API 调用抛异常（网络/模型/超时）：同样收集到重试队列，待其他音轨完成后重试
-            _tx_reason = f"[翻译调用异常] {_tx_e}"
-            _log(f"  [异常翻译] {lrc_path.name}: {_tx_reason}", console=True)
-            _max_r = getattr(ctx, 'max_failed_retries', 3)
-            _log(f"  [异常翻译] 标记为翻译失败，不写入文件，待其他音轨全部完成后重试"
-                 f"（已尝试 {attempts} 次，最多重试 {_max_r} 次）")
-            _enqueue_failed_track(ctx, {
-                'lrc_path': lrc_path,
-                'label': label,
-                'wkey': wkey,
-                'terms': terms,
-                'alias_list': alias_list,
-                'worldview': worldview,
-                'scriptbook_lines': scriptbook_lines,
-                'attempts': attempts,
-            }, _tx_reason)
-            return False
+        for _try in range(_chunk_retries + 1):
+            call_start = time.time()
+            try:
+                _block_result = ctx.translate_engine.translate_batch(
+                    _chunk_numbered, terms=terms,
+                    alias_list=alias_list,
+                    worldview=worldview,
+                    scriptbook_lines=scriptbook_lines,
+                    scriptbook_aligned=_chunk_sb,
+                    skip_hallucination_check=True,
+                )
+                _block_err = ''
+            except Exception as _tx_e:
+                _block_result = None
+                _block_err = f"[翻译调用异常] {_tx_e}"
+
+            if _block_result is not None:
+                try:
+                    _fr_list.append(_block_result.get('finish_reason'))
+                    _last_reason_preview = _block_result.get('reasoning_preview', '') or ''
+                except Exception:
+                    pass
+                # 累加 token / 费用统计（含失败尝试的消耗）
+                _total_hit += _block_result.get('hit_tokens', 0)
+                _total_miss += _block_result.get('miss_tokens', 0)
+                _total_comp += _block_result.get('completion_tokens', 0)
+                _total_cost += _block_result.get('cost', 0.0)
+                _total_prompt += _block_result.get('prompt_tokens', 0) or 0
+                _total_reasoning += _block_result.get('reasoning_tokens', 0) or 0
+                # 解析全空（且块内 >=5 行）同样视为失败，纳入块级重试
+                if _block_result.get('parsed_count', 0) == 0 and len(_chunk_idx) >= 5:
+                    _block_err = "[JSON解析] 整块解析失败（全空）"
+                else:
+                    break  # 成功
+
+            if _try < _chunk_retries:
+                _log(f"  [块 {_ci+1}/{len(_chunks)}] 第 {_try+1} 次失败: {_block_err}，"
+                     f"{_retry_delay * (2 ** _try):.0f}s 后重试", console=True)
+                if _retry_delay > 0:
+                    time.sleep(_retry_delay * (2 ** _try))
+            else:
+                break
+
         call_elapsed = time.time() - call_start
-        try:
-            _fr_list.append(result.get('finish_reason'))
-            _last_reason_preview = result.get('reasoning_preview', '') or ''
-        except Exception:
-            pass
+        if _block_err:
+            # 块级重试耗尽：记录失败块，继续后续块（不整轨中断）
+            _failed_chunks.append(_ci)
+            _log(f"  [块 {_ci+1}/{len(_chunks)}] 最终失败: {_block_err}", console=True)
+            continue
 
-        translated_batch = result.get('translated_lines', [])
-        # 若分块翻译失败（全空/异常），记 _all_ok=False，仍继续后续块
-        _parsed_count_block = result.get('parsed_count', 0)
-        if _parsed_count_block == 0 and len(_chunk_idx) >= 5:
-            _all_ok = False
-        # 累加 token / 费用统计
-        _total_hit += result.get('hit_tokens', 0)
-        _total_miss += result.get('miss_tokens', 0)
-        _total_comp += result.get('completion_tokens', 0)
-        _total_cost += result.get('cost', 0.0)
-        _total_prompt += result.get('prompt_tokens', 0) or 0
-        _total_reasoning += result.get('reasoning_tokens', 0) or 0
-
+        translated_batch = _block_result.get('translated_lines', [])
         # 块内解析出的行数可能少于块行数，补齐为空
         while len(translated_batch) < len(_chunk_idx):
             translated_batch.append('')
@@ -2180,22 +2247,19 @@ def translate_one_lrc(
     call_elapsed_total = time.time() - _chunk_start_t
 
     # ═══════════════════════════════════════════════════════════
-    # 异常翻译判定：整文件翻译时仅当解析失败（parsed_count==0）判定失败；
-    # 分块翻译时，若有任一整块解析失败（全空）则判定失败。
-    # 判定为失败：不写文件、不入统计，加入重试队列，
+    # 异常翻译判定：块级重试（config.app.translate_chunk_retries）后仍有块失败
+    # 才判定整轨失败。判定为失败：不写文件、不入统计，加入音轨级重试队列，
     # 待其他音轨全部完成后统一重试（最多 max_failed_retries 次）。
     # 主线程只打印一行简洁失败提示（详细 JSON 诊断已在 worker 日志输出）。
     # ═══════════════════════════════════════════════════════════
     _n_input = len(_texts_eff)
     _abnormal_reason = ''
-    if _use_chunk:
-        if not _all_ok:
-            _abnormal_reason = f"[分块翻译] 存在整块解析失败（原文{_n_input}行）"
-    elif _n_input >= 5:
-        # 整文件翻译：取最后一块的 parsed_count（无分块时即唯一块）
-        _parsed_count = result.get('parsed_count', 0)
-        if _parsed_count == 0:
-            _abnormal_reason = f"[JSON解析] 失败！原文{_n_input}行全部留空"
+    if _failed_chunks:
+        if _use_chunk:
+            _abnormal_reason = (f"[分块翻译] {len(_failed_chunks)}/{len(_chunks)} 块"
+                                f"块级重试后仍失败（原文{_n_input}行）")
+        else:
+            _abnormal_reason = f"[翻译调用] 块级重试后仍失败（原文{_n_input}行）"
     if _abnormal_reason:
         _max_r = getattr(ctx, 'max_failed_retries', 3)
         _log(f"  [异常翻译] {lrc_path.name}: {_abnormal_reason}", console=True)
@@ -2245,13 +2309,13 @@ def translate_one_lrc(
         elapsed = call_elapsed_total
         reasoning = _total_reasoning
     else:
-        hit = result.get('hit_tokens', 0)
-        miss = result.get('miss_tokens', 0)
-        prompt = result.get('prompt_tokens', hit + miss)
-        comp = result.get('completion_tokens', 0)
-        elapsed = result.get('elapsed', call_elapsed)
-        cost = result.get('cost', 0)
-        reasoning = result.get('reasoning_tokens', 0) or 0
+        hit = _block_result.get('hit_tokens', 0)
+        miss = _block_result.get('miss_tokens', 0)
+        prompt = _block_result.get('prompt_tokens', hit + miss)
+        comp = _block_result.get('completion_tokens', 0)
+        elapsed = _block_result.get('elapsed', call_elapsed)
+        cost = _block_result.get('cost', 0)
+        reasoning = _block_result.get('reasoning_tokens', 0) or 0
 
     # 统一 token 追踪：记录 + 打印
     # work_key 使用 RJ 作品根目录，确保同一作品的翻译/台本/世界观合并统计
@@ -2333,11 +2397,21 @@ def translate_one_lrc(
             ctx.stats["skipped"] += 1
         return False
 
-    # 写回翻译结果（通用字幕格式；过滤空行，只保留非空歌词行）
-    from io_adapter.lrc_handler import write_subtitle_file_nonempty
-    write_subtitle_file_nonempty(sub_file, translated_texts, lrc_path)
+    # 写回翻译结果：**保留日文原文件结构**（空时间轴行原样保留，中文填入对应非空行）。
+    # 说明：只有「发送给 LLM」时过滤空行（省 token）；写回不再删空行，
+    # 使 .lrc 与 .ja.lrc 逐行/时间轴一一对齐，便于对照校对。
+    _full_texts: list[str] = []
+    _ni = 0
+    for _t in texts:
+        if _t and _t.strip():
+            _full_texts.append(translated_texts[_ni] if _ni < len(translated_texts) else '')
+            _ni += 1
+        else:
+            _full_texts.append('')
+    write_subtitle_file(sub_file, _full_texts, lrc_path)
     _log(f"\n[写入] -> {abs_path}")
-    _log(f"  -> 翻译完成: {len(translated_texts)} 行中文（已去除空行）")
+    _log(f"  -> 翻译完成: {sum(1 for t in _full_texts if t)} 行中文, "
+         f"共 {len(_full_texts)} 行（保留原结构）")
     with ctx.thread_lock:
         ctx.stats['translated'] += 1
 
@@ -2673,6 +2747,272 @@ def _preflight_api_check(ctx: PipelineContext) -> None:
     sys.exit(1)
 
 
+# ==================== 字幕重排（长句拆分） ====================
+
+def _maybe_resegment_subtitles(ctx: PipelineContext, lrc_files: list[Path]) -> None:
+    """翻译前用 raw/<stem>.words.jsonl 把过长的 .lrc 行拆分。
+
+    频率：**一个作品一次请求**（作品内所有文件的过长句合并发送）；
+    重试：内联重试（默认 4 次）+ 失败文件队列重试。
+    """
+    cfg = (ctx.config.get('app', {}) or {}).get('resegment', {}) or {}
+    if not cfg.get('enabled', True):
+        return
+
+    max_duration = float(cfg.get('max_duration', 8.0) or 8.0)
+    max_chars = int(cfg.get('max_chars', 40) or 40)
+    _app = ctx.config.get('app', {}) or {}
+    # 请求频率降低 → 单次重试次数调高
+    # 不做内联退避重试：失败的文件在全部跑完后集中重试（最多 failed_rounds 轮）
+    retries = 0
+    retry_delay = 0.0
+    max_rounds = max(1, int(cfg.get('failed_rounds', 3) or 1))
+    max_prompt_chars = int(cfg.get('max_prompt_chars', 20000) or 0)
+    tracks_per_request = max(1, int(cfg.get('tracks_per_request', 1) or 1))
+
+    from engines.resegment import resegment_work, find_words_path
+    from io_adapter.lrc_handler import detect_lrc_language
+
+    targets: list[Path] = []
+    for f in lrc_files:
+        if f.suffix != '.lrc' or f.name.endswith('.ja.lrc'):
+            continue
+        try:
+            if detect_lrc_language(f) == 'chinese':
+                continue
+        except Exception:
+            pass
+        if find_words_path(f) is not None:
+            targets.append(f)
+
+    if not targets:
+        _log("[重排] 未发现可用的 words.jsonl，跳过长句拆分")
+        return
+
+    _sep("第 1.5 步: 字幕重排（长句拆分）")
+    _log(f"[重排] 待检查: {len(targets)} 个文件 | 阈值: 时长≤{max_duration:g}s 且 字数≤{max_chars}")
+
+    def _make_cb(work_root: Path):
+        def _cb(kind, stats, count):
+            if not stats:
+                return
+            try:
+                cost = ctx.tracker.compute_cost(
+                    stats.get('hit_tokens', 0),
+                    stats.get('miss_tokens', 0),
+                    stats.get('completion_tokens', 0),
+                )
+                usage = TokenUsage(
+                    request_type=kind,
+                    label=work_root.name,
+                    work_key=str(work_root),
+                    prompt_tokens=stats.get('prompt_tokens', 0),
+                    hit_tokens=stats.get('hit_tokens', 0),
+                    miss_tokens=stats.get('miss_tokens', 0),
+                    completion_tokens=stats.get('completion_tokens', 0),
+                    reasoning_tokens=stats.get('reasoning_tokens', 0) or 0,
+                    cost=cost,
+                    elapsed=float(stats.get('elapsed', 0) or 0),
+                )
+                with ctx.thread_lock:
+                    ctx.tracker.record(usage)
+                    ctx.pr.token_inline(usage)
+            except Exception:
+                pass
+        return _cb
+
+    def _make_log(work_root: Path):
+        def _l(msg):
+            with ctx.thread_lock:
+                _log(f"  [重排] {work_root.name}: {msg}")
+        return _l
+
+    from concurrent.futures import ThreadPoolExecutor as _Pool, as_completed as _as_completed
+    _parallel = max(1, int(cfg.get(
+        'parallel', getattr(ctx, 'translation_parallel', 1)) or 1))
+
+    def _work_root(f: Path) -> Path:
+        try:
+            r, _ = find_rj_work_root(f)
+            return r or f.parent
+        except Exception:
+            return f.parent
+
+    def _group(files: list[Path]):
+        g: dict[Path, list[Path]] = {}
+        for f in files:
+            g.setdefault(_work_root(f), []).append(f)
+        return g
+
+    def _run_pass(files: list[Path]):
+        """并发单位 = 音轨组（每 tracks_per_request 个音轨一组，一组一次请求）。
+
+        不再以「作品」为并发单位：同一作品的多组也会并发出去。
+        """
+        changed, failed = 0, []
+        groups = _group(files)
+        tasks: list[tuple[Path, list[Path]]] = []
+        step = max(1, tracks_per_request)
+        for wroot, group in groups.items():
+            for i in range(0, len(group), step):
+                tasks.append((wroot, group[i:i + step]))
+
+        with _Pool(max_workers=_parallel) as pool:
+            futs = {}
+            for wroot, chunk in tasks:
+                futs[pool.submit(
+                    resegment_work, chunk, ctx.translate_engine,
+                    max_duration=max_duration, max_chars=max_chars,
+                    retries=retries, retry_delay=retry_delay,
+                    max_prompt_chars=max_prompt_chars,
+                    tracks_per_request=len(chunk),
+                    tokens_cb=_make_cb(wroot),
+                    log=_make_log(wroot),
+                )] = (wroot, chunk)
+            for fut in _as_completed(futs):
+                wroot, chunk = futs[fut]
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    _log(f"  [重排] {wroot.name} 异常: {e}")
+                    failed.extend(chunk)
+                    continue
+                res = r.get('results') or {}
+                for f in chunk:
+                    fr = res.get(f)
+                    if not fr:
+                        continue
+                    if fr.get('skipped'):
+                        _log(f"  [重排] {f.name}: 跳过（{fr['skipped']}）")
+                    elif fr.get('failed'):
+                        _log(f"  [重排] {f.name}: 未得到可读切分（保持原样）")
+                    elif fr.get('split'):
+                        changed += 1
+                        _log(f"  [重排] {f.name}: {fr['long']}/{fr['segments']} 条过长 → 拆为 {fr['split']} 条")
+                failed.extend(r.get('failed_files') or [])
+        return changed, failed
+
+    total_changed = 0
+    changed, failed = _run_pass(targets)
+    total_changed += changed
+    rounds = 0
+    while failed and rounds < max_rounds:
+        rounds += 1
+        _log(f"[重排] 集中重试第 {rounds}/{max_rounds} 轮: {len(failed)} 个失败文件")
+        changed, failed = _run_pass(failed)
+        total_changed += changed
+    if failed:
+        _log("[重排] 仍失败（保持原样，不拆分）: " + ', '.join(x.name for x in failed[:8]))
+    _log(f"[重排] 完成: {total_changed} 个文件发生拆分")
+    _log()
+
+
+# ==================== 音轨名称翻译（只写 JSON，不改文件名） ====================
+
+def _maybe_translate_track_names(ctx: PipelineContext, root: Path) -> None:
+    """翻译完成后，把每个作品的音轨名译成中文，写入 <工作根>/_track_names.json。"""
+    app_cfg = ctx.config.get('app', {}) or {}
+    if not app_cfg.get('translate_track_names', True):
+        return
+
+    from engines.track_titles import (
+        collect_track_stems, translate_names, write_track_names)
+
+    audio_exts = {str(e).lower() for e in (app_cfg.get('audio_suffixes') or [
+        '.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.wma',
+        '.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'])}
+    sub_exts = {'.lrc', '.srt', '.vtt'}
+    excl = {'raw', '_split_tracks', 'translate_logs', 'Hde_G_bug_lrc_collection'}
+
+    roots: set = set()
+    try:
+        files = sorted(root.rglob('*'))
+    except Exception:
+        files = []
+    for p in files:
+        if not p.is_file():
+            continue
+        if any(part in excl for part in p.parts):
+            continue
+        ext = p.suffix.lower()
+        is_audio = ext in audio_exts
+        is_sub = ext in sub_exts and not p.name.endswith('.ja' + ext)
+        if not (is_audio or is_sub):
+            continue
+        rj_root, _ = find_rj_work_root(p)
+        roots.add(rj_root or p.parent)
+
+    groups: dict[Path, list] = {}
+    for wr in sorted(roots):
+        stems = collect_track_stems(wr, audio_exts, sub_exts)
+        if stems:
+            groups[wr] = stems
+    if not groups:
+        _log("[标题] 未找到音轨，跳过")
+        return
+
+    _sep("第 5.5 步: 翻译作品名 / 音轨名")
+    _log(f"[标题] 作品数: {len(groups)}")
+
+    def _make_log(wroot: Path):
+        def _l(msg):
+            with ctx.thread_lock:
+                _log(f"  [标题] {wroot.name}: {msg}")
+        return _l
+
+    def _work(item):
+        wroot, stems = item
+        stats = None
+        try:
+            # pipeline 自动执行：作品名留空，只翻译音轨名
+            data, stats = translate_names(
+                ctx.translate_engine, '', stems, log=_make_log(wroot))
+        except Exception as e:
+            data = {'work_title': wroot.name, 'work_title_original': wroot.name,
+                    'tracks': {s: s for s in stems}}
+            _make_log(wroot)(f"翻译失败，回退原名：{e}")
+        path = write_track_names(wroot, data)
+        if stats:
+            try:
+                cost = ctx.tracker.compute_cost(
+                    stats.get('hit_tokens', 0),
+                    stats.get('miss_tokens', 0),
+                    stats.get('completion_tokens', 0))
+                usage = TokenUsage(
+                    request_type='track_names',
+                    label=wroot.name,
+                    work_key=str(wroot),
+                    prompt_tokens=stats.get('prompt_tokens', 0),
+                    hit_tokens=stats.get('hit_tokens', 0),
+                    miss_tokens=stats.get('miss_tokens', 0),
+                    completion_tokens=stats.get('completion_tokens', 0),
+                    reasoning_tokens=stats.get('reasoning_tokens', 0) or 0,
+                    cost=cost,
+                    elapsed=float(stats.get('elapsed', 0) or 0),
+                )
+                with ctx.thread_lock:
+                    ctx.tracker.record(usage)
+                    ctx.pr.token_inline(usage)
+            except Exception:
+                pass
+        return wroot, path, len(stems)
+
+    from concurrent.futures import ThreadPoolExecutor as _Pool, as_completed as _as_completed
+    parallel = max(1, int(getattr(ctx, 'translation_parallel', 1) or 1))
+    done = 0
+    with _Pool(max_workers=parallel) as pool:
+        futs = [pool.submit(_work, it) for it in groups.items()]
+        for fut in _as_completed(futs):
+            try:
+                wroot, path, n = fut.result()
+                done += 1
+                _log(f"  [标题] {wroot.name}: {n} 条 → {path.name}")
+            except Exception as e:
+                _log(f"  [标题] 失败: {e}")
+    _log(f"[标题] 完成: {done}/{len(groups)} 个作品")
+    _log()
+
+
 def run_pipeline(
     root: Path,
     *,
@@ -2779,6 +3119,9 @@ def run_pipeline(
         if ja_lrc_files:
             _log(f"  (有 {len(ja_lrc_files)} 个 .ja.lrc 留档文件，但无对应 .lrc)")
         return ctx.stats
+
+    # ──── 第 1.5 步: 字幕重排（长句拆分，可选；时机=预检之后、台本分析之前）──
+    _maybe_resegment_subtitles(ctx, lrc_files)
 
     # ──── 文本分析（仅 debug 模式）──
     if ctx.pr.debug_enabled:
@@ -3566,6 +3909,9 @@ def run_pipeline(
                 _log(f"  第一轮出现异常翻译的音轨: {ctx.abnormal_count} 个")
                 for _name, _rst in ctx.retry_results.items():
                     _log(f"    - {_name}: {_rst}")
+
+    # ──── 第 5.5 步: 翻译作品名 / 音轨名（只写 JSON，不改文件名）───
+    _maybe_translate_track_names(ctx, root)
 
     # ──── 第 6 步: 打印报告 ────
     _sep("处理完成")

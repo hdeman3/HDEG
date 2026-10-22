@@ -448,6 +448,7 @@ class OpenAICompatEngine:
         *,
         max_retries: int = None,
         override_gen_params: dict | None = None,
+        log_io: bool = True,
     ) -> tuple[str, dict]:
         """
         调用 API 并返回结果 + token 统计（委托统一 APIClient，自带模型轮换/参数剔除）
@@ -475,7 +476,7 @@ class OpenAICompatEngine:
             gen_params.update(override_gen_params)
 
         # DEBUG: 只打印待翻译的日文原文（跳过格式说明和台本参考）
-        if self.verbose:
+        if self.verbose and log_io:
             lines = user_prompt.split('\n')
             content_start = 0
             for i, l in enumerate(lines):
@@ -528,7 +529,7 @@ class OpenAICompatEngine:
                flush=True)
 
         # DEBUG: 尝试提取翻译结果供预览
-        if self.verbose:
+        if self.verbose and log_io:
             parsed = self._extract_json_array(content)
             if parsed:
                 preview = []

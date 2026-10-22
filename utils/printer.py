@@ -146,6 +146,8 @@ class Printer:
         'scriptbook_split': '台本分割',
         'worldview': '世界观',
         'terms': '术语',
+        'resegment': '字幕重排',
+        'track_names': '标题',
     }
 
     def token(self, type_cn: str, label: str, elapsed: float,

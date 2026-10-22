@@ -754,25 +754,32 @@ class APIClient:
 
     @staticmethod
     def _looks_like_quota_exhausted(e: Exception) -> bool:
-        """错误是否源于「配额/用量耗尽」（应切换到下一个模型继续）
+        """判断是否源于「配额/用量」的确定性错误（应切换下一个模型继续）。
 
-        识别策略：优先看 HTTP 状态码（429/402/403），其次按错误消息关键词。
-        覆盖 OpenAI、Anthropic、OpenCode Go/Zen、DeepSeek、各家 OpenAI 兼容网关的常见配额耗尽响应。
+        识别策略：优先看 HTTP 状态码（429/402/403），否则看错误消息关键词。
+        OpenAI、Anthropic、OpenCode Go/Zen、DeepSeek 等厂商 OpenAI 兼容层返回的常见文案都应命中。
         """
+        msg = str(e).lower()
+        # 网络/连接类错误不是配额问题（应走退避重试，而非切模型/放弃）
+        _NET_KW = (
+            'proxyerror', 'connection broken', 'max retries exceeded',
+            'connection aborted', 'connection reset', 'connection refused',
+            'remotedisconnected', 'remote end closed', 'timed out', 'timeout',
+            'sslerror', 'eof occurred', 'name resolution', 'name or service not known',
+            'temporary failure', 'bad gateway', 'gateway timeout',
+        )
+        if any(k in msg for k in _NET_KW):
+            return False
         status = getattr(e, 'status_code', None)
         if status in (429, 402, 403):
             return True
-        msg = str(e).lower()
         _QUOTA_KW = (
             'rate limit', 'rate_limit', 'rate-limit',
             'quota', 'insufficient_quota', 'usage limit', 'usage_limit',
-            'limit reached', 'exceeded', 'exhausted',
-            'too many requests', 'too_many_requests',
+            'limit reached', 'too many requests', 'too_many_requests',
             'credit', 'balance', 'insufficient',
             'permission', 'forbidden', 'not allowed',
-            'gone', 'gone quota',
             'plan', 'subscription',
-            'no longer', 'unavailable',
         )
         for kw in _QUOTA_KW:
             if kw in msg:

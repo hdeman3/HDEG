@@ -61,6 +61,8 @@ def detect_stage(messages: list, max_tokens: int = 0) -> str:
         return 'split'
     if 'body_y_max' in user or ('reading_order' in user and 'col_gap' in user):
         return 'pdf_layout'
+    if '【音轨名列表】' in user:
+        return 'track_names'
     if '音声作品的分析专家' in system:
         return 'worldview'
     if '角色语言学和ASR纠错' in system:
@@ -145,6 +147,12 @@ def synthesize(stage: str, messages: list) -> str:
         }, ensure_ascii=False)
     if stage in ('worldview', 'terms_role', 'terms_dict'):
         return json.dumps({}, ensure_ascii=False)
+    if stage == 'track_names':
+        user = _messages_text(messages, 'user')
+        names = {}
+        for m in re.finditer(r'^\s*(\d+): (.*)$', user, re.M):
+            names[m.group(1)] = m.group(2)
+        return json.dumps({'names': names}, ensure_ascii=False)
     if stage in ('translate', 'polish'):
         user = _messages_text(messages, 'user')
         n = len(_LINES_RE.findall(extract_asr_block(user)))

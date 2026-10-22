@@ -96,6 +96,7 @@ def write_config(tmp_path: Path, base_url: str) -> Path:
             'delay_translate_to_offpeak': False,
             'print_worker_detail': False,
             'debug': False,
+            'translate_track_names': False,
         },
         'network': {'clear_proxy_on_startup': True},
         'pricing': {'hit_per_1m': 0.02, 'miss_per_1m': 1, 'completion_per_1m': 2},

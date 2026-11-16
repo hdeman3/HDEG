@@ -4,6 +4,8 @@
 
 `Python` · `Faster-Whisper` · `PyMuPDF` · `pyopenjtalk` · 多厂商 LLM · `PyInstaller`
 
+开源地址：<https://github.com/hdeman3/HDEG>
+
 ---
 
 ## 一、使用说明

@@ -22,7 +22,7 @@ import re as _re_fs
 def extract_main_rj_number(folder_name: str) -> str | None:
     """从文件夹名提取主 RJ 号（不含子编号）
 
-    例如: "RJ00000000_030" → "RJ00000000"
+    例如: "RJ01048637_030" → "RJ01048637"
     """
     m = _re_fs.search(r'(RJ\d{6,})', folder_name, _re_fs.IGNORECASE)
     if m:

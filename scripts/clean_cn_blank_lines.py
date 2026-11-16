@@ -17,10 +17,10 @@
 
 用法::
 
-    python scripts/clean_cn_blank_lines.py "/path/to/library"
-    python scripts/clean_cn_blank_lines.py "/path/to/library" --apply
-    python scripts/clean_cn_blank_lines.py "/path/to/library/RJ01745725" --apply --no-backup
-    python scripts/clean_cn_blank_lines.py "/path/to/library" --exts lrc,srt,vtt
+    python scripts/clean_cn_blank_lines.py "E:/奥术"
+    python scripts/clean_cn_blank_lines.py "E:/奥术" --apply
+    python scripts/clean_cn_blank_lines.py "E:/奥术/RJ01745725" --apply --no-backup
+    python scripts/clean_cn_blank_lines.py "E:/奥术" --exts lrc,srt,vtt
 """
 
 from __future__ import annotations

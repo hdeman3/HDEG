@@ -591,7 +591,7 @@ class APIClient:
         if timeout < 30:
             timeout = 120.0
         if self.verbose:
-            print(f"  [API初始化] base_url={base_url}, timeout={timeout}s, key={api_key[:12]}...", flush=True)
+            print(f"  [API初始化] base_url={base_url}, timeout={timeout}s, key=***", flush=True)
         self._client = OpenAI(
             base_url=base_url,
             api_key=api_key,

@@ -562,9 +562,8 @@ def copy_config():
     # 抹去 API key（含 presets 内各服务商的 key）
     if "api" in config:
         if "key" in config["api"]:
-            original_key = config["api"]["key"]
             config["api"]["key"] = ""
-            print(f"  抹去 API key: {str(original_key)[:10]}... -> (空)")
+            print("  抹去 API key -> (空)")
         # 预设中的 key 也需清空
         presets = config["api"].get("presets")
         if isinstance(presets, dict):

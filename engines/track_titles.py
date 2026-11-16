@@ -11,7 +11,7 @@
       "work_title": "中文作品名（自动执行时为空）",
       "work_title_original": "原作品名（自动执行时为空）",
       "tracks": {
-        "01. 元ギャル人妻…": "01. 原辣妹人妻…",
+        "01. 示例标题…": "01. 示例译文…",
         "Tr2_…": "Tr2_…"
       }
     }
@@ -25,7 +25,7 @@ Python::
 
     from engines.track_titles import translate_titles
     data = translate_titles(
-        'RJ01681589 元ギャル人妻 …',      # 作品名
+        'RJ000000 示例作品 …',      # 作品名
         ['01. 凌晨3点…', 'Tr2_…'],        # 音轨名列表
         config_path='config.json',        # 可选
     )
@@ -43,7 +43,7 @@ CLI（参数形式）::
 
 CLI（按目录自动收集音轨名）::
 
-    python -m engines.track_titles "D:/works/RJ01681589" [--out-dir DIR]
+    python -m engines.track_titles "/path/to/work" [--out-dir DIR]
 
 结果始终以 JSON 打印到 stdout；日志走 stderr（`--stdin` 模式 stdout 保持纯 JSON）。
 可选 `--json-out 文件` / `--out-dir 目录`（后者写 `<dir>/_track_names.json`）。
@@ -58,7 +58,7 @@ from pathlib import Path
 
 NAMES_SYSTEM_PROMPT = (
     '你是音声作品标题翻译助手。把日文作品名与音轨名翻译成自然、简洁的中文标题。'
-    '保留原有编号/前缀（如 RJ01681589、01.、Tr1_、#1、【…】）与专有名词设定；'
+    '保留原有编号/前缀（如 RJ000000、01.、Tr1_、#1、【…】）与专有名词设定；'
     '编号/前缀不翻译，不要增删编号，不要输出任何解释。只输出 JSON。'
 )
 
@@ -104,7 +104,7 @@ def _build_user_prompt(work_title: str, stems: list[str],
     if translate_work_title and work_title:
         lines += [
             '【输出】仅 JSON：{"work_title": "中文作品名", "names": {"0": "中文标题", "1": "..."}}',
-            '  作品名保留开头的 RJ 编号（如 RJ01681589），只翻译其后的标题部分；',
+            '  作品名保留开头的 RJ 编号（如 RJ000000），只翻译其后的标题部分；',
             '  每个音轨编号都必须出现；无法翻译或不需翻译时填原样。',
         ]
     else:

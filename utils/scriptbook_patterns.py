@@ -13,9 +13,8 @@ SCRIPTBOOK_KEYWORDS = [
     '台本', 'だいほん', 'だい本', 'ダイホン', 'script', '台本付き',
     '仮台本', 'かり台本', '本編', 'ほんぺん',
     'セリフ初稿', 'せりふしょこう', 'シナリオ', 'しなりお',
-    '演技指定', 'えんぎしてい', '射精タイミング', '全章',
+    '演技指定', 'えんぎしてい', '全章',
     'track', 'トラック', 'RJ', '音声作品', 'シチュエーション',
-    '射精箇所',  # 射精位置标注
 ]
 
 SCRIPTBOOK_EXTS = {'.txt', '.pdf'}
@@ -23,7 +22,6 @@ SCRIPTBOOK_EXTS = {'.txt', '.pdf'}
 NON_SCRIPTBOOK_KEYWORDS = [
     'finishtime', 'finish_time', 'フィニッシュタイム',
     'クレジット', 'credit',
-    'お射精メモ', '射精メモ',
     'readme', 'read me', 'read_me',
     '説明', '説明書',
     '特典', 'bonus',

@@ -6,13 +6,17 @@
     - raw/words.jsonl（词级时间戳：每行一个原始段 {start,end,text,words[{start,end,word}]}，单位 ms）
 
 规则:
-    - 若某条字幕 时长 > max_duration 或 字数 > max_chars → 视为过长；
+    - **字数是硬约束，时长是软约束**：`chars > max_chars` 必须拆；
+      `speech > max_duration` 只作为拆分倾向，不会为了压时长而切进词内；
+    - **短句不拆**：字数 < _MIN_SPLIT_CHARS 时一律保持原样（跨度异常属于 ASR 时间戳问题）；
     - **合法切点由本地计算**：分词器（fugashi）+ 标点 + 停顿，且必须落在词素边界，
       绝不允许切进词内（「主|人」「好|きな」）；分级 S(标点) > P(停顿) > C(小节结束)；
-    - 把「文本 + 词 token + 合法切点 + 上轮违规」发给 LLM，由 LLM 从合法切点中选；
-    - 本地校验 LLM 结果（切点合法、无碎片、不超限），不合规就**带原因重问**；
-      删除“删了也不超限”的多余切点（能少切就少切）；
-    - **LLM 未给出合规切点（失败/违规）→ 该条保持原样，本地不做拆分**；
+    - W（弱边界）只在字数超限时暴露；G（长静音）只作为字数的最后兜底，
+      且必须落在词素边界、通过语法校验、两侧各 ≥ _MIN_GAP_FRAG_CHARS 字；
+    - 把「文本 + 词 token + 合法切点 + 上下文」发给 LLM，由 LLM 从合法切点中选；
+    - 本地校验 LLM 结果（切点合法、无碎片、不超字数），不合规时由**本地求解器兜底**，
+      避免模型偷懒返回空结果导致漏拆；删除多余切点（能少切就少切）；
+    - 网络/请求失败 → 该条保持原样，交给上层重试；
     - 重建子条时只在静音 ≥ 0.8s 处插入清屏行，避免碎片空行；
     - 写回同一个 .lrc（保留原有清屏空行与元数据行），并备份 .bak。
 
@@ -144,17 +148,50 @@ def _text_len(s: str) -> int:
     return len(re.sub(r'\s', '', s or ''))
 
 
-def is_too_long(cue: dict, max_duration: float, max_chars: int) -> bool:
-    dur = (cue['end'] - cue['start']) / 1000
-    return dur > max_duration or _text_len(cue['text']) > max_chars
+def _speech_ms(tokens) -> int:
+    """有效语音时长：逐词累加，单词语音按 _WORD_CAP_MS 截断，静音不计。"""
+    total = 0
+    for t in tokens or []:
+        try:
+            d = int(t.get('end', 0)) - int(t.get('start', 0))
+        except Exception:
+            d = 0
+        if d > 0:
+            total += min(d, _WORD_CAP_MS)
+    return total
+
+
+def is_too_long(cue: dict, max_duration: float, max_chars: int,
+                tokens=None) -> bool:
+    """字数超限必须拆；时长超限只是拆分倾向，短句一律不拆。"""
+    chars = _text_len(cue.get('text'))
+    if chars <= 0:
+        return False
+    if chars > max_chars:
+        return True
+    if chars < _MIN_SPLIT_CHARS:
+        return False
+    if tokens is not None:
+        dur = _speech_ms(tokens) / 1000.0
+    else:
+        dur = (cue['end'] - cue['start']) / 1000
+    return dur > max_duration + _DUR_OVER_TOLERANCE
 
 
 # ==================== 合法切点（分词 + 标点 + 停顿） ====================
 
 _GAP_SAFE_MS = 300          # 明显停顿：间隔 ≥ 该值（ms）
-_GAP_HARD_MS = 800          # 长静音（可作为兜底切点，允许落在词内）
+_GAP_HARD_MS = 800          # 长静音（仅字数兜底时启用，且必须落在词素边界）
 _MIN_DURATION_MS = 600      # 每段最少语音时长（ms）
 _CLEAR_GAP_MS = 800         # 静音 ≥ 该值才插入清屏行
+_MIN_SPLIT_CHARS = 6        # 低于该字数一律不拆（时长异常视为对齐问题）
+_MIN_FRAG_CHARS = 2         # 任意片段的最短字数
+_MIN_GAP_FRAG_CHARS = 3     # G 切点两侧各自的最短字数
+_WORD_CAP_MS = 1200         # 单词语音时长上限（抑制 ASR 漂移）
+_CUT_COST = 1000.0          # 本地求解：每多一段的成本
+_DUR_OVER_TOLERANCE = 0.5   # 时长软约束容忍量（秒）
+_DUR_OVER_WEIGHT = 1000.0   # 每秒时长溢出成本
+_CHAR_OVER_WEIGHT = 2000.0  # 每字字数溢出成本
 
 # 可作为「新段开头」的自立词性（助词/助动词/接尾/接头/标点一律不行）
 _CONTENT_POS1 = {'名詞', '代名詞', '動詞', '形容詞', '形状詞', '副詞',
@@ -268,6 +305,33 @@ def _is_clause_left(left: dict) -> bool:
     return left.get('pos1') == '助詞' and left.get('pos2') in ('接続助詞', '終助詞')
 
 
+def _morph_token_maps(tokens: list[dict]):
+    """返回 (morphemes, start_tok, end_tok)。
+
+    start_tok[i] 表示从 token i 开始的词素；end_tok[i] 表示在 token i 结束的词素。
+    两者都没有的 i 就是「词素内部」，不能作为切点。分词器不可用时 morphemes 为 None。
+    """
+    text = ''.join(t.get('word', '') for t in tokens)
+    ms = _morphemes(text)
+    start_tok: dict[int, dict] = {}
+    end_tok: dict[int, dict] = {}
+    if ms is None:
+        return None, start_tok, end_tok
+    tok_start: dict[int, int] = {}
+    p = 0
+    for i, t in enumerate(tokens):
+        tok_start[p] = i
+        p += len(t.get('word', ''))
+    for m in ms:
+        si = tok_start.get(m['start'])
+        ei = tok_start.get(m['end'])
+        if si is not None:
+            start_tok[si] = m
+        if ei is not None:
+            end_tok[ei] = m
+    return ms, start_tok, end_tok
+
+
 def _legal_boundaries(tokens: list[dict]) -> dict[int, str]:
     """返回 {token_index: 'S'|'P'|'C'} 可读切点。
 
@@ -281,24 +345,7 @@ def _legal_boundaries(tokens: list[dict]) -> dict[int, str]:
     if n < 2:
         return {}
 
-    tok_starts: list[int] = []
-    p = 0
-    for t in tokens:
-        tok_starts.append(p)
-        p += len(t.get('word', ''))
-    tok_at_char = {c: i for i, c in enumerate(tok_starts)}
-
-    ms = _morphemes(''.join(t.get('word', '') for t in tokens))
-    start_tok: dict[int, dict] = {}
-    end_tok: dict[int, dict] = {}
-    if ms is not None:
-        for m in ms:
-            si = tok_at_char.get(m['start'])
-            ei = tok_at_char.get(m['end'])
-            if si is not None:
-                start_tok[si] = m
-            if ei is not None:
-                end_tok[ei] = m
+    ms, start_tok, end_tok = _morph_token_maps(tokens)
 
     legal: dict[int, str] = {}
     for i in range(1, n):
@@ -364,7 +411,7 @@ def _weak_boundaries(tokens: list[dict]) -> dict[int, str]:
 
 def _feasible(tokens: list[dict], legal: dict[int, str],
               max_duration: float, max_chars: int) -> bool:
-    """判断当前候选集合是否存在满足上限的切法（只做可行性判断，不做切分）。"""
+    """当前候选集合能否把每段字数压到上限内（时长不参与可行性判断）。"""
     n = len(tokens)
     pos = sorted(set([0] + [k for k in legal if 0 < k < n] + [n]))
     ok = [False] * len(pos)
@@ -373,25 +420,40 @@ def _feasible(tokens: list[dict], legal: dict[int, str],
         if not ok[i]:
             continue
         for j in range(i + 1, len(pos)):
-            _, d, l = _seg_stats(tokens, pos[i], pos[j])
-            if d <= max_duration + 0.05 and l <= max_chars:
+            _, _d, l = _seg_stats(tokens, pos[i], pos[j])
+            if _MIN_FRAG_CHARS <= l <= max_chars:
                 ok[j] = True
     return ok[-1]
 
 
 def _gap_boundaries(tokens: list[dict], legal: dict[int, str]) -> dict[int, str]:
-    """长静音处的兜底切点 G（可能落在词内部）。
+    """长静音的兜底切点 G（只在字数超限且 S/P/C/W 都无解时暴露）。
 
-    仅在 S/P/C/W 都无法满足上限时暴露；切不切仍由 LLM 决定。
+    与 P 一样必须落在词素边界并通过语法校验，且两侧各 ≥ _MIN_GAP_FRAG_CHARS 字，
+    因此不会再切出「好|き」「お|姉」「中|に」这类碎片。
     """
     n = len(tokens)
+    if n < 2:
+        return {}
+    ms, start_tok, end_tok = _morph_token_maps(tokens)
+    if not ms:
+        return {}
     out: dict[int, str] = {}
     for i in range(1, n):
         if i in legal:
             continue
+        if i not in start_tok or i not in end_tok:
+            continue                     # 词素内部：一律禁止
         if _gap_before(tokens, i) < _GAP_HARD_MS:
             continue
         if _ends_punct(tokens, i) or _starts_punct(tokens, i):
+            continue
+        left, right = end_tok.get(i), start_tok.get(i)
+        if left is None or right is None or not _boundary_ok(left, right):
+            continue
+        if _text_len(''.join(t.get('word', '') for t in tokens[:i])) < _MIN_GAP_FRAG_CHARS:
+            continue
+        if _text_len(''.join(t.get('word', '') for t in tokens[i:])) < _MIN_GAP_FRAG_CHARS:
             continue
         out[i] = 'G'
     return out
@@ -413,8 +475,8 @@ def _splits_ok(splits: list[int], tokens: list[dict],
                max_duration: float, max_chars: int) -> list[str]:
     """校验切点，返回硬错误列表（空表示可用）。
 
-    硬错误：越界 / 非可切点 / 空片段 / 超上限。
-    （不再检查“片段过短字数”；超上限必须判无效，避免漏网。）
+    硬错误：越界 / 非可切点 / 空片段 / 字数超限 / 碎片过短。
+    时长是软约束：超时只影响“要不要拆”的倾向，不会让合规切法作废。
     """
     n = len(tokens)
     errs: list[str] = []
@@ -436,8 +498,8 @@ def _splits_ok(splits: list[int], tokens: list[dict],
         text, dur, ln = _seg_stats(tokens, a, b)
         if ln > max_chars:
             errs.append(f'片段过长「{text}」({ln}字 > {max_chars})')
-        if dur > max_duration + 0.05:
-            errs.append(f'片段过长「{text}」({dur:.1f}s > {max_duration:g}s)')
+        if ln < _MIN_FRAG_CHARS:
+            errs.append(f'片段过短「{text}」({ln}字 < {_MIN_FRAG_CHARS})')
     return errs
 
 
@@ -446,7 +508,8 @@ def _max_ok(splits: list[int], tokens: list[dict],
     bounds = [0] + sorted(set(splits)) + [len(tokens)]
     for a, b in zip(bounds, bounds[1:]):
         _, dur, ln = _seg_stats(tokens, a, b)
-        if dur > max_duration + 0.05 or ln > max_chars:
+        if dur > max_duration + 0.05 or ln > max_chars \
+                or ln < _MIN_FRAG_CHARS:
             return False
     return True
 
@@ -464,6 +527,50 @@ def _drop_redundant(splits: list[int], tokens: list[dict],
                 ks = trial
                 changed = True
                 break
+    return ks
+
+
+def _local_splits(tokens: list[dict], legal: dict[int, str],
+                  max_duration: float, max_chars: int) -> list[int]:
+    """本地兜底求解：在候选点上找「时长溢出最小 → 切点最少」的合规切法。
+
+    硬约束：每段字数 ∈ [_MIN_FRAG_CHARS, max_chars]。
+    时长只计入成本（软约束），不会为了压时长而要求词内切点。
+    """
+    n = len(tokens)
+    if n < 2 or not legal:
+        return []
+    pos = sorted(set([0] + [k for k in legal if 0 < k < n] + [n]))
+    if len(pos) < 2:
+        return []
+    inf = float('inf')
+    best = [inf] * len(pos)
+    prev = [-1] * len(pos)
+    best[0] = 0.0
+    for i in range(len(pos)):
+        if best[i] == inf:
+            continue
+        for j in range(i + 1, len(pos)):
+            _, dur, ln = _seg_stats(tokens, pos[i], pos[j])
+            if not (_MIN_FRAG_CHARS <= ln <= max_chars):
+                continue
+            over_d = max(0.0, dur - max_duration - _DUR_OVER_TOLERANCE)
+            cost = (best[i] + _DUR_OVER_WEIGHT * over_d
+                    + _CHAR_OVER_WEIGHT * max(0, ln - max_chars)
+                    + _CUT_COST)
+            if cost < best[j]:
+                best[j] = cost
+                prev[j] = i
+    if prev[-1] < 0:
+        return []
+    ks: list[int] = []
+    j = len(pos) - 1
+    while j > 0:
+        j = prev[j]
+        if j <= 0:
+            break
+        ks.append(pos[j])
+    ks.sort()
     return ks
 
 
@@ -526,7 +633,8 @@ def _build_batch_user_prompt(items, max_duration, max_chars):
         f'每段尽量 ≥ {_MIN_DURATION_MS / 1000:g}s。',
         '【优先级】S 标点 > P 停顿 > C 小节结束 > W 较弱边界 > G 长静音；能少切就少切。',
         '【W 说明】W 是词素/语法上安全的弱边界，只在 S/P/C 不足以满足上限时使用，不要优先选 W。',
-        '【G 说明】G 是长静音（≥0.8s）处的兜底切点，可能切在词中间，只有在 S/P/C/W 都无法满足上限时才用。',
+        '【G 说明】G 是长静音（≥0.8s）处的兜底切点，已落在词与词之间；'
+        '只有在 S/P/C/W 都无法满足字数上限时才用。',
         '【算长度】每个切点都标了「累计字数/时长」。相邻两个已选切点的累计之差，'
         '就是它们之间那一段的长度；**差值超过上限时，必须再选一个中间标签**。',
         '【输出】仅 JSON：{"results": {"<编号>": ["A", "C"]}}（标签升序；每条编号都必须出现）',
@@ -765,7 +873,7 @@ def _prepare_lrc(lrc_path, max_duration, max_chars,
         cue = {'start': int(toks[0]['start']),
                'end': int(toks[-1]['end']),
                'text': text_i}
-        if is_too_long(cue, max_duration, max_chars):
+        if is_too_long(cue, max_duration, max_chars, toks):
             long_idx.append(li)
     if not long_idx:
         return None, [], None
@@ -785,11 +893,12 @@ def _prepare_lrc(lrc_path, max_duration, max_chars,
                 neighbors.append(('后一条', lyric_items[i + 1]['text']))
         tokens_by_idx[i] = toks
         legal = _legal_boundaries(toks)
-        # 若 S/P/C 无法满足上限，追加较弱边界 W；仍不行再加长静音 G（可能切在词内）
-        if not _feasible(toks, legal, max_duration, max_chars):
-            legal.update(_weak_boundaries(toks))
+        # 只有字数超限才放宽到 W / G；单纯时长超限时不允许切进词内（宁可显示长一点）
+        if _text_len(text_i) > max_chars:
             if not _feasible(toks, legal, max_duration, max_chars):
-                legal.update(_gap_boundaries(toks, legal))
+                legal.update(_weak_boundaries(toks))
+                if not _feasible(toks, legal, max_duration, max_chars):
+                    legal.update(_gap_boundaries(toks, legal))
         batch_items.append({
             'id': f'{id_prefix}s{i}',
             'seg_idx': i,
@@ -853,14 +962,28 @@ def _run_batch(engine, items, max_duration, max_chars, *,
 
     rejected = 0
     rejected_ids: set[str] = set()
+    fallback = 0
     for it in pending:
         ks = got.get(it['id']) or []
         errs = _splits_ok(ks, it['tokens'], it['legal'],
                           max_duration, max_chars)
         if errs:
-            rejected += 1
-            rejected_ids.add(it['id'])
-            if log and rejected <= 3:
+            # 模型没给出可用切分（空/违规）→ 本地求解器兜底，避免模型偷懒漏拆
+            local = _local_splits(it['tokens'], it['legal'],
+                                  max_duration, max_chars)
+            if local and not _splits_ok(local, it['tokens'], it['legal'],
+                                        max_duration, max_chars):
+                split_ks[it['id']] = _drop_redundant(
+                    local, it['tokens'], max_duration, max_chars)
+                fallback += 1
+                if log and fallback <= 3:
+                    log(f"本地兜底切分 {it['text'][:16]}…：{errs[0]}")
+                continue
+            if _text_len(it['text']) > max_chars:
+                # 字数硬超限却无合规切法 → 记失败（交给上层重试/人工）
+                rejected += 1
+                rejected_ids.add(it['id'])
+            if log and (rejected <= 3 or _text_len(it['text']) <= max_chars):
                 # 只打印前 3 条具体原因，避免刷屏
                 log(f"忽略 {it['text'][:16]}…：{errs[0]}")
             continue
@@ -868,11 +991,13 @@ def _run_batch(engine, items, max_duration, max_chars, *,
             ks, it['tokens'], max_duration, max_chars)
 
     if log:
+        if fallback:
+            log(f"{fallback} 条由本地求解器兜底切分")
         if rejected:
             more = f"（另有 {rejected - 3} 条同类）" if rejected > 3 else ''
             log(f"{rejected} 条切分不合法，已忽略（不重试）{more}")
         if split_ks:
-            log(f"模型返回 {len(split_ks)}/{len(items)} 条有效切分，"
+            log(f"模型返回 {len(split_ks) - fallback}/{len(items)} 条有效切分，"
                 f"{(stats or {}).get('elapsed', 0):.1f}s")
     # 重试只用于网络/请求失败；模型正常回复但切不了，按失败处理但不重复提问
     return split_ks, stats, False, rejected_ids

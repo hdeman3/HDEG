@@ -748,7 +748,8 @@ def sync_lrc_to_srt_vtt(lrc_path: Path, translated_texts: list[str]) -> int:
                 _log(f"  [同步] {ext} 行数不匹配 (原文{len(orig_texts)}, 译文{len(trans_filtered)}), 跳过: {other_path.name}")
                 continue
 
-            write_subtitle_file(sub_file, trans_filtered, other_path)
+            write_subtitle_file(sub_file, trans_filtered, other_path,
+                                drop_empty=True)
             _log(f"  [同步] {ext} 写回中文: {other_path.name}")
             synced += 1
         except Exception as e:
@@ -2397,9 +2398,9 @@ def translate_one_lrc(
             ctx.stats["skipped"] += 1
         return False
 
-    # 写回翻译结果：**保留日文原文件结构**（空时间轴行原样保留，中文填入对应非空行）。
-    # 说明：只有「发送给 LLM」时过滤空行（省 token）；写回不再删空行，
-    # 使 .lrc 与 .ja.lrc 逐行/时间轴一一对齐，便于对照校对。
+    # 写回翻译结果：中文文件不再保留 `[时间]` 清屏空行（drop_empty=True）。
+    # 发送给 LLM 时同样过滤空行（省 token）；写回时直接丢弃空行，
+    # 避免播放器里出现一条长时间的空字幕。
     _full_texts: list[str] = []
     _ni = 0
     for _t in texts:
@@ -2408,7 +2409,7 @@ def translate_one_lrc(
             _ni += 1
         else:
             _full_texts.append('')
-    write_subtitle_file(sub_file, _full_texts, lrc_path)
+    write_subtitle_file(sub_file, _full_texts, lrc_path, drop_empty=True)
     _log(f"\n[写入] -> {abs_path}")
     _log(f"  -> 翻译完成: {sum(1 for t in _full_texts if t)} 行中文, "
          f"共 {len(_full_texts)} 行（保留原结构）")
@@ -3378,7 +3379,8 @@ def run_pipeline(
                             except Exception:
                                 pass
                     # 写入
-                    write_subtitle_file(fd['sub_file'], translated, fpath)
+                    write_subtitle_file(fd['sub_file'], translated, fpath,
+                                        drop_empty=True)
                     ctx.stats['translated'] += 1
                     ctx.stats['total_lines'] += len(translated)
                     _log(f"  [写入] {fpath.name}: {len(translated)} 行")

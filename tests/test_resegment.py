@@ -129,18 +129,21 @@ def test_weak_boundary_not_exposed():
 
 
 def test_overlong_split_rejected(tmp_path):
-    """切完仍超上限 → 判无效（不再照常接受）。"""
+    """模型切完仍超字数上限 → 该切法被拒，由本地兜底给出合规切法。"""
     _, lrc = _setup(tmp_path, list(LONG), list(SHORT))
-    before = lrc.read_text(encoding='utf-8')
-    engine = FakeEngine({LONG: [6]})
-    r = resegment_lrc_file(lrc, engine, max_duration=4.0, max_chars=40,
+    engine = FakeEngine({LONG: [6]})              # 切出 6 / 11 字，11 > 8
+    r = resegment_lrc_file(lrc, engine, max_duration=8.0, max_chars=8,
                            retries=0, retry_delay=0)
-    assert r and r.get('failed') is True
-    assert lrc.read_text(encoding='utf-8') == before
+    assert r and r.get('failed') is not True
+    lyrics = [it for it in parse_lrc_items(lrc.read_text(encoding='utf-8'))
+              if it['type'] == 'lyric']
+    assert ''.join(it['text'] for it in lyrics) == LONG + SHORT
+    for it in lyrics:
+        assert len(it['text']) <= 8
 
 
 def test_weak_boundaries_exposed_when_primary_insufficient():
-    """S/P/C 无法满足上限时，追加 W 弱边界作为兜底候选。"""
+    """字数超限且 S/P/C 无法满足时，追加 W 弱边界作为兜底候选。"""
     from engines.resegment import (
         _feasible, _legal_boundaries, _weak_boundaries)
 
@@ -148,10 +151,10 @@ def test_weak_boundaries_exposed_when_primary_insufficient():
     toks = [{'word': c, 'start': i * 600, 'end': (i + 1) * 600}
             for i, c in enumerate(s)]
     primary = _legal_boundaries(toks)
-    assert not _feasible(toks, primary, 8.0, 40)
+    assert not _feasible(toks, primary, 8.0, 10)
     weak = _weak_boundaries(toks)
     assert weak
-    assert _feasible(toks, {**primary, **weak}, 8.0, 40)
+    assert _feasible(toks, {**primary, **weak}, 8.0, 10)
 
 
 def test_long_cue_split_keeps_text_and_structure(tmp_path):
@@ -239,24 +242,27 @@ def test_retries_exhausted_returns_failed(tmp_path):
 
 
 def test_midword_split_rejected(tmp_path):
-    """LLM 给出词内切点（ご|主人）→ 直接忽略，不重问、不拆分。"""
+    """LLM 给出词内切点（ご|主人）→ 忽略；本地在「、」后兜底切分。"""
     mid = 'ご主人様の性欲処理は、全部私がご対応させていただきますから'
     _, lrc = _setup(tmp_path, list(mid), list(SHORT))
-    before = lrc.read_text(encoding='utf-8')
 
     engine = FakeEngine({mid: [1]})               # ご|主人
     r = resegment_lrc_file(lrc, engine, max_duration=6.0, max_chars=40,
                            retries=0, retry_delay=0)
-    assert r and r.get('failed') is True
+    assert r and r.get('long') == 1
     assert engine.calls == 1                      # 没有重问
-    assert lrc.read_text(encoding='utf-8') == before
+    lyrics = [it for it in parse_lrc_items(lrc.read_text(encoding='utf-8'))
+              if it['type'] == 'lyric']
+    assert ''.join(it['text'] for it in lyrics) == mid + SHORT
+    assert not any(it['text'] == 'ご' for it in lyrics)
+    assert any(it['text'].startswith('全部私が') for it in lyrics)
 
 
 def test_redundant_cut_dropped(tmp_path):
     """能少切就少切：两刀里有一刀多余时应删掉。"""
     _, lrc = _setup(tmp_path, list(LONG), list(SHORT))
     engine = FakeEngine({LONG: [6, 12]})
-    r = resegment_lrc_file(lrc, engine, max_duration=10.0, max_chars=40)
+    r = resegment_lrc_file(lrc, engine, max_duration=9.0, max_chars=40)
     assert r and r.get('split') == 2              # [6,12] → [12]
     lyrics = [it for it in parse_lrc_items(lrc.read_text(encoding='utf-8'))
               if it['type'] == 'lyric']
@@ -376,7 +382,7 @@ def test_work_batch_by_five_tracks(tmp_path):
 
 
 def test_invalid_split_not_retried(tmp_path):
-    """模型正常回复但切不了 → 按失败处理，但不重复提问（只发 1 次）。"""
+    """模型正常回复但只给一个切点 → 只发 1 次请求，不再重复提问。"""
     from pipeline import orchestrator as orch
     from pipeline.orchestrator import PipelineContext
 
@@ -410,3 +416,78 @@ def test_one_request_per_track(tmp_path):
     assert ''.join(it['text'] for it in lyrics) == a + b + c
     for d in _cue_durations(items):
         assert d <= 6.0 + 1e-6, d
+
+
+# ==================== 回归：ASR 时间戳漂移不应切出碎片 ====================
+
+def test_short_line_with_huge_gap_not_split(tmp_path):
+    """2 字的「好き」跨 18s（ASR 漂移）→ 不拆、不发请求。"""
+    work = tmp_path / 'RJ99999999'
+    (work / 'raw').mkdir(parents=True)
+    seg = {'start': 0, 'end': 18320, 'text': '好き', 'words': [
+        {'start': 0, 'end': 400, 'word': '好'},
+        {'start': 17560, 'end': 17920, 'word': 'き'}]}
+    (work / 'raw' / '05_like.words.jsonl').write_text(
+        json.dumps(seg, ensure_ascii=False) + '\n', encoding='utf-8')
+    lrc = work / '05_like.lrc'
+    lrc.write_text('[00:00.00]好き\n[00:18.32]\n', encoding='utf-8')
+    before = lrc.read_text(encoding='utf-8')
+
+    engine = FakeEngine({'好き': [1]})
+    r = resegment_lrc_file(lrc, engine, max_duration=8.0, max_chars=40)
+    assert r is None
+    assert engine.calls == 0
+    assert lrc.read_text(encoding='utf-8') == before
+
+
+def test_duration_only_does_not_force_midword_split(tmp_path):
+    """只是时长超标、句内没有安全切点 → 不拆（宁可显示长一点）。"""
+    text = 'あ' * 20                             # 20 字 / 12s，无标点、无停顿
+    _, lrc = _setup_segments(tmp_path, [list(text), list(SHORT)])
+    before = lrc.read_text(encoding='utf-8')
+
+    engine = FakeEngine({text: [1]})
+    r = resegment_lrc_file(lrc, engine, max_duration=6.0, max_chars=40)
+    assert r is None
+    assert engine.calls == 0
+    assert lrc.read_text(encoding='utf-8') == before
+
+
+def test_gap_boundaries_never_inside_word():
+    """长静音在词素内部（好|き）→ 不进入 G 候选。"""
+    from engines.resegment import _gap_boundaries, _legal_boundaries
+
+    toks = _toks('あああ好きいいい')
+    k = 4                                        # 「好|き」
+    for i in range(k, len(toks)):
+        toks[i]['start'] += 5000
+        toks[i]['end'] += 5000
+    legal = _legal_boundaries(toks)
+    gap = _gap_boundaries(toks, legal)
+    assert k not in gap
+
+
+def test_gap_boundary_requires_min_fragment():
+    """G 两侧不足 3 字（お|姉）→ 不进入候选。"""
+    from engines.resegment import _gap_boundaries, _legal_boundaries
+
+    toks = _toks('お姉ちゃん……')
+    for i in range(1, len(toks)):
+        toks[i]['start'] += 5000
+        toks[i]['end'] += 5000
+    legal = _legal_boundaries(toks)
+    gap = _gap_boundaries(toks, legal)
+    assert 1 not in gap
+
+
+def test_local_fallback_when_model_returns_empty(tmp_path):
+    """模型偷懒返回 [] → 本地求解器兜底，仍然按字数上限拆分。"""
+    _, lrc = _setup(tmp_path, list(LONG), list(SHORT))
+    engine = FakeEngine({})                       # 所有条都返回 []
+    r = resegment_lrc_file(lrc, engine, max_duration=8.0, max_chars=8)
+    assert r and r.get('split')
+    lyrics = [it for it in parse_lrc_items(lrc.read_text(encoding='utf-8'))
+              if it['type'] == 'lyric']
+    assert ''.join(it['text'] for it in lyrics) == LONG + SHORT
+    for it in lyrics:
+        assert len(it['text']) <= 8

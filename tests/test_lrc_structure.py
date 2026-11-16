@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""写回结构测试：只发送非空行，但写回 .lrc 保留日文原结构。
+"""写回结构测试：只发送非空行，中文 .lrc 写回时丢弃空时间轴行。
 
 覆盖：
-- 空时间轴行（仅时间戳）原样保留，不再被删除；
-- 非空行填入译文，输出与原文逐行/时间轴对齐；
+- 空时间轴行（仅时间戳）不再写入中文文件（避免长时间空字幕）；
+- 非空行填入译文；
 - 元数据标签行保留；
 - 续行（无时间轴、被解析器并入上一条）行为不变（不单独成行）。
 """
@@ -69,7 +69,7 @@ def _run(tmp_path, lrc_text):
     return ok, engine, lrc.read_text(encoding='utf-8')
 
 
-def test_empty_timeline_lines_preserved(tmp_path):
+def test_empty_timeline_lines_removed(tmp_path):
     src = (
         '[ti:サンプル]\n'
         '[00:01.00]こんにちは\n'
@@ -84,17 +84,14 @@ def test_empty_timeline_lines_preserved(tmp_path):
     assert len(engine.sent) == 1 and len(engine.sent[0]) == 3
 
     out_lines = out.splitlines()
-    # 结构保留：行数与原文一致（含元数据行、空时间轴行）
-    assert len(out_lines) == len(src.splitlines())
-    # 元数据行保留
+    # 元数据行 + 3 条译文，空时间轴行已删除
+    assert len(out_lines) == 4
     assert out_lines[0] == '[ti:サンプル]'
-    # 空时间轴行原样保留（时间戳在、无文本）
-    assert out_lines[2] == '[00:03.00]'
-    assert out_lines[4] == '[00:07.50]'
-    # 非空行填入译文
+    assert not any(ln.strip() in ('[00:03.00]', '[00:07.50]')
+                   for ln in out_lines)
     assert out_lines[1] == '[00:01.00]译文0'
-    assert out_lines[3] == '[00:05.00]译文1'
-    assert out_lines[5] == '[00:09.00]译文2'
+    assert out_lines[2] == '[00:05.00]译文1'
+    assert out_lines[3] == '[00:09.00]译文2'
 
 
 def test_continuation_line_merged_unchanged(tmp_path):
@@ -114,3 +111,20 @@ def test_continuation_line_merged_unchanged(tmp_path):
     assert not any('の続き' in l for l in out_lines)
     assert out_lines[0] == '[00:01.00]译文0'
     assert out_lines[1] == '[00:05.00]译文1'
+
+
+def test_write_subtitle_file_drop_empty(tmp_path):
+    """通用写入：drop_empty=True 删除 LRC 空时间轴行；默认 False 保持原结构。"""
+    from io_adapter.lrc_handler import parse_subtitle_file, write_subtitle_file
+
+    src = tmp_path / 'a.lrc'
+    src.write_text('[00:01.00]甲\n[00:02.00]\n[00:03.00]乙\n', encoding='utf-8')
+    sf = parse_subtitle_file(src)
+
+    out = tmp_path / 'b.lrc'
+    write_subtitle_file(sf, ['A', '', 'B'], out, drop_empty=True)
+    assert out.read_text(encoding='utf-8') == '[00:01.00]A\n[00:03.00]B\n'
+
+    out2 = tmp_path / 'c.lrc'
+    write_subtitle_file(sf, ['A', '', 'B'], out2)
+    assert '[00:02.00]\n' in out2.read_text(encoding='utf-8')

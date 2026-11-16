@@ -341,24 +341,40 @@ def parse_subtitle_file(path: Path) -> SubtitleFile | None:
     )
 
 
-def write_subtitle_file(sub_file: SubtitleFile, translated_lyrics: list[str], target_path: Path) -> None:
+def write_subtitle_file(sub_file: SubtitleFile, translated_lyrics: list[str],
+                        target_path: Path, *, drop_empty: bool = False) -> None:
     """将翻译结果写回字幕文件（保留原始结构）
 
     参数:
         sub_file: parse_subtitle_file 的解析结果
         translated_lyrics: 翻译后的文本行（与 original_lyrics 一一对应）
         target_path: 输出路径
+        drop_empty: 丢弃空文本行。LRC 用于去掉 `[mm:ss.xx]` 空行（清屏行），
+            SRT/VTT 只去掉空文本占位；默认 False 保持原有结构。
     """
     final_lines = list(sub_file.final_lines)
 
     for idx, tags, new_lyric in zip(sub_file.lyric_indices, sub_file.time_tags, translated_lyrics):
+        empty = not (new_lyric or '').strip()
         if sub_file.ext == '.lrc':
-            final_lines[idx] = f"{tags}{new_lyric}\n" if new_lyric else f"{tags}\n"
+            if empty and drop_empty:
+                final_lines[idx] = ''
+            else:
+                final_lines[idx] = f"{tags}{new_lyric}\n" if new_lyric else f"{tags}\n"
         else:
             final_lines[idx] = f"{new_lyric}\n" if new_lyric else '\n'
 
-    # None 占位转空行
-    final_lines = [line if line is not None else '\n' for line in final_lines]
+    if drop_empty:
+        if sub_file.ext == '.lrc':
+            # LRC：空行就是 `[时间]` 清屏行，整行删除
+            final_lines = [line for line in final_lines
+                           if line is not None and line.strip()]
+        else:
+            # SRT/VTT：空行是块分隔符，不能删；只把空文本占位去掉
+            final_lines = [line if line is not None else '' for line in final_lines]
+    else:
+        # None 占位转空行
+        final_lines = [line if line is not None else '\n' for line in final_lines]
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     with open(target_path, 'w', encoding='utf-8') as f:
